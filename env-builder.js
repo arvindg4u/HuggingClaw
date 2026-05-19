@@ -421,8 +421,7 @@ const FIELDS = [
     "icon": "⚡",
     "k": "LLM_MODEL",
     "lbl": "Default model ID",
-    "type": "model",
-    "options_key": "LLM_MODEL",
+    "type": "text",
     "ph": "choose a provider model",
     "common": 1,
     "tag": "critical"
