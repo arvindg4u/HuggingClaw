@@ -326,7 +326,7 @@ CONFIG_JSON=$(cat <<'CONFIGEOF'
 {
   "gateway": {
     "mode": "local",
-    "port": 7860,
+    "port": "${GATEWAY_PORT}",
     "bind": "lan",
     "auth": {
       "token": ""
@@ -523,8 +523,10 @@ for candidate in \
     /usr/bin/chromium-browser \
     /snap/bin/chromium; do
   if [ -x "$candidate" ]; then
-    BROWSER_EXECUTABLE_PATH="$candidate"
-    break
+    if file "$candidate" 2>/dev/null | grep -q "ELF"; then
+      BROWSER_EXECUTABLE_PATH="$candidate"
+      break
+    fi
   fi
 done
 if [ -z "$BROWSER_EXECUTABLE_PATH" ]; then
@@ -1687,6 +1689,16 @@ while true; do
 
   # 11. Start WhatsApp Guardian after the gateway is accepting connections
   start_guardian_once
+
+  # ── Silence D-Bus errors for headless Chromium ──
+  if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    if command -v dbus-launch >/dev/null 2>&1; then
+      eval "$(dbus-launch --sh-syntax 2>/dev/null)" || true
+      export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-disabled:}"
+    else
+      export DBUS_SESSION_BUS_ADDRESS="disabled:"
+    fi
+  fi
 
   # 11.5 Warm up the managed browser so first browser actions have a live tab
   warmup_browser
