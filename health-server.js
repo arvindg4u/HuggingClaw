@@ -28,6 +28,8 @@ const JUPYTER_ENABLED =
   !/^(false|0|no|off)$/i.test(String(process.env.HUGGINGCLAW_JUPYTER_ENABLED || "").trim());
 const startTime = Date.now();
 const LLM_MODEL = process.env.LLM_MODEL || "Not Set";
+const LLM_PROVIDER = LLM_MODEL.includes("/") ? LLM_MODEL.split("/")[0] : "";
+const TELEGRAM_WEBHOOK_URL = (process.env.TELEGRAM_WEBHOOK_URL || "").trim();
 const TELEGRAM_ENABLED = !!process.env.TELEGRAM_BOT_TOKEN;
 const WHATSAPP_ENABLED = isTrue(process.env.WHATSAPP_ENABLED);
 const WHATSAPP_STATUS_FILE = "/tmp/huggingclaw-wa-status.json";
@@ -240,9 +242,9 @@ function renderDashboard(data) {
 
   const tiles = [
     tile({ title: "Gateway", value: badge(data.gatewayReady ? "Online" : "Offline", data.gatewayReady ? "ok" : "off"), detail: `OpenClaw on internal port ${GATEWAY_PORT}`, tone: data.gatewayReady ? "ok" : "off" }),
-    tile({ title: "Model", value: `<code>${escapeHtml(LLM_MODEL)}</code>`, detail: "Primary LLM configured", tone: "neutral" }),
+    tile({ title: "Model", value: `<code>${escapeHtml(LLM_MODEL)}</code>`, detail: LLM_PROVIDER ? `Provider: ${escapeHtml(LLM_PROVIDER)}` : "Primary LLM configured", tone: "neutral" }),
     tile({ title: "Runtime", value: escapeHtml(data.uptimeHuman), detail: `Public port ${PORT}`, tone: "neutral" }),
-    tile({ title: "Telegram", value: badge(TELEGRAM_ENABLED ? "Enabled" : "Disabled", TELEGRAM_ENABLED ? "ok" : "neutral"), detail: TELEGRAM_ENABLED ? "Bot channel active" : "Not configured", tone: TELEGRAM_ENABLED ? "ok" : "neutral" }),
+    tile({ title: "Telegram", value: badge(TELEGRAM_ENABLED ? "Enabled" : "Disabled", TELEGRAM_ENABLED ? "ok" : "neutral"), detail: TELEGRAM_ENABLED ? (TELEGRAM_WEBHOOK_URL ? "Webhook" : "Polling") + (process.env.CLOUDFLARE_PROXY_URL ? " via CF proxy" : "") : "Not configured", tone: TELEGRAM_ENABLED ? "ok" : "neutral" }),
   ];
 
 
