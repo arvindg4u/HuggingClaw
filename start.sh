@@ -521,6 +521,40 @@ inject_provider_models_from_env "github-copilot" "GITHUB_COPILOT_MODELS" "COPILO
 # Browser configuration (managed local Chromium in HF/Docker)
 BROWSER_EXECUTABLE_PATH=""
 BROWSER_WRAPPER_PATH=""
+HAS_FILE_CMD=false
+if command -v file >/dev/null 2>&1; then
+  HAS_FILE_CMD=true
+fi
+
+ensure_chromium_for_browser_plugin() {
+  # Enforce Chromium availability when browser plugin is explicitly enabled.
+  [ "$BROWSER_PLUGIN_MODE" = "enabled" ] || return 0
+  for candidate in /usr/lib/chromium/chromium /usr/bin/chromium /usr/bin/chromium-browser; do
+    [ -x "$candidate" ] && return 0
+  done
+  if [ "$HAS_FILE_CMD" != "true" ]; then
+    echo "BROWSER_PLUGIN_MODE=enabled and 'file' command is missing; attempting runtime install..."
+    if _hc_apt_install file; then
+      HAS_FILE_CMD=true
+      echo "'file' command installed via apt-get."
+    else
+      echo "Warning: could not install 'file'; continuing with executable-path fallback checks."
+    fi
+  fi
+  echo "BROWSER_PLUGIN_MODE=enabled but Chromium is missing; attempting runtime install..."
+  if _hc_apt_install chromium; then
+    echo "Chromium installed via apt-get."
+    return 0
+  fi
+  if _hc_apt_install chromium-browser; then
+    echo "Chromium browser package installed via apt-get."
+    return 0
+  fi
+  echo "ERROR: Browser plugin is enabled, but Chromium install failed. Disable browser plugin or rebuild image with Chromium preinstalled." >&2
+  return 1
+}
+ensure_chromium_for_browser_plugin || HC_STARTUP_FAILURES=$((HC_STARTUP_FAILURES + 1))
+
 # On Debian/Ubuntu, /usr/bin/chromium is often a shell wrapper while the real
 # ELF binary lives under /usr/lib/chromium/*. Prefer a real ELF binary, then
 # fall back to wrapper launchers (Playwright/OpenClaw can execute those too).
@@ -531,7 +565,13 @@ for candidate in \
     /usr/bin/chromium-browser \
     /snap/bin/chromium; do
   if [ -x "$candidate" ]; then
-    if file "$candidate" 2>/dev/null | grep -q "ELF"; then
+    if [ "$HAS_FILE_CMD" = "true" ]; then
+      if file "$candidate" 2>/dev/null | grep -q "ELF"; then
+        BROWSER_EXECUTABLE_PATH="$candidate"
+        break
+      fi
+    else
+      # Minimal images may not ship `file`; accept the first executable path.
       BROWSER_EXECUTABLE_PATH="$candidate"
       break
     fi
@@ -543,6 +583,8 @@ done
 if [ -z "$BROWSER_EXECUTABLE_PATH" ] && [ -n "$BROWSER_WRAPPER_PATH" ]; then
   BROWSER_EXECUTABLE_PATH="$BROWSER_WRAPPER_PATH"
   echo "No ELF Chromium binary found; using launcher wrapper at $BROWSER_EXECUTABLE_PATH"
+elif [ -n "$BROWSER_EXECUTABLE_PATH" ] && [ "$HAS_FILE_CMD" != "true" ]; then
+  echo "Detected Chromium executable at $BROWSER_EXECUTABLE_PATH (ELF probe skipped: 'file' command not installed)"
 fi
 if [ -z "$BROWSER_EXECUTABLE_PATH" ]; then
   echo "Warning: Chromium executable not found. Browser plugin will be disabled."
