@@ -118,7 +118,7 @@ HuggingClaw features a built-in dashboard to track:
 - **Uptime:** Real-time uptime monitoring.
 - **Sync Status:** Visual indicators for workspace backup operations.
 - **Chat Status:** Real-time connection status for WhatsApp and Telegram.
-- **Model Info:** See which LLM is currently powering your assistant.
+- **Model Info:** See which LLM and provider are currently powering your assistant.
 
 ## 📱 Telegram Setup *(Optional)*
 
@@ -133,6 +133,7 @@ To chat via Telegram:
 | :--- | :--- | :--- |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token from BotFather |
 | `TELEGRAM_ALLOWED_USERS` | — | Comma-separated Telegram user IDs for access |
+| `TELEGRAM_WEBHOOK_URL` | *(auto-provisioned)* | Override webhook URL; set `TELEGRAM_MODE=polling` to use long-polling instead |
 
 ## 🌐 Cloudflare Proxy Setup
 
@@ -381,9 +382,9 @@ HuggingClaw uses a multi-layered approach to ensure stability and persistence on
 <details>
 <summary><b>Click to view technical details</b></summary>
 
-- **Dashboard (`/`)**: Management, monitoring, and keep-alive tools (terminal controls appear only in DEV mode).
+- **Dashboard (`/`)**: Management, monitoring, and keep-alive tools. Terminal button appears when DEV mode is enabled (default when `GATEWAY_TOKEN` is set).
 - **Control UI (`/app/`)**: Secure interface for managing agents and channels, proxied to the OpenClaw gateway on internal port `7860`.
-- **JupyterLab Terminal (`/terminal/`)**: Browser terminal/notebook server on internal port `8888` (DEV mode only).
+- **JupyterLab Terminal (`/terminal/`)**: Browser terminal/notebook server on internal port `8888` (auto-enabled when `GATEWAY_TOKEN` is set; set `DEV_MODE=false` to disable).
 - **Health Check (`/health`)**: Endpoint for uptime monitoring and readiness probes.
 - **Sync Engine**: Python background process managing HF Dataset persistence.
 - **Transparent Proxy**: Interceptor for requests to blocked domains (Telegram, etc.).
@@ -394,7 +395,7 @@ HuggingClaw uses a multi-layered approach to ensure stability and persistence on
 2. Resolve backup namespace and restore workspace from HF Dataset.
 3. Generate `openclaw.json` configuration.
 4. Launch background tasks (auto-sync, channel helpers).
-5. Start the local dashboard/reverse proxy and OpenClaw gateway (JupyterLab starts when `GATEWAY_TOKEN` is set, `DEV_MODE=true`, or `HUGGINGCLAW_JUPYTER_ENABLED=true`).
+5. Start the local dashboard/reverse proxy and OpenClaw gateway (JupyterLab starts automatically when `GATEWAY_TOKEN` is set; set `DEV_MODE=false` to opt out).
 
 </details>
 

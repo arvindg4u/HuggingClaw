@@ -20,7 +20,7 @@ ARG DEV_MODE=false
 # override by setting DEV_MODE=false as an HF Space Variable to opt out.
 
 # Install system dependencies (+ optional JupyterLab deps in DEV_MODE)
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     sudo \
     file \
@@ -53,7 +53,7 @@ RUN apt-get update && apt-get install -y \
     fonts-wqy-zenhei \
     xfonts-scalable \
     --no-install-recommends && \
-    pip3 install --no-cache-dir --break-system-packages huggingface_hub && \
+    pip3 install --no-cache-dir --break-system-packages huggingface_hub hf_transfer && \
     rm -rf /var/lib/apt/lists/*
 
 # Install JupyterLab only when DEV_MODE is enabled (build-time)
