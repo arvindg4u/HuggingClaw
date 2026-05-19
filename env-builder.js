@@ -484,6 +484,15 @@ const FIELDS = [
   },
 {
     "g": "Startup",
+    "icon": "🩺",
+    "k": "AUTO_DOCTOR",
+    "lbl": "Auto-fix config on boot (openclaw doctor --fix)",
+    "type": "toggle",
+    "ph": "false",
+    "tag": "advanced"
+  },
+{
+    "g": "Startup",
     "icon": "⚡",
     "k": "HUGGINGCLAW_JUPYTER_ENABLED",
     "lbl": "Enable Jupyter terminal",

@@ -99,6 +99,9 @@ DEVDATA_ENABLED=true
 if ! hc_is_true "$DEVDATA_NORMALIZED"; then
   DEVDATA_ENABLED=false
 fi
+# On HF Spaces, browser is disabled by default (no display server).
+# To enable: set BROWSER_PLUGIN_MODE=enabled as an HF Space secret.
+# WARNING: requires at least CPU Upgrade tier (2 vCPU / 16GB RAM).
 if [ -n "${SPACE_HOST:-}" ]; then
   OPENCLAW_CONSOLE_LOG_LEVEL="${OPENCLAW_CONSOLE_LOG_LEVEL:-warn}"
   OPENCLAW_FILE_LOG_LEVEL="${OPENCLAW_FILE_LOG_LEVEL:-info}"
@@ -508,10 +511,19 @@ inject_provider_models_from_env "github-copilot" "GITHUB_COPILOT_MODELS" "COPILO
 BROWSER_EXECUTABLE_PATH=""
 for candidate in /usr/bin/chromium /usr/bin/chromium-browser /snap/bin/chromium; do
   if [ -x "$candidate" ]; then
-    BROWSER_EXECUTABLE_PATH="$candidate"
-    break
+    # Reject snap stubs — they silently fail in Docker
+    if file "$candidate" 2>/dev/null | grep -q "ELF"; then
+      BROWSER_EXECUTABLE_PATH="$candidate"
+      break
+    elif head -1 "$candidate" 2>/dev/null | grep -qv "snap\|exec"; then
+      BROWSER_EXECUTABLE_PATH="$candidate"
+      break
+    fi
   fi
 done
+if [ -z "$BROWSER_EXECUTABLE_PATH" ]; then
+  echo "Warning: No real Chromium binary found. Browser plugin will be disabled."
+fi
 
 BROWSER_SHOULD_ENABLE=false
 if [ "$BROWSER_PLUGIN_MODE" = "enabled" ] && [ -n "$BROWSER_EXECUTABLE_PATH" ] && [ -x "$BROWSER_EXECUTABLE_PATH" ]; then
@@ -569,7 +581,20 @@ if [ "$BROWSER_SHOULD_ENABLE" = "true" ]; then
        "defaultProfile": "openclaw",
        "headless": true,
        "noSandbox": true,
-       "executablePath": $execPath
+       "executablePath": $execPath,
+       "localLaunchTimeoutMs": 45000,
+       "localCdpReadyTimeoutMs": 30000,
+       "extraArgs": [
+         "--disable-dev-shm-usage",
+         "--disable-gpu",
+         "--disable-setuid-sandbox",
+         "--no-first-run",
+         "--disable-background-networking",
+         "--disable-sync",
+         "--disable-translate",
+         "--disable-notifications",
+         "--disable-speech-api"
+       ]
      }
      | .agents.defaults.sandbox.browser.allowHostControl = true' <<<"$CONFIG_JSON")
 fi
@@ -821,16 +846,16 @@ warmup_browser() {
   [ "$BROWSER_SHOULD_ENABLE" = "true" ] || return 0
 
   (
-    sleep 5
+    sleep 8
 
     local attempt
-    for attempt in 1 2 3 4 5; do
+    for attempt in 1 2 3 4 5 6; do
       if openclaw browser --browser-profile openclaw start >/dev/null 2>&1; then
         openclaw browser --browser-profile openclaw open about:blank >/dev/null 2>&1 || true
         echo "Managed browser ready."
         return 0
       fi
-      sleep 2
+      sleep 5
     done
 
     echo "Warning: managed browser warm-up did not complete; first browser action may need a retry."
@@ -1438,7 +1463,9 @@ if [ -n "${HUGGINGCLAW_OPENCLAW_PLUGINS:-}" ]; then
 fi
 
 # ── Fix config before running startup commands ──
-openclaw doctor --fix || true
+if [ "${AUTO_DOCTOR:-false}" = "true" ]; then
+  openclaw doctor --fix || true
+fi
 
 # ── Arbitrary startup commands from HF Variables/Secrets ──
 # Recommended: use one variable, HUGGINGCLAW_RUN, as a full bash script. If the
@@ -1581,7 +1608,19 @@ while true; do
     fi
   fi
 
-  openclaw doctor --fix || true
+  if [ "${AUTO_DOCTOR:-false}" = "true" ]; then
+    openclaw doctor --fix || true
+  fi
+  # ── Silence D-Bus errors for headless Chromium ──
+  if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    if command -v dbus-launch >/dev/null 2>&1; then
+      eval "$(dbus-launch --sh-syntax 2>/dev/null)" || true
+      export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-disabled:}"
+    else
+      export DBUS_SESSION_BUS_ADDRESS="disabled:"
+    fi
+  fi
+
   echo "Launching OpenClaw gateway on port 7860..."
 
   GATEWAY_ARGS=(gateway run --port 7860 --bind lan)
@@ -1618,13 +1657,28 @@ while true; do
     echo "Gateway failed to start. Last 30 lines of log:"
     echo "────────────────────────────────────────────"
     tail -30 /home/node/.openclaw/gateway.log
-    echo "Gateway failed — JupyterLab and env-builder still running. Retrying in 10s..."
-    sleep 10
-    continue
+    if [ "$DEV_MODE_ENABLED" = "true" ]; then
+      echo "Gateway failed — DEV_MODE active, retrying in 10s..."
+      sleep 10
+      continue
+    else
+      echo "Gateway failed — exiting."
+      exit 1
+    fi
   fi
 
   # 11. Start WhatsApp Guardian after the gateway is accepting connections
   start_guardian_once
+
+  # ── Silence D-Bus errors for headless Chromium ──
+  if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    if command -v dbus-launch >/dev/null 2>&1; then
+      eval "$(dbus-launch --sh-syntax 2>/dev/null)" || true
+      export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-disabled:}"
+    else
+      export DBUS_SESSION_BUS_ADDRESS="disabled:"
+    fi
+  fi
 
   # 11.5 Warm up the managed browser so first browser actions have a live tab
   warmup_browser
