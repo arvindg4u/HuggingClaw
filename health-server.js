@@ -22,11 +22,12 @@ const JUPYTER_HOST = "127.0.0.1";
 const JUPYTER_BASE = normalizeBase(process.env.JUPYTER_BASE, "/terminal");
 const GATEWAY_TOKEN = (process.env.GATEWAY_TOKEN || "").trim();
 const DEV_MODE_ENABLED = isTrue(process.env.DEV_MODE);
-// Auto-enable Jupyter when DEV_MODE=true, HUGGINGCLAW_JUPYTER_ENABLED=true, or GATEWAY_TOKEN is set.
-// GATEWAY_TOKEN doubles as JUPYTER_TOKEN in start.sh — no extra secret needed.
-const JUPYTER_ENABLED = /^(true|1|yes|on)$/i.test(
-  process.env.HUGGINGCLAW_JUPYTER_ENABLED || (DEV_MODE_ENABLED ? "true" : GATEWAY_TOKEN ? "true" : "false")
+// Jupyter enabled by default. Only disabled when explicitly set to false via
+// DEV_MODE=false or HUGGINGCLAW_JUPYTER_ENABLED=false.
+const JUPYTER_EXPLICITLY_DISABLED = /^(false|0|no|off)$/i.test(
+  String(process.env.HUGGINGCLAW_JUPYTER_ENABLED || process.env.DEV_MODE || "").trim()
 );
+const JUPYTER_ENABLED = !JUPYTER_EXPLICITLY_DISABLED;
 const startTime = Date.now();
 const LLM_MODEL = process.env.LLM_MODEL || "Not Set";
 const TELEGRAM_ENABLED = !!process.env.TELEGRAM_BOT_TOKEN;
@@ -243,7 +244,7 @@ function renderDashboard(data) {
     <a class="hero-action env" data-space-link="env-builder" href="/env-builder">⚙️ Env Builder →</a>
   </div>
   <section class="overview">${tilesHtml}</section>
-  <footer>Built by <a href="https://github.com/somratpro" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:none">@somratpro</a>${JUPYTER_ENABLED ? " · Terminal by JupyterLab" : ""}<br><span>Public Spaces open via <code>.hf.space</code> directly. Private Spaces require the <a href="${HF_SPACE_URL || "#"}" target="_blank" rel="noopener noreferrer" style="color:inherit">Hugging Face App tab</a> for the authenticated session${HF_SPACE_URL ? ` — or share <code>huggingface.co/spaces/${SPACE_ID}</code>` : ""}.</span></footer>
+  <footer>Built by <a href="https://github.com/somratpro" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:none">@somratpro</a>${JUPYTER_ENABLED ? " · Terminal by JupyterLab" : ""}</footer>
   </main>
   <script>
   document.querySelectorAll('.local-time').forEach(el=>{const d=new Date(el.getAttribute('data-iso'));if(!isNaN(d))el.textContent='At '+d.toLocaleTimeString()});
@@ -481,7 +482,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname === JUPYTER_BASE || pathname.startsWith(JUPYTER_BASE + "/")) {
     if (!JUPYTER_ENABLED) {
       res.writeHead(404, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ status: "disabled", message: "JupyterLab terminal is disabled. Set DEV_MODE=true to enable /terminal/." }));
+      return res.end(JSON.stringify({ status: "disabled", message: "JupyterLab terminal is disabled. Remove DEV_MODE=false to re-enable." }));
     }
     if (isDirectHfSpaceRequest) {
       res.writeHead(200, { "Content-Type": "text/html" });
