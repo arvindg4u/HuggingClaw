@@ -62,6 +62,10 @@ function deriveHfSpaceUrl() {
   return "";
 }
 const HF_SPACE_URL = deriveHfSpaceUrl();
+const _privacyWaitRaw = Number(process.env.PRIVACY_DETECTION_WAIT_MS || "1500");
+const PRIVACY_DETECTION_WAIT_MS = Number.isFinite(_privacyWaitRaw)
+  ? Math.max(0, Math.floor(_privacyWaitRaw))
+  : 1500;
 
 // ── Privacy Detection ──
 // Priority order:
@@ -643,7 +647,14 @@ const server = http.createServer(async (req, res) => {
   // the fail-secure default (SPACE_IS_PRIVATE=true), causing private redirects
   // even when the space is actually public or the owner is accessing via HF App.
   // After the very first HTML request, _privacyDetectionDone=true so no delay.
-  if (isHtmlRequest && !_privacyDetectionDone) await privacyDetectionReady;
+  let privacyWaitTimedOut = false;
+  if (isHtmlRequest && !_privacyDetectionDone) {
+    const waitResult = await Promise.race([
+      privacyDetectionReady.then(() => "detected"),
+      new Promise((resolve) => setTimeout(() => resolve("timeout"), PRIVACY_DETECTION_WAIT_MS)),
+    ]);
+    privacyWaitTimedOut = waitResult == "timeout";
+  }
 
   // In-app navigation (clicking links within the HF iframe) sends a Referer
   // from the same .hf.space origin — don't redirect those, only redirect
@@ -662,6 +673,7 @@ const server = http.createServer(async (req, res) => {
   ));
   // NOTE: computed AFTER detection is awaited above — always uses real value.
   const isDirectHfSpaceRequest = SPACE_IS_PRIVATE &&
+    !privacyWaitTimedOut &&
     HF_SPACE_URL &&
     isHtmlRequest &&
     typeof req.headers.host === "string" &&

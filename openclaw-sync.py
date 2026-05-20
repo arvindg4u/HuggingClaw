@@ -75,7 +75,7 @@ EXCLUDED_STATE_NAMES = {
     "browser",
     "npm",
 }
-SESSIONS_DIR = OPENCLAW_HOME / "agents" / "main" / "sessions"
+SESSIONS_ROOT = OPENCLAW_HOME / "agents"
 WHATSAPP_CREDS_DIR = OPENCLAW_HOME / "credentials" / "whatsapp" / "default"
 WHATSAPP_BACKUP_DIR = STATE_DIR / "credentials" / "whatsapp" / "default"
 RESET_MARKER = WORKSPACE / ".reset_credentials"
@@ -109,6 +109,30 @@ def count_files(path: Path) -> int:
     return sum(1 for child in path.rglob("*") if child.is_file())
 
 
+def copy_state_entry_with_retry(source_path: Path, backup_path: Path, attempts: int = 3) -> None:
+    """Copy one top-level .openclaw entry with short retries for hot files/dirs."""
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if source_path.is_dir():
+                shutil.copytree(source_path, backup_path)
+                return
+            if source_path.is_file():
+                shutil.copy2(source_path, backup_path)
+                return
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(0.2 * attempt)
+                if backup_path.exists():
+                    if backup_path.is_dir():
+                        shutil.rmtree(backup_path, ignore_errors=True)
+                    else:
+                        backup_path.unlink(missing_ok=True)
+                continue
+            raise last_exc
+
 def snapshot_state_into_workspace() -> None:
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -120,20 +144,32 @@ def snapshot_state_into_workspace() -> None:
             shutil.rmtree(staging_dir, ignore_errors=True)
         staging_dir.mkdir(parents=True, exist_ok=True)
 
+        skipped_entries: list[tuple[str, Exception]] = []
         for source_path in OPENCLAW_HOME.iterdir():
             if source_path.name in EXCLUDED_STATE_NAMES:
                 continue
 
             backup_path = staging_dir / source_path.name
-            if source_path.is_dir():
-                shutil.copytree(source_path, backup_path)
-            elif source_path.is_file():
-                shutil.copy2(source_path, backup_path)
+            try:
+                copy_state_entry_with_retry(source_path, backup_path)
+            except Exception as entry_exc:
+                skipped_entries.append((source_path.name, entry_exc))
 
-        # Atomically swap staging → real backup dir
-        if OPENCLAW_STATE_BACKUP_DIR.exists():
-            shutil.rmtree(OPENCLAW_STATE_BACKUP_DIR, ignore_errors=True)
-        staging_dir.rename(OPENCLAW_STATE_BACKUP_DIR)
+        # If any top-level state entries could not be copied, keep the
+        # previous known-good snapshot instead of replacing it with a partial
+        # backup. We'll retry next pass.
+        if skipped_entries:
+            for name, entry_exc in skipped_entries:
+                print(f"Warning: skipping state entry {name}: {entry_exc}")
+            print(
+                "Warning: OpenClaw state snapshot incomplete; keeping previous backup and retrying next sync."
+            )
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        else:
+            # Atomically swap staging → real backup dir
+            if OPENCLAW_STATE_BACKUP_DIR.exists():
+                shutil.rmtree(OPENCLAW_STATE_BACKUP_DIR, ignore_errors=True)
+            staging_dir.rename(OPENCLAW_STATE_BACKUP_DIR)
     except Exception as exc:
         # Clean up staging on failure so it doesn't interfere next time
         staging_dir = STATE_DIR / ".openclaw-staging"
@@ -527,12 +563,34 @@ def is_valid_json_file(path: Path) -> bool:
 
 
 def sessions_marker() -> tuple[int, int, int, str]:
-    """Return a lightweight marker for the sessions directory.
+    """Return a lightweight marker for all agent session directories.
 
-    Uses the same metadata_marker() logic so any new, deleted, or modified
-    session file is detected without hashing file contents.
+    OpenClaw can use agent profiles beyond "main". Watch every
+    */sessions path under .openclaw/agents so session changes always trigger
+    syncs regardless of profile name.
     """
-    return metadata_marker(SESSIONS_DIR)
+    if not SESSIONS_ROOT.exists():
+        return (0, 0, 0, "")
+
+    file_count = 0
+    total_size = 0
+    newest_mtime = 0
+    metadata_hasher = hashlib.sha256()
+
+    for profile_dir in sorted(SESSIONS_ROOT.iterdir()):
+        if not profile_dir.is_dir():
+            continue
+        sessions_dir = profile_dir / "sessions"
+        marker = metadata_marker(sessions_dir)
+        file_count += marker[0]
+        total_size += marker[1]
+        newest_mtime = max(newest_mtime, marker[2])
+        metadata_hasher.update(profile_dir.name.encode("utf-8"))
+        metadata_hasher.update(b"\0")
+        metadata_hasher.update(marker[3].encode("ascii"))
+        metadata_hasher.update(b"\0")
+
+    return (file_count, total_size, newest_mtime, metadata_hasher.hexdigest())
 
 
 def wait_for_config_settle(config_marker: tuple[int, int, int]) -> tuple[str, tuple[int, int, int]]:
