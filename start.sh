@@ -1016,7 +1016,7 @@ start_jupyter_once() {
     echo "       DEV_MODE active but JupyterLab will NOT start until JUPYTER_TOKEN is changed." >&2
     return 1
   fi
-  JUPYTER_ROOT_DIR="${JUPYTER_ROOT_DIR:-/}"
+  JUPYTER_ROOT_DIR="${JUPYTER_ROOT_DIR:-/home/node}"
   if [ "$JUPYTER_ROOT_DIR" = "/home/node/.openclaw/workspace" ] && [ "$DEVDATA_ENABLED" = "true" ]; then
     echo "Jupyter root was set to OpenClaw workspace; moving Jupyter root to /home/node/devdata to keep BACKUP and DEVDATA datasets separate."
     JUPYTER_ROOT_DIR="/home/node/devdata"

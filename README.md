@@ -370,7 +370,7 @@ The merged Space includes the Hugging Face JupyterLab template behavior inside t
 | `/app/` | OpenClaw Control UI | `7860` | Mounted behind the local reverse proxy |
 | `/terminal/` | JupyterLab terminal | `8888` | Auto-enabled when `GATEWAY_TOKEN` is set; uses `GATEWAY_TOKEN` as auth token unless `JUPYTER_TOKEN` is set separately. Set `DEV_MODE=false` to disable. |
 
-When enabled, the terminal notebook root defaults to `/`, so you can browse the full container filesystem from the browser (including `/home/node`). Handy shortcuts are also created: `HuggingClaw`, `HuggingClaw-Workspace`, and `OpenClaw-Home`.
+When enabled, the terminal notebook root defaults to `/home/node` (stable + writable by default). To browse a broader tree, set `JUPYTER_ROOT_DIR=/home`. Handy shortcuts are also created: `HuggingClaw`, `HuggingClaw-Workspace`, and `OpenClaw-Home`.
 
 > [!IMPORTANT]
 > No extra secret needed — `GATEWAY_TOKEN` is automatically reused as `JUPYTER_TOKEN`. Set a separate `JUPYTER_TOKEN` secret only if you want a different terminal credential.
