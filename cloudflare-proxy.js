@@ -38,7 +38,7 @@ if (SOCKS5_PROXY) {
 const SOCKS5_DOMAINS_RAW = (process.env.SOCKS5_PROXY_DOMAINS || "").trim();
 const SOCKS5_DOMAIN_LIST = SOCKS5_DOMAINS_RAW ? SOCKS5_DOMAINS_RAW.split(",").map(d => d.trim().toLowerCase()).filter(Boolean) : [];
 
-const DEBUG = true;
+const DEBUG = process.env.CLOUDFLARE_PROXY_DEBUG === "true";
 const PROXY_SHARED_SECRET = (process.env.CLOUDFLARE_PROXY_SECRET || "").trim();
 
 // ── Blocked Domains for Cloudflare Worker ──
@@ -197,7 +197,7 @@ if (PROXY_URL || SOCKS5_HOST) {
 
     if (shouldProxyViaSOCKS5(hostname) && !alreadyProxied) {
       if (DEBUG) log(`[proxy] Routing ${hostname} via SOCKS5 (HTTP)`);
-      const newOpts = { ...options, _proxied: true, createConnection: socks5Connect };
+      const newOpts = { ...options, _proxied: true, createConnection: createSocks5ServerSocket };
       return originalHttpRequest.call(this, newOpts, callback);
     }
 
@@ -225,34 +225,37 @@ if (PROXY_URL || SOCKS5_HOST) {
 
       if (shouldProxyViaSOCKS5(hostname) && !alreadyProxied) {
         if (DEBUG) log(`[proxy] fetch: Routing ${hostname} via SOCKS5`);
+        // Convert fetch to https.request with SOCKS5 createConnection
+        const u = new URL(req.url);
         return new Promise((resolve, reject) => {
-          socks5Connect(hostname, 443)
-            .then((rawSocket) => {
-              const tlsSocket = tls.connect({ socket: rawSocket, host: hostname, servername: hostname }, () => {
-                // Send the HTTP request over TLS
-                const method = req.method;
-                const path = url.pathname + url.search;
-                const headers = [];
-                req.headers.forEach((v, k) => headers.push(`${k}: ${v}`));
-                const body = req.body ? req.body : "";
-                const reqStr = `${method} ${path} HTTP/1.1\r\nhost: ${hostname}\r\n${headers.join("\r\n")}\r\nx-proxied: true\r\nconnection: close\r\n\r\n`;
-                tlsSocket.write(reqStr);
-                let respData = Buffer.alloc(0);
-                tlsSocket.on("data", (d) => { respData = Buffer.concat([respData, d]); });
-                tlsSocket.on("end", () => {
-                  const respStr = respData.toString();
-                  const [statusLine, ...headerLines] = respStr.split("\r\n");
-                  const statusMatch = statusLine.match(/HTTP\/\d+\.\d+ (\d+)/);
-                  const status = statusMatch ? parseInt(statusMatch[1]) : 502;
-                  const bodyStart = respStr.indexOf("\r\n\r\n") + 4;
-                  const bodyText = respStr.slice(bodyStart);
-                  resolve(new Response(bodyText, { status, headers: { "content-type": "application/json" } }));
-                });
-                tlsSocket.on("error", reject);
-              });
-              tlsSocket.on("error", reject);
-            })
-            .catch(reject);
+          const chunks = [];
+          const nodeReq = https.request(u, {
+            method: req.method,
+            headers: Object.fromEntries((req.headers || new Map()).entries ? req.headers.entries() : []),
+            createConnection: createSocks5ServerSocket,
+            timeout: 60000,
+          }, (nodeRes) => {
+            nodeRes.on("data", (c) => chunks.push(c));
+            nodeRes.on("end", () => {
+              resolve(new Response(Buffer.concat(chunks), {
+                status: nodeRes.statusCode,
+                statusText: nodeRes.statusMessage,
+                headers: Object.fromEntries((nodeRes.headers || []).entries ? Object.entries(nodeRes.headers) : []),
+              }));
+            });
+          });
+          nodeReq.on("error", reject);
+          nodeReq.on("timeout", () => { nodeReq.destroy(); reject(new Error("SOCKS5 fetch timeout")); });
+          // Pipe request body if present
+          if (req.body) {
+            req.body.getReader().read().then(function pump({ done, value }) {
+              if (done) { nodeReq.end(); return; }
+              nodeReq.write(value);
+              return req.body.getReader().read().then(pump);
+            }).catch(reject);
+          } else {
+            nodeReq.end();
+          }
         });
       }
 

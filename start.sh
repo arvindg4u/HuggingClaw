@@ -342,10 +342,50 @@ fi
 SOCKS5_PROXY_URL="${SOCKS5_PROXY_URL:-}"
 SOCKS5_PROXY_DOMAINS="${SOCKS5_PROXY_DOMAINS:-}"
 export SOCKS5_PROXY_URL SOCKS5_PROXY_DOMAINS
+
+TOR_HEALTHY=false
 if [ -n "${SOCKS5_PROXY_URL:-}" ]; then
   echo "Starting Tor SOCKS5 proxy..."
-  tor --RunAsDaemon 1 > /dev/null 2>&1 || true
-  echo "Tor SOCKS5 proxy ready on 127.0.0.1:9050"
+  SOCKS5_PORT="${SOCKS5_PORT:-9050}"
+  
+  # Kill any stale Tor from previous run
+  if [ -f /tmp/tor.pid ]; then
+    kill "$(cat /tmp/tor.pid)" 2>/dev/null || true
+    rm -f /tmp/tor.pid
+  fi
+  
+  # Start Tor as daemon
+  tor --RunAsDaemon 1 --PIDFile /tmp/tor.pid > /dev/null 2>&1
+  
+  # Wait for Tor to be ready (check SOCKS port)
+  echo "Waiting for Tor to establish connection..."
+  for i in $(seq 1 30); do
+    if (echo > /dev/tcp/127.0.0.1/${SOCKS5_PORT}) 2>/dev/null; then
+      TOR_HEALTHY=true
+      break
+    fi
+    sleep 1
+  done
+  
+  if [ "$TOR_HEALTHY" = "true" ]; then
+    echo "Tor SOCKS5 proxy ready on 127.0.0.1:${SOCKS5_PORT}"
+    
+    # Pre-warm Tor circuits by making a background request
+    # This makes the first real request much faster
+    (SOCKS5_PROXY_URL="$SOCKS5_PROXY_URL" 
+     SOCKS5_PROXY_DOMAINS="$SOCKS5_PROXY_DOMAINS" 
+     timeout 15 curl -s --socks5-hostname 127.0.0.1:${SOCKS5_PORT} 
+       "https://check.torproject.org/" > /dev/null 2>&1) &
+    echo "Tor circuits pre-warming in background"
+  else
+    echo "Warning: Tor failed to start within 30s. Check if tor package is installed."
+    echo "Falling back: opencode.ai will connect directly (may be blocked by HF firewall)."
+    # Clear SOCKS5 vars so proxy bypasses Tor
+    unset SOCKS5_PROXY_URL
+    export SOCKS5_PROXY_URL=""
+    unset SOCKS5_PROXY_DOMAINS
+    export SOCKS5_PROXY_DOMAINS=""
+  fi
 fi
 # ── Build config ──
 CONFIG_JSON=$(cat <<'CONFIGEOF'
