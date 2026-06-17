@@ -38,7 +38,7 @@ if (SOCKS5_PROXY) {
 const SOCKS5_DOMAINS_RAW = (process.env.SOCKS5_PROXY_DOMAINS || "").trim();
 const SOCKS5_DOMAIN_LIST = SOCKS5_DOMAINS_RAW ? SOCKS5_DOMAINS_RAW.split(",").map(d => d.trim().toLowerCase()).filter(Boolean) : [];
 
-const DEBUG = process.env.CLOUDFLARE_PROXY_DEBUG === "true";
+const DEBUG = true;
 const PROXY_SHARED_SECRET = (process.env.CLOUDFLARE_PROXY_SECRET || "").trim();
 
 // ── Blocked Domains for Cloudflare Worker ──
@@ -132,17 +132,10 @@ function socks5Connect(targetHost, targetPort) {
   });
 }
 
-// ── Create HTTPS server socket via SOCKS5 ──
+// ── Create raw TCP socket via SOCKS5 (https.request handles TLS upgrade) ──
 function createSocks5ServerSocket(options, callback) {
   socks5Connect(options.hostname || options.host || "localhost", options.port || 443)
-    .then((rawSocket) => {
-      const tlsSocket = tls.connect({
-        socket: rawSocket,
-        host: options.hostname || options.host,
-        servername: options.servername || options.hostname || options.host,
-      }, () => callback(null, tlsSocket));
-      tlsSocket.on("error", callback);
-    })
+    .then((rawSocket) => callback(null, rawSocket))
     .catch(callback);
 }
 
