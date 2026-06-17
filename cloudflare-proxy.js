@@ -1,31 +1,48 @@
 /**
- * Cloudflare Proxy: Transparent Fix for Blocked Domains
+ * Cloudflare + SOCKS5 Proxy: Transparent Fix for Blocked Domains
  *
- * Patches https.request/http.request/fetch and undici to redirect traffic 
- * for blocked hosts through a Cloudflare Worker proxy.
+ * Patches https.request/http.request/fetch and undici to redirect traffic
+ * for blocked hosts through a Cloudflare Worker OR Tor SOCKS5 proxy.
+ *
+ * SOCKS5 mode is activated by setting SOCKS5_PROXY_URL (e.g. socks5h://127.0.0.1:9050)
+ * and SOCKS5_PROXY_DOMAINS (comma-separated domains to route through Tor).
  */
 "use strict";
 
 const https = require("https");
 const http = require("http");
+const net = require("net");
+const tls = require("tls");
 
-// Use stderr for logs to avoid breaking child processes that communicate via stdout JSON
 const log = (...args) => console.error(...args);
 
+// ── Cloudflare Worker Proxy Config ──
 let PROXY_URL = process.env.CLOUDFLARE_PROXY_URL;
-if (
-  PROXY_URL &&
-  !PROXY_URL.startsWith("http://") &&
-  !PROXY_URL.startsWith("https://")
-) {
+if (PROXY_URL && !PROXY_URL.startsWith("http://") && !PROXY_URL.startsWith("https://")) {
   PROXY_URL = `https://${PROXY_URL}`;
 }
 
+// ── SOCKS5 / Tor Proxy Config ──
+const SOCKS5_PROXY = (process.env.SOCKS5_PROXY_URL || "").trim();
+let SOCKS5_HOST = "";
+let SOCKS5_PORT = 9050;
+if (SOCKS5_PROXY) {
+  try {
+    const u = new URL(SOCKS5_PROXY);
+    SOCKS5_HOST = u.hostname;
+    SOCKS5_PORT = parseInt(u.port) || 9050;
+  } catch (e) {
+    log(`[proxy] Invalid SOCKS5_PROXY_URL: ${SOCKS5_PROXY}`);
+  }
+}
+const SOCKS5_DOMAINS_RAW = (process.env.SOCKS5_PROXY_DOMAINS || "").trim();
+const SOCKS5_DOMAIN_LIST = SOCKS5_DOMAINS_RAW ? SOCKS5_DOMAINS_RAW.split(",").map(d => d.trim().toLowerCase()).filter(Boolean) : [];
+
 const DEBUG = process.env.CLOUDFLARE_PROXY_DEBUG === "true";
 const PROXY_SHARED_SECRET = (process.env.CLOUDFLARE_PROXY_SECRET || "").trim();
+
+// ── Blocked Domains for Cloudflare Worker ──
 const DEFAULT_PROXY_DOMAINS = [
-  // Messaging & social platforms — these are the primary use-case for the
-  // Cloudflare proxy on HF Spaces (geo-restrictions on Telegram, Discord, WA).
   "api.telegram.org", "discord.com", "discordapp.com",
   "gateway.discord.gg", "status.discord.com", "web.whatsapp.com",
   "graph.facebook.com", "graph.instagram.com",
@@ -33,371 +50,303 @@ const DEFAULT_PROXY_DOMAINS = [
   "api.linkedin.com", "www.linkedin.com",
   "open.tiktokapis.com", "oauth.reddit.com",
   "youtube.com", "www.youtube.com",
-  // Email delivery
   "api.resend.com", "api.sendgrid.com", "api.mailgun.net",
-  // Google services
   "googleapis.com", "google.com", "googleusercontent.com", "gstatic.com",
-  // NOTE: AI-provider domains (api.openai.com, api.anthropic.com, etc.) are
-  // intentionally NOT included here. Proxying AI calls routes your API keys
-  // through the Cloudflare Worker without an explicit opt-in. Users who need
-  // AI API calls proxied (e.g. geo-restricted regions) can add specific
-  // domains via the CLOUDFLARE_PROXY_DOMAINS environment variable.
 ];
+
 const PROXY_DOMAINS_RAW = (process.env.CLOUDFLARE_PROXY_DOMAINS || "").trim();
 const PROXY_ALL = PROXY_DOMAINS_RAW === "*";
+
 let BLOCKED_DOMAINS;
 if (PROXY_ALL) {
   BLOCKED_DOMAINS = [];
 } else {
-  const extra = PROXY_DOMAINS_RAW.split(",").map((d) => d.trim()).filter(Boolean);
-  const seen = new Set(DEFAULT_PROXY_DOMAINS);
+  const extra = PROXY_DOMAINS_RAW.split(",").map(d => d.trim()).filter(Boolean);
   BLOCKED_DOMAINS = [...DEFAULT_PROXY_DOMAINS];
   for (const d of extra) {
-    if (!seen.has(d)) { BLOCKED_DOMAINS.push(d); seen.add(d); }
+    if (!BLOCKED_DOMAINS.includes(d)) BLOCKED_DOMAINS.push(d);
   }
 }
 
-if (PROXY_URL) {
-  try {
-    const proxy = new URL(PROXY_URL);
-    const originalHttpsRequest = https.request;
-    const originalHttpRequest = http.request;
-    const originalFetch =
-      typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
+// ── Helpers ──
+const isInternalHost = (hostname) => {
+  const n = String(hostname || "").trim().toLowerCase();
+  if (!n) return true;
+  return n === "localhost" || n === "127.0.0.1" || n === "::1" || n === "0.0.0.0" ||
+    n.endsWith(".hf.space") || n.endsWith(".huggingface.co") || n === "huggingface.co" ||
+    (PROXY_URL && (n === new URL(PROXY_URL).hostname));
+};
 
-    const shouldProxyHost = (hostname) => {
-      const normalized = String(hostname || "").trim().toLowerCase();
-      if (!normalized) return false;
+const matchesDomain = (hostname, domainList) => {
+  const n = String(hostname || "").trim().toLowerCase();
+  return domainList.some(d => n === d || n.endsWith(`.${d}`));
+};
 
-      const isInternal =
-        normalized === "localhost" ||
-        normalized === "127.0.0.1" ||
-        normalized === "::1" ||
-        normalized === "0.0.0.0" ||
-        normalized === proxy.hostname ||
-        normalized.endsWith(".hf.space") ||
-        normalized.endsWith(".huggingface.co") ||
-        normalized === "huggingface.co";
+const shouldProxyViaCF = (hostname) => PROXY_URL && !isInternalHost(hostname) && matchesDomain(hostname, BLOCKED_DOMAINS);
+const shouldProxyViaSOCKS5 = (hostname) => SOCKS5_HOST && !isInternalHost(hostname) && matchesDomain(hostname, SOCKS5_DOMAIN_LIST);
 
-      const should = PROXY_ALL ? !isInternal : BLOCKED_DOMAINS.some(
-        (domain) =>
-          normalized === domain || normalized.endsWith(`.${domain}`),
-      );
-
-      return should;
+// ── SOCKS5 Tunnel (pure Node.js, no deps) ──
+function socks5Connect(targetHost, targetPort) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: SOCKS5_HOST, port: SOCKS5_PORT }, () => {
+      // SOCKS5 handshake: no auth
+      socket.write(Buffer.from([0x05, 0x01, 0x00]));
+    });
+    let state = 0; // 0 = auth, 1 = connect
+    let buf = Buffer.alloc(0);
+    const onData = (data) => {
+      buf = Buffer.concat([buf, data]);
+      if (state === 0 && buf.length >= 2) {
+        if (buf[0] !== 0x05 || buf[1] !== 0x00) {
+          return reject(new Error(`SOCKS5 auth failed: ${buf[1]}`));
+        }
+        state = 1;
+        const hbuf = Buffer.from(targetHost);
+        const req = Buffer.concat([
+          Buffer.from([0x05, 0x01, 0x00, 0x03, hbuf.length]),
+          hbuf,
+          Buffer.from([(targetPort >> 8) & 0xFF, targetPort & 0xFF])
+        ]);
+        socket.write(req);
+        buf = Buffer.alloc(0);
+      } else if (state === 1 && buf.length >= 4) {
+        const rep = buf[1];
+        if (rep !== 0x00) {
+          return reject(new Error(`SOCKS5 connect failed: ${rep}`));
+        }
+        // Determine response length (variable for domain names)
+        let respLen = 4;
+        const atyp = buf[3];
+        if (atyp === 0x01) respLen = 10;       // IPv4
+        else if (atyp === 0x03) respLen = 7 + buf[4]; // Domain
+        else if (atyp === 0x04) respLen = 22;  // IPv6
+        if (buf.length >= respLen) {
+          socket.removeListener("data", onData);
+          resolve(socket);
+        }
+      }
     };
+    socket.on("data", onData);
+    socket.on("error", reject);
+    socket.setTimeout(30000, () => { socket.destroy(); reject(new Error("SOCKS5 timeout")); });
+  });
+}
 
-    const patch = (original, originalModuleName) => {
-      return function patchedRequest(arg1, arg2, arg3) {
-        let options = {};
-        let callback;
+// ── Create HTTPS server socket via SOCKS5 ──
+function createSocks5ServerSocket(options, callback) {
+  socks5Connect(options.hostname || options.host || "localhost", options.port || 443)
+    .then((rawSocket) => {
+      const tlsSocket = tls.connect({
+        socket: rawSocket,
+        host: options.hostname || options.host,
+        servername: options.servername || options.hostname || options.host,
+      }, () => callback(null, tlsSocket));
+      tlsSocket.on("error", callback);
+    })
+    .catch(callback);
+}
 
-        if (typeof arg1 === "string" || arg1 instanceof URL) {
-          const url = typeof arg1 === "string" ? new URL(arg1) : arg1;
-          options = {
-            protocol: url.protocol,
-            hostname: url.hostname,
-            port: url.port,
-            path: url.pathname + url.search,
-          };
-          if (typeof arg2 === "object" && arg2 !== null) {
-            options = { ...options, ...arg2 };
-            callback = arg3;
-          } else {
-            callback = arg2;
-          }
-        } else {
-          options = { ...arg1 };
-          callback = arg2;
-        }
+// ── Patch https.request ──
+if (PROXY_URL || SOCKS5_HOST) {
+  const originalHttpsRequest = https.request;
+  const originalHttpRequest = http.request;
+  const originalFetch = typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
 
-        const hostname =
-          options.hostname ||
-          (options.host ? String(options.host).split(":")[0] : "");
-        const path = options.path || "/";
-        const headers = options.headers || {};
+  https.request = function patchedHttpsRequest(arg1, arg2, arg3) {
+    let options = {}, callback;
+    if (typeof arg1 === "string" || arg1 instanceof URL) {
+      const url = typeof arg1 === "string" ? new URL(arg1) : arg1;
+      options = { protocol: url.protocol, hostname: url.hostname, port: url.port, path: url.pathname + url.search };
+      if (typeof arg2 === "object" && arg2 !== null) { Object.assign(options, arg2); callback = arg3; }
+      else { callback = arg2; }
+    } else { options = { ...arg1 }; callback = arg2; }
 
-        const shouldProxy = shouldProxyHost(hostname);
-        const alreadyProxied = options._proxied;
-        const hasTargetHeader =
-          headers["x-target-host"] || headers["X-Target-Host"];
+    const hostname = options.hostname || (options.host ? String(options.host).split(":")[0] : "");
+    const path = options.path || "/";
+    const headers = options.headers || {};
+    const alreadyProxied = options._proxied;
+    const hasTargetHeader = headers["x-target-host"] || headers["X-Target-Host"];
 
-        if (shouldProxy && !alreadyProxied && !hasTargetHeader) {
-          if (DEBUG) {
-            log(
-              `[cloudflare-proxy] Redirecting ${originalModuleName}://${hostname}${path} -> ${proxy.hostname}`,
-            );
-          }
-
-          const newOptions = { ...options };
-          newOptions._proxied = true;
-          newOptions.protocol = "https:";
-          newOptions.hostname = proxy.hostname;
-          newOptions.port = proxy.port || 443;
-          newOptions.servername = proxy.hostname;
-          delete newOptions.host;
-          delete newOptions.agent;
-
-          newOptions.headers = {
-            ...(options.headers || {}),
-            host: proxy.host,
-            "x-target-host": hostname,
-          };
-
-          if (PROXY_SHARED_SECRET) {
-            newOptions.headers["x-proxy-key"] = PROXY_SHARED_SECRET;
-          }
-
-          return originalHttpsRequest.call(https, newOptions, callback);
-        }
-
-        return original.call(this, arg1, arg2, arg3);
-      };
-    };
-
-    https.request = patch(originalHttpsRequest, "https");
-    http.request = patch(originalHttpRequest, "http");
-
-    if (originalFetch) {
-      globalThis.fetch = async function patchedFetch(input, init) {
-        const request = input instanceof Request ? input : null;
-        const urlStr = request ? request.url : String(input);
-        
-        let url;
-        try {
-          url = new URL(urlStr);
-        } catch (e) {
-          return originalFetch(input, init);
-        }
-
-        const hostname = url.hostname;
-        const shouldProxy = shouldProxyHost(hostname);
-        
-        let mergedHeaders;
-        if (request) {
-            mergedHeaders = new Headers(request.headers);
-        } else {
-            mergedHeaders = new Headers(init?.headers || {});
-        }
-
-        const alreadyProxied =
-          mergedHeaders.has("x-target-host") || mergedHeaders.has("X-Target-Host");
-
-        if (!shouldProxy || alreadyProxied) {
-          return originalFetch(input, init);
-        }
-
-        if (DEBUG) {
-          log(
-            `[cloudflare-proxy] Redirecting fetch://${hostname}${url.pathname}${url.search} -> ${proxy.hostname}`,
-          );
-        }
-
-        mergedHeaders.set("x-target-host", hostname);
-        if (PROXY_SHARED_SECRET) {
-          mergedHeaders.set("x-proxy-key", PROXY_SHARED_SECRET);
-        }
-
-        const proxiedUrl = new URL(url.pathname + url.search, proxy);
-
-        const logProxyError = (promise, debugInfo) => {
-          promise
-            .then(r => {
-              if (DEBUG && !r.ok) {
-                log(`[cloudflare-proxy] Proxy HTTP ${r.status} for ${hostname}: ${r.statusText}`);
-              }
-            })
-            .catch(err => {
-              const cause = err?.cause;
-              const causeStr = cause
-                ? ` | cause: ${cause?.code || cause?.message || String(cause)}`
-                : "";
-              log(`[cloudflare-proxy] Proxy FAILED ${hostname}: ${err?.message}${causeStr}`);
-              if (DEBUG && debugInfo) {
-                log(`[cloudflare-proxy] Debug: ${debugInfo}`);
-              }
-            });
-          return promise;
-        };
-
-        if (request) {
-          const fetchOpts = {
-            method: request.method,
-            headers: mergedHeaders,
-            redirect: request.redirect,
-          };
-          if (request.body) {
-            fetchOpts.body = request.body;
-            fetchOpts.duplex = "half";
-          }
-          return logProxyError(
-            originalFetch(String(proxiedUrl), fetchOpts),
-            `request-mode method=${request.method} hasBody=${!!request.body}`,
-          );
-        }
-
-        // Build a fresh init: do NOT spread `init` because it may carry a
-        // `dispatcher`/`client` pinned to the original target's connection
-        // pool, which causes undici to throw UND_ERR_INVALID_ARG when we
-        // change the origin. Forward only well-known fetch options.
-        const newInit = {
-          method: init?.method || "GET",
-          headers: mergedHeaders,
-        };
-        if (init?.body != null) {
-          newInit.body = init.body;
-          if (init.body instanceof ReadableStream) {
-            newInit.duplex = init.duplex || "half";
-          }
-        }
-        if (init?.signal) newInit.signal = init.signal;
-        if (init?.redirect) newInit.redirect = init.redirect;
-        if (init?.credentials) newInit.credentials = init.credentials;
-        if (init?.cache) newInit.cache = init.cache;
-        if (init?.mode) newInit.mode = init.mode;
-        if (init?.referrer) newInit.referrer = init.referrer;
-        if (init?.referrerPolicy) newInit.referrerPolicy = init.referrerPolicy;
-        if (init?.integrity) newInit.integrity = init.integrity;
-        if (init?.keepalive != null) newInit.keepalive = init.keepalive;
-
-        const bodyType = init?.body == null
-          ? "none"
-          : init.body instanceof ReadableStream
-            ? "ReadableStream"
-            : (init.body?.constructor?.name || typeof init.body);
-
-        return logProxyError(
-          originalFetch(String(proxiedUrl), newInit),
-          `init-mode method=${newInit.method} body=${bodyType} initKeys=${Object.keys(init || {}).join(",")}`,
-        );
-      };
+    // Try SOCKS5 first
+    if (shouldProxyViaSOCKS5(hostname) && !alreadyProxied) {
+      if (DEBUG) log(`[proxy] Routing ${hostname}${path} via SOCKS5 (${SOCKS5_HOST}:${SOCKS5_PORT})`);
+      // Use createConnection to route through SOCKS5 tunnel
+      const newOpts = { ...options, _proxied: true, createConnection: createSocks5ServerSocket };
+      return originalHttpsRequest.call(this, newOpts, callback);
     }
 
-    // undici patching
-    const patchUndiciInstance = (exports) => {
-      if (!exports) return;
+    // Then try Cloudflare Worker
+    if (shouldProxyViaCF(hostname) && !alreadyProxied && !hasTargetHeader) {
+      if (DEBUG) log(`[proxy] Redirecting ${hostname}${path} -> ${new URL(PROXY_URL).hostname}`);
+      const newOpts = { ...options, _proxied: true, protocol: "https:", hostname: new URL(PROXY_URL).hostname, port: new URL(PROXY_URL).port || 443, servername: new URL(PROXY_URL).hostname };
+      delete newOpts.host;
+      if (!newOpts.headers) newOpts.headers = {};
+      newOpts.headers["x-target-host"] = hostname;
+      if (PROXY_SHARED_SECRET) newOpts.headers["x-proxy-key"] = PROXY_SHARED_SECRET;
+      return originalHttpsRequest.call(this, newOpts, callback);
+    }
 
-      const patchDispatch = (proto, name) => {
-        if (proto && proto.dispatch && !proto.dispatch._patched) {
-          const origDispatch = proto.dispatch;
-          proto.dispatch = function(options, handler) {
-            let origin = options.origin || this.origin;
-            if (origin && typeof origin !== 'string') {
-              try { origin = origin.origin || origin.toString(); } catch (e) { origin = ""; }
-            }
-            
-            let hostname = "";
-            try {
-              hostname = new URL(String(origin)).hostname;
-            } catch(e) {
-              hostname = String(origin || "").split(':')[0];
-            }
+    return originalHttpsRequest.call(this, options, callback);
+  };
 
-            if (hostname && shouldProxyHost(hostname)) {
-              if (DEBUG) log(`[cloudflare-proxy] Redirecting undici ${name}.dispatch: ${hostname}${options.path || ""} -> ${proxy.hostname}`);
-              
-              const targetHeader = "x-target-host";
-              const secretHeader = "x-proxy-key";
+  // ── Patch http.request ──
+  http.request = function patchedHttpRequest(arg1, arg2, arg3) {
+    let options = {}, callback;
+    if (typeof arg1 === "string" || arg1 instanceof URL) {
+      const url = typeof arg1 === "string" ? new URL(arg1) : arg1;
+      options = { protocol: url.protocol, hostname: url.hostname, port: url.port, path: url.pathname + url.search };
+      if (typeof arg2 === "object" && arg2 !== null) { Object.assign(options, arg2); callback = arg3; }
+      else { callback = arg2; }
+    } else { options = { ...arg1 }; callback = arg2; }
 
-              if (Array.isArray(options.headers)) {
-                let foundTarget = false;
-                for (let i = 0; i < options.headers.length; i += 2) {
-                  if (String(options.headers[i]).toLowerCase() === targetHeader) {
-                    foundTarget = true;
-                    break;
-                  }
-                }
-                if (!foundTarget) {
-                  options.headers.push(targetHeader, hostname);
-                  if (PROXY_SHARED_SECRET) options.headers.push(secretHeader, PROXY_SHARED_SECRET);
-                }
-              } else {
-                options.headers = options.headers || {};
-                if (options.headers instanceof Map || (typeof options.headers.set === 'function')) {
-                  options.headers.set(targetHeader, hostname);
-                  if (PROXY_SHARED_SECRET) options.headers.set(secretHeader, PROXY_SHARED_SECRET);
-                } else {
-                  options.headers[targetHeader] = hostname;
-                  if (PROXY_SHARED_SECRET) options.headers[secretHeader] = PROXY_SHARED_SECRET;
-                }
-              }
-              options.origin = `https://${proxy.hostname}`;
-            }
-            return origDispatch.call(this, options, handler);
-          };
-          proto.dispatch._patched = true;
-        }
-      };
+    const hostname = options.hostname || (options.host ? String(options.host).split(":")[0] : "");
+    const alreadyProxied = options._proxied;
 
-      for (const key in exports) {
-        if (exports[key] && exports[key].prototype && typeof exports[key].prototype.dispatch === 'function') {
-           patchDispatch(exports[key].prototype, key);
-        }
+    if (shouldProxyViaSOCKS5(hostname) && !alreadyProxied) {
+      if (DEBUG) log(`[proxy] Routing ${hostname} via SOCKS5 (HTTP)`);
+      const newOpts = { ...options, _proxied: true, createConnection: socks5Connect };
+      return originalHttpRequest.call(this, newOpts, callback);
+    }
+
+    if (shouldProxyViaCF(hostname) && !alreadyProxied) {
+      if (DEBUG) log(`[proxy] Redirecting ${hostname} -> Cloudflare Worker`);
+      const newOpts = { ...options, _proxied: true, protocol: "https:", hostname: new URL(PROXY_URL).hostname, port: new URL(PROXY_URL).port || 443, servername: new URL(PROXY_URL).hostname };
+      delete newOpts.host;
+      if (!newOpts.headers) newOpts.headers = {};
+      newOpts.headers["x-target-host"] = hostname;
+      if (PROXY_SHARED_SECRET) newOpts.headers["x-proxy-key"] = PROXY_SHARED_SECRET;
+      return originalHttpRequest.call(this, newOpts, callback);
+    }
+
+    return originalHttpRequest.call(this, options, callback);
+  };
+
+  // ── Patch globalThis.fetch ──
+  if (originalFetch) {
+    globalThis.fetch = async function patchedFetch(input, init) {
+      const req = input instanceof Request ? input : new Request(input, init);
+      const url = new URL(req.url);
+      const hostname = url.hostname;
+      const alreadyProxied = req.headers.get("x-proxied") === "true";
+      const hasTargetHeader = req.headers.has("x-target-host");
+
+      if (shouldProxyViaSOCKS5(hostname) && !alreadyProxied) {
+        if (DEBUG) log(`[proxy] fetch: Routing ${hostname} via SOCKS5`);
+        return new Promise((resolve, reject) => {
+          socks5Connect(hostname, 443)
+            .then((rawSocket) => {
+              const tlsSocket = tls.connect({ socket: rawSocket, host: hostname, servername: hostname }, () => {
+                // Send the HTTP request over TLS
+                const method = req.method;
+                const path = url.pathname + url.search;
+                const headers = [];
+                req.headers.forEach((v, k) => headers.push(`${k}: ${v}`));
+                const body = req.body ? req.body : "";
+                const reqStr = `${method} ${path} HTTP/1.1\r\nhost: ${hostname}\r\n${headers.join("\r\n")}\r\nx-proxied: true\r\nconnection: close\r\n\r\n`;
+                tlsSocket.write(reqStr);
+                let respData = Buffer.alloc(0);
+                tlsSocket.on("data", (d) => { respData = Buffer.concat([respData, d]); });
+                tlsSocket.on("end", () => {
+                  const respStr = respData.toString();
+                  const [statusLine, ...headerLines] = respStr.split("\r\n");
+                  const statusMatch = statusLine.match(/HTTP\/\d+\.\d+ (\d+)/);
+                  const status = statusMatch ? parseInt(statusMatch[1]) : 502;
+                  const bodyStart = respStr.indexOf("\r\n\r\n") + 4;
+                  const bodyText = respStr.slice(bodyStart);
+                  resolve(new Response(bodyText, { status, headers: { "content-type": "application/json" } }));
+                });
+                tlsSocket.on("error", reject);
+              });
+              tlsSocket.on("error", reject);
+            })
+            .catch(reject);
+        });
       }
 
-      if (exports.getGlobalDispatcher) {
-        try {
-          const globalDispatcher = exports.getGlobalDispatcher();
-          if (globalDispatcher && globalDispatcher.dispatch && !globalDispatcher.dispatch._patched) {
-            patchDispatch(globalDispatcher, "GlobalDispatcherInstance");
+      if (shouldProxyViaCF(hostname) && !alreadyProxied && !hasTargetHeader) {
+        if (DEBUG) log(`[proxy] fetch: Redirecting ${hostname} -> Cloudflare Worker`);
+        const proxyUrl = new URL(PROXY_URL);
+        const newUrl = `https://${proxyUrl.hostname}${url.pathname}${url.search}`;
+        const newHeaders = new Headers(req.headers);
+        newHeaders.set("x-target-host", hostname);
+        if (PROXY_SHARED_SECRET) newHeaders.set("x-proxy-key", PROXY_SHARED_SECRET);
+        newHeaders.set("x-proxied", "true");
+        return originalFetch(newUrl, { ...init, headers: newHeaders });
+      }
+
+      return originalFetch(input, init);
+    };
+  }
+
+  // ── Patch undici dispatch ──
+  try {
+    const patchDispatch = (proto, name) => {
+      if (!proto || !proto.dispatch || proto.dispatch._patched) return;
+      const origDispatch = proto.dispatch;
+      proto.dispatch = function patchedDispatch(options, handler) {
+        let origin = options.origin || "";
+        if (typeof origin !== "string") { try { origin = origin.origin || origin.toString(); } catch (e) { origin = ""; } }
+        let hostname = "";
+        try { hostname = new URL(String(origin)).hostname; } catch (e) { hostname = String(origin || "").split(":")[0]; }
+
+        // SOCKS5
+        if (hostname && shouldProxyViaSOCKS5(hostname)) {
+          if (DEBUG) log(`[proxy] undici ${name}: Routing ${hostname} via SOCKS5`);
+          // Fall back to fetch which handles SOCKS5
+          return origDispatch.call(this, options, handler);
+        }
+
+        // Cloudflare Worker
+        if (hostname && shouldProxyViaCF(hostname)) {
+          if (DEBUG) log(`[proxy] undici ${name}: ${hostname} -> ${new URL(PROXY_URL).hostname}`);
+          const targetHeader = "x-target-host";
+          if (Array.isArray(options.headers)) {
+            let found = false;
+            for (let i = 0; i < options.headers.length; i += 2) {
+              if (String(options.headers[i]).toLowerCase() === targetHeader) { found = true; break; }
+            }
+            if (!found) { options.headers.push(targetHeader, hostname); }
+          } else {
+            options.headers = options.headers || {};
+            options.headers[targetHeader] = hostname;
           }
-        } catch (e) {}
-      }
+          options.origin = PROXY_URL;
+        }
+        return origDispatch.call(this, options, handler);
+      };
+      proto.dispatch._patched = true;
+    };
 
-      // Also patch Agent and other potentially unexported classes if they have dispatch
+    const patchUndici = (exports) => {
+      for (const key in exports) {
+        if (exports[key] && exports[key].prototype && typeof exports[key].prototype.dispatch === "function") {
+          patchDispatch(exports[key].prototype, key);
+        }
+      }
+      if (exports.getGlobalDispatcher) {
+        try { const gd = exports.getGlobalDispatcher(); if (gd && gd.dispatch && !gd.dispatch._patched) patchDispatch(gd, "Global"); } catch (e) {}
+      }
       if (exports.Agent && exports.Agent.prototype) patchDispatch(exports.Agent.prototype, "Agent");
       if (exports.Pool && exports.Pool.prototype) patchDispatch(exports.Pool.prototype, "Pool");
       if (exports.Client && exports.Client.prototype) patchDispatch(exports.Client.prototype, "Client");
-
-      if (exports.fetch && !exports.fetch._patched) {
-        const origFetch = exports.fetch;
-        exports.fetch = async function (input, init) {
-          // If we are calling undici.fetch, it should use our globalThis.fetch which is patched
-          return globalThis.fetch(input, init);
-        };
-        exports.fetch._patched = true;
-      }
     };
 
-    // Try to require undici immediately
-    try {
-      const undici = require("undici");
-      patchUndiciInstance(undici);
-    } catch (e) {}
-
-    // Hook require() to patch any undici instance the moment it loads.
-    // Match either the bare "undici" id or paths whose final package
-    // segment IS undici (e.g. "/foo/node_modules/undici/index.js"). The
-    // earlier substring check `id.includes("/undici/")` would also match
-    // unrelated packages like "super-undici-x".
+    try { const undici = require("undici"); patchUndici(undici); } catch (e) {}
     const Module = require("module");
     const originalRequire = Module.prototype.require;
-    const UNDICI_PATH_RE = /(?:^|\/)node_modules\/undici(?:\/|$)/;
     Module.prototype.require = function (id) {
       const exports = originalRequire.apply(this, arguments);
-      if (id === "undici" || UNDICI_PATH_RE.test(id)) {
-        try { patchUndiciInstance(exports); } catch (e) {}
-      }
+      if (id === "undici" || /node_modules\/undici(?:\/|$)/.test(id)) { try { patchUndici(exports); } catch (e) {} }
       return exports;
     };
-
-    // Startup banner: print once across all Node spawns. Use a file marker
-    // because every Node process (health-server, gateway, sync subprocess)
-    // is spawned fresh from bash with NODE_OPTIONS=--require, so an env-var
-    // marker won't propagate. /tmp is per-container so it resets on rebuild.
-    if (DEBUG) {
-      try {
-        require("fs").writeFileSync("/tmp/.cf-proxy-banner-shown", "1", {
-          flag: "wx",
-        });
-        log(
-          `[cloudflare-proxy] active (${PROXY_ALL ? "wildcard" : "list"}) -> ${proxy.hostname}`,
-        );
-      } catch (_) {
-        // marker exists — banner already shown by another process
-      }
-    }
-  } catch (error) {
-    log(`[cloudflare-proxy] Failed to initialize: ${error.message}`);
+  } catch (e) {
+    if (DEBUG) log(`[proxy] undici patch skipped: ${e.message}`);
   }
+
+  // Startup banner
+  try {
+    require("fs").writeFileSync("/tmp/.cf-proxy-banner-shown", "1", { flag: "wx" });
+    if (SOCKS5_HOST) log(`[proxy] SOCKS5 active (${SOCKS5_HOST}:${SOCKS5_PORT}) for: ${SOCKS5_DOMAINS_RAW || "(none)"}`);
+    if (PROXY_URL) log(`[proxy] Cloudflare active -> ${new URL(PROXY_URL).hostname}${PROXY_ALL ? " (wildcard)" : ""}`);
+  } catch (_) {}
 }

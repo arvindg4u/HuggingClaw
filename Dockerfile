@@ -28,6 +28,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     curl \
     dbus \
+    tor \
+    proxychains4 \
     dbus-x11 \
     python3 \
     python3-pip \
