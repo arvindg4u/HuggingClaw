@@ -365,7 +365,6 @@ DataDirectory /tmp/tor-data
 PidFile /tmp/tor.pid
 Log notice stdout
 RunAsDaemon 1
-User node
 TOREOF
   
   # Start Tor as daemon with custom config
