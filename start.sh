@@ -343,18 +343,9 @@ SOCKS5_PROXY_URL="${SOCKS5_PROXY_URL:-}"
 SOCKS5_PROXY_DOMAINS="${SOCKS5_PROXY_DOMAINS:-}"
 export SOCKS5_PROXY_URL SOCKS5_PROXY_DOMAINS
 if [ -n "${SOCKS5_PROXY_URL:-}" ]; then
-  TOR_RC="/etc/tor/torrc"
-  if [ -f "$TOR_RC" ]; then
-    echo "Starting Tor SOCKS5 proxy..."
-    SOCKS5_PORT="$(printf '%s' "$SOCKS5_PROXY_URL" | sed -E "s|^socks5h?://||" | cut -d: -f2)"
-    SOCKS5_PORT="${SOCKS5_PORT:-9050}"
-    if ! grep -q "^SocksPort " "$TOR_RC" 2>/dev/null; then
-      echo "SocksPort 127.0.0.1:$SOCKS5_PORT" >> "$TOR_RC"
-      echo "RunAsDaemon 1" >> "$TOR_RC"
-    fi
-    tor --RunAsDaemon 1 > /dev/null 2>&1 || true
-    echo "Tor SOCKS5 proxy ready on 127.0.0.1:$SOCKS5_PORT"
-  fi
+  echo "Starting Tor SOCKS5 proxy..."
+  tor --RunAsDaemon 1 > /dev/null 2>&1 || true
+  echo "Tor SOCKS5 proxy ready on 127.0.0.1:9050"
 fi
 # ── Build config ──
 CONFIG_JSON=$(cat <<'CONFIGEOF'
