@@ -193,6 +193,7 @@ case "$LLM_PROVIDER" in
   # ── OpenCode Providers ──
   opencode)                     export OPENCODE_API_KEY="$LLM_API_KEY" ;;
   opencode-go)                  export OPENCODE_API_KEY="$LLM_API_KEY" ;;
+  opencode-free)                export CUSTOM_API_KEY="$LLM_API_KEY" ;;
   # ── Gateway/Router Providers ──
   openrouter)                   export OPENROUTER_API_KEY="$LLM_API_KEY" ;;
   kilocode)                     export KILOCODE_API_KEY="$LLM_API_KEY" ;;
@@ -812,6 +813,7 @@ if [ -f "$EXISTING_CONFIG" ]; then
      | .plugins.allow = (((.plugins.allow // []) + ($desired.plugins.allow // [])) | unique)
      | .plugins.deny = (((.plugins.deny // []) + ($desired.plugins.deny // [])) | unique)
      | .plugins.entries = ((.plugins.entries // {}) * ($desired.plugins.entries // {}))
+     | .models = ((.models // {}) * ($desired.models // {}))
      | if $whatsappEnabled then
          ($desired.channels.whatsapp // {"dmPolicy": "pairing"}) as $desiredWhatsapp
          | .plugins.entries.whatsapp.enabled = true
