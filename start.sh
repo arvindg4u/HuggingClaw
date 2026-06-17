@@ -812,7 +812,6 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
           "commandText": "status"
         }
       }
-    | .channels.telegram.includeGroupHistoryContext = "recent"
     | .channels.telegram.pollingStallThresholdMs = 180000
     | (if $proxy_url != "" then .channels.telegram.apiRoot = $proxy_url else . end)
     | .channels.telegram.retry = {
