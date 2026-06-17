@@ -354,8 +354,22 @@ if [ -n "${SOCKS5_PROXY_URL:-}" ]; then
     rm -f /tmp/tor.pid
   fi
   
-  # Start Tor as daemon
-  tor --RunAsDaemon 1 --PIDFile /tmp/tor.pid > /dev/null 2>&1
+  # Create writable directories for Tor (user: node)
+  mkdir -p /tmp/tor-data /tmp/tor-run
+  chmod 700 /tmp/tor-data /tmp/tor-run
+  
+  # Write minimal torrc (avoids /etc/tor/torrc permission issues)
+  cat > /tmp/torrc << 'TOREOF'
+SOCKSPort 9050
+DataDirectory /tmp/tor-data
+PidFile /tmp/tor.pid
+Log notice stdout
+RunAsDaemon 1
+User node
+TOREOF
+  
+  # Start Tor as daemon with custom config
+  tor -f /tmp/torrc > /dev/null 2>&1
   
   # Wait for Tor to be ready (check SOCKS port)
   echo "Waiting for Tor to establish connection..."
@@ -790,8 +804,17 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq --arg token "$CLEAN_TG_TOKEN" --arg proxy_url "$TELEGRAM_API_ROOT" '
     .channels.telegram.enabled = true
     | .channels.telegram.botToken = $token
-    | .channels.telegram.commands.native = false
+    | .channels.telegram.commands.native = true
     | .channels.telegram.timeoutSeconds = 60
+    | .channels.telegram.streaming = {
+        "mode": "partial",
+        "preview": {
+          "toolProgress": true,
+          "commandText": "status"
+        }
+      }
+    | .channels.telegram.includeGroupHistoryContext = "recent"
+    | .channels.telegram.pollingStallThresholdMs = 180000
     | (if $proxy_url != "" then .channels.telegram.apiRoot = $proxy_url else . end)
     | .channels.telegram.retry = {
         "attempts": 5,
