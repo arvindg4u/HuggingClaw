@@ -384,11 +384,7 @@ TOREOF
     echo "Tor SOCKS5 proxy ready on 127.0.0.1:${SOCKS5_PORT}"
     
     # Pre-warm Tor circuits by making a background request
-    # This makes the first real request much faster
-    (SOCKS5_PROXY_URL="$SOCKS5_PROXY_URL" 
-     SOCKS5_PROXY_DOMAINS="$SOCKS5_PROXY_DOMAINS" 
-     timeout 15 curl -s --socks5-hostname 127.0.0.1:${SOCKS5_PORT} 
-       "https://check.torproject.org/" > /dev/null 2>&1) &
+    (timeout 15 curl -s --socks5-hostname 127.0.0.1:${SOCKS5_PORT} "https://check.torproject.org/" > /dev/null 2>&1) &
     echo "Tor circuits pre-warming in background"
   else
     echo "Warning: Tor failed to start within 30s. Check if tor package is installed."
