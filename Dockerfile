@@ -20,6 +20,7 @@ ARG DEV_MODE=false
 # override by setting DEV_MODE=false as an HF Space Variable to opt out.
 
 # Install system dependencies (+ optional JupyterLab deps in DEV_MODE)
+# tor and proxychains4 removed (replaced by proxy-pool.py)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     sudo \
@@ -28,8 +29,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     curl \
     dbus \
-    tor \
-    proxychains4 \
     dbus-x11 \
     python3 \
     python3-pip \
@@ -95,13 +94,14 @@ RUN ln -s /home/node/.openclaw/openclaw-app/openclaw.mjs /usr/local/bin/openclaw
 
 # Copy HuggingClaw files
 COPY --chown=1000:1000 cloudflare-proxy.js /opt/cloudflare-proxy.js
-COPY --chown=1000:1000 cloudflare-proxy-setup.py /home/node/app/cloudflare-proxy-setup.py
+COPY --chown=1000:1000 proxy-pool.py /home/node/app/proxy-pool.py
+# COPY cloudflare-proxy-setup.py removed
 COPY --chown=1000:1000 health-server.js /home/node/app/health-server.js
 COPY --chown=1000:1000 login.html /home/node/app/login.html
 COPY --chown=1000:1000 iframe-fix.cjs /home/node/app/iframe-fix.cjs
 COPY --chown=1000:1000 start.sh /home/node/app/start.sh
 COPY --chown=1000:1000 wa-guardian.js /home/node/app/wa-guardian.js
-COPY --chown=1000:1000 cloudflare-keepalive-setup.py /home/node/app/cloudflare-keepalive-setup.py
+# COPY cloudflare-keepalive-setup.py removed
 COPY --chown=1000:1000 openclaw-sync.py /home/node/app/openclaw-sync.py
 COPY --chown=1000:1000 multi-provider-key-rotator.cjs /home/node/app/multi-provider-key-rotator.cjs
 COPY --chown=1000:1000 env-builder.html /home/node/app/env-builder.html
@@ -109,8 +109,7 @@ COPY --chown=1000:1000 env-builder.js /home/node/app/env-builder.js
 COPY --chown=1000:1000 jupyter-devdata-sync.py /home/node/app/jupyter-devdata-sync.py
 # login.html template is now copied inside the DEV_MODE install block above
 RUN chmod +x /home/node/app/start.sh \
-              /home/node/app/cloudflare-proxy-setup.py \
-              /home/node/app/cloudflare-keepalive-setup.py \
+              /home/node/app/proxy-pool.py \
               /home/node/app/openclaw-sync.py \
               /home/node/app/jupyter-devdata-sync.py \
               /home/node/app/multi-provider-key-rotator.cjs

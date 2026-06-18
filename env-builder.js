@@ -772,58 +772,22 @@ const FIELDS = [
     "tag": "feature"
   },
 {
-    "g": "Cloudflare",
-    "icon": "⚡",
-    "k": "CLOUDFLARE_PROXY_DEBUG",
-    "lbl": "Cloudflare proxy debug",
-    "type": "toggle",
-    "ph": "false",
-    "tag": "advanced"
-  },
-{
-    "g": "Cloudflare",
-    "icon": "⚡",
-    "k": "CLOUDFLARE_KEEPALIVE_ENABLED",
-    "lbl": "Enable keep-awake worker",
-    "type": "toggle",
-    "ph": "true",
-    "tag": "feature"
-  },
-{
-    "g": "Cloudflare",
-    "icon": "⚡",
-    "k": "CLOUDFLARE_PROXY_URL",
-    "lbl": "Proxy worker URL",
+    "g": "Network",
+    "icon": "🌐",
+    "k": "SOCKS5_PROXY_URL",
+    "lbl": "Custom SOCKS5 proxy",
     "type": "text",
-    "ph": "https://your-proxy.workers.dev",
-    "common": 1,
-    "tag": "feature"
-  },
-{
-    "g": "Cloudflare",
-    "icon": "⚡",
-    "k": "CLOUDFLARE_PROXY_SECRET",
-    "lbl": "Proxy shared secret",
-    "type": "password",
-    "tag": "credential"
-  },
-{
-    "g": "Cloudflare",
-    "icon": "⚡",
-    "k": "CLOUDFLARE_PROXY_DOMAINS",
-    "lbl": "Extra domains to proxy",
-    "type": "textarea",
-    "ph": "api.sendgrid.com,slack.com",
+    "ph": "socks5h://user:pass@host:1080",
     "tag": "advanced"
   },
 {
-    "g": "Cloudflare",
-    "icon": "⚡",
-    "k": "CLOUDFLARE_WORKERS_TOKEN",
-    "lbl": "Workers API token",
-    "type": "password",
-    "common": 1,
-    "tag": "credential"
+    "g": "Network",
+    "icon": "🌐",
+    "k": "SOCKS5_PROXY_DOMAINS",
+    "lbl": "Domains to route through proxy",
+    "type": "textarea",
+    "ph": "api.example.com,other.com",
+    "tag": "advanced"
   },
 {
     "g": "Core",

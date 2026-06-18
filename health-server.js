@@ -194,7 +194,7 @@ if (_spacPrivacyEnv !== "public" && _spacPrivacyEnv !== "private") {
   setInterval(detectSpacePrivacy, 5 * 60 * 1000);
 }
 const CLOUDFLARE_KEEPALIVE_STATUS_FILE =
-  "/tmp/huggingclaw-cloudflare-keepalive-status.json";
+  "/tmp/huggingclaw-proxy-pool-status.json";
 
 function parseRequestUrl(url) {
   try { return new URL(url, "http://localhost"); }
@@ -372,20 +372,20 @@ function renderDashboard(data) {
   const syncStatus = String(data.sync?.status || "unknown");
   const syncTone = ["success","restored","synced","configured"].includes(syncStatus) ? "ok" : syncStatus === "disabled" ? "warn" : "neutral";
   const kaConf = data.keepalive?.configured === true;
-  const kaStatus = String(data.keepalive?.status || (process.env.CLOUDFLARE_WORKERS_TOKEN ? "pending" : "not configured"));
-  const kaTone = kaConf ? "ok" : process.env.CLOUDFLARE_WORKERS_TOKEN ? "warn" : "neutral";
+  const kaStatus = String(data.keepalive?.status || "not configured");
+  const kaTone = kaConf ? "ok" : "neutral";
 
   const tiles = [
     tile({ title: "Gateway", value: badge(data.gatewayReady ? "Online" : "Offline", data.gatewayReady ? "ok" : "off"), detail: `OpenClaw on internal port ${GATEWAY_PORT}`, tone: data.gatewayReady ? "ok" : "off" }),
     tile({ title: "Model", value: `<code>${escapeHtml(LLM_MODEL)}</code>`, detail: LLM_PROVIDER ? `Provider: ${escapeHtml(LLM_PROVIDER)}` : "Primary LLM configured", tone: "neutral" }),
     tile({ title: "Runtime", value: escapeHtml(data.uptimeHuman), detail: `Public port ${PORT}`, tone: "neutral" }),
-    tile({ title: "Telegram", value: badge(TELEGRAM_ENABLED ? "Enabled" : "Disabled", TELEGRAM_ENABLED ? "ok" : "neutral"), detail: TELEGRAM_ENABLED ? (TELEGRAM_WEBHOOK_URL ? "Webhook" : "Polling") + (process.env.CLOUDFLARE_PROXY_URL ? " via CF proxy" : "") : "Not configured", tone: TELEGRAM_ENABLED ? "ok" : "neutral" }),
+    tile({ title: "Telegram", value: badge(TELEGRAM_ENABLED ? "Enabled" : "Disabled", TELEGRAM_ENABLED ? "ok" : "neutral"), detail: TELEGRAM_ENABLED ? (TELEGRAM_WEBHOOK_URL ? "Webhook" : "Polling via DNS override") : "Not configured", tone: TELEGRAM_ENABLED ? "ok" : "neutral" }),
   ];
 
 
   tiles.push(
     tile({ title: "Backup", value: badge(syncStatus.toUpperCase(), syncTone), detail: escapeHtml(data.sync?.message || "No status yet"), tone: syncTone, meta: data.sync?.timestamp ? `<span class="local-time" data-iso="${data.sync.timestamp}"></span>` : "" }),
-    tile({ title: "Keep Awake", value: badge(kaConf ? "CF Cron" : kaStatus.toUpperCase(), kaTone), detail: kaConf ? `Pinging <code>${escapeHtml(data.keepalive?.targetUrl || "/health")}</code>` : process.env.CLOUDFLARE_WORKERS_TOKEN ? "Worker pending or failed" : "Not configured", tone: kaTone }),
+    tile({ title: "Keep Awake", value: badge(kaStatus.toUpperCase(), kaTone), detail: kaConf ? `Pinging <code>${escapeHtml(data.keepalive?.targetUrl || "/health")}</code>` : "Not configured", tone: kaTone }),
   );
 
   if (JUPYTER_ENABLED) {
