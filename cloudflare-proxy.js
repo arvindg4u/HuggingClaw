@@ -23,7 +23,7 @@ const log = (...args) => console.error("[hc-proxy]", ...args);
 // ── SOCKS5 Proxy Pool Config ──
 const SOCKS5_HOST = process.env.SOCKS5_PROXY_URL ? new URL(process.env.SOCKS5_PROXY_URL).hostname : null;
 const SOCKS5_PORT = process.env.SOCKS5_PROXY_URL
-  ? parseInt(new URL(process.env.SOCKS5_PROXY_URL).port || '9050') : null;
+  ? (parseInt(new URL(process.env.SOCKS5_PROXY_URL).port) || (process.env.SOCKS5_PROXY_URL.startsWith('https') ? 443 : 9050)) : null;
 
 // Domains routed through SOCKS5 proxy (set by env var).
 // SOCKS5_PROXY_URL = "socks5://host:port" (e.g. your Render Tor proxy)
