@@ -47,6 +47,28 @@ const domainMatch = (h, list) => {
 const needsProxy = (h) => !isInternal(h) && domainMatch(h, SOCKS5_DOMAINS);
 
 // SOCKS5 connect helper
+// Connect through proxy: tries SOCKS5, falls back to HTTP CONNECT
+function proxyConnect(targetHost, targetPort, timeout = 30000) {
+  if (!SOCKS5_HOST) {
+    // No proxy configured — direct TCP
+    return new Promise((resolve, reject) => {
+      const s = net.createConnection({ host: targetHost, port: targetPort, timeout });
+      s.on('connect', () => resolve(s));
+      s.on('error', reject);
+    });
+  }
+  
+  // Try SOCKS5 first (if proxy URL is socks5://)
+  if (typeof process !== 'undefined' && process.env && process.env.SOCKS5_PROXY_URL &&
+      process.env.SOCKS5_PROXY_URL.startsWith('socks5')) {
+    return socks5Connect(targetHost, targetPort, timeout);
+  }
+  
+  // HTTP CONNECT proxy (for http:// or https:// proxy URLs — works on Render, Cloudflare, etc.)
+  return httpConnectProxy(targetHost, targetPort, timeout);
+}
+
+// SOCKS5 connection (direct to Tor SOCKS port)
 function socks5Connect(targetHost, targetPort, timeout = 30000) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({ host: SOCKS5_HOST, port: SOCKS5_PORT }, () => {
@@ -199,7 +221,7 @@ http.request = function(...args) {
   if (opts._hc || !needsProxy(hn)) return origHttp.call(this, ...args);
   
   const nopts = { ...opts, _hc: true, createConnection: (o, c) => {
-    socks5Connect(o.host || o.hostname || "localhost", o.port || 80).then(s => c(null, s)).catch(e => c(e));
+    proxyConnect(o.host || o.hostname || "localhost", o.port || 80).then(s => c(null, s)).catch(e => c(e));
     return new net.Socket();
   }};
   return origHttp.call(this, nopts, cb);
@@ -304,7 +326,7 @@ if (origFetch) {
         method: req.method,
         headers: { ...headers, "x-hc": "true" },
         createConnection: (o, c) => {
-          socks5Connect(o.host || o.hostname || "localhost", o.port || 443, 30000)
+          proxyConnect(o.host || o.hostname || "localhost", o.port || 443, 30000)
             .then(s => c(null, s)).catch(e => c(e));
           return new net.Socket();
         },
@@ -439,7 +461,7 @@ tls.connect = function(...args) {
   try {
     const tlsSocket = new tls.TLSSocket(null, { ...opts, _hc: true });
     
-    socks5Connect(hn, port, 30000)
+    proxyConnect(hn, port, 30000)
       .then(socks => {
         const wrapped = tls.connect({
           socket: socks,
@@ -504,6 +526,53 @@ if (CF_PROXY_URL) {
 }
 if (Object.keys(DNS_OVERRIDE).length) {
   log(`DNS override: ${Object.keys(DNS_OVERRIDE).join(", ")}`);
+}
+
+
+// HTTP CONNECT proxy (works through standard HTTP/HTTPS ports — Render/Cloudflare compatible)
+// Connects via TLS when proxy URL is https://, raw TCP for http://
+function httpConnectProxy(targetHost, targetPort, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const proxyPort = SOCKS5_PORT || 443;
+    const useTls = typeof process !== 'undefined' && process.env && process.env.SOCKS5_PROXY_URL
+      && process.env.SOCKS5_PROXY_URL.startsWith('https');
+    
+    const rawSocket = net.createConnection({ host: SOCKS5_HOST, port: proxyPort, timeout }, () => {
+      const socket = useTls
+        ? tls.connect({ socket: rawSocket, host: SOCKS5_HOST, servername: SOCKS5_HOST, rejectUnauthorized: false })
+        : rawSocket;
+      
+      const doConnect = () => {
+        const req = "CONNECT " + targetHost + ":" + targetPort + " HTTP/1.1\r\nHost: " + targetHost + ":" + targetPort + "\r\n\r\n";
+        socket.write(req);
+        
+        let buf = Buffer.alloc(0);
+        const onData = (data) => {
+          buf = Buffer.concat([buf, data]);
+          if (buf.includes(Buffer.from("\r\n\r\n"))) {
+            const status = buf.toString('utf-8', 0, buf.indexOf('\r\n'));
+            if (status.includes('200')) {
+              socket.removeAllListeners('data');
+              resolve(socket);
+            } else {
+              socket.destroy();
+              reject(new Error('CONNECT failed: ' + status));
+            }
+          }
+        };
+        socket.on('data', onData);
+      };
+      
+      if (useTls) {
+        socket.once('secureConnect', doConnect);
+      } else {
+        doConnect();
+      }
+    });
+    
+    rawSocket.on('error', reject);
+    setTimeout(() => { rawSocket.destroy(); reject(new Error('CONNECT timeout')); }, timeout);
+  });
 }
 
 module.exports = {};
