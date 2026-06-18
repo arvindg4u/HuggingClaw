@@ -20,7 +20,7 @@ ARG DEV_MODE=false
 # override by setting DEV_MODE=false as an HF Space Variable to opt out.
 
 # Install system dependencies (+ optional JupyterLab deps in DEV_MODE)
-# tor package kept for compatibility but NOT started (causes account locks)
+# No Tor (causes HF account locks). SOCKS5 via SOCKS5_PROXY_URL env var if needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     sudo \
@@ -46,7 +46,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxfixes3 \
     libasound2 \
-    tor \
     fonts-dejavu-core \
     fonts-liberation \
     fonts-noto-color-emoji \
