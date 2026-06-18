@@ -21,17 +21,17 @@ const { URL } = require("url");
 const log = (...args) => console.error("[hc-proxy]", ...args);
 
 // ── SOCKS5 Proxy Pool Config ──
-const SOCKS5_HOST = "127.0.0.1";
-const SOCKS5_PORT = 9050;
+const SOCKS5_HOST = process.env.SOCKS5_PROXY_URL ? new URL(process.env.SOCKS5_PROXY_URL).hostname : null;
+const SOCKS5_PORT = process.env.SOCKS5_PROXY_URL
+  ? parseInt(new URL(process.env.SOCKS5_PROXY_URL).port || '9050') : null;
 
-// Domains that need IP rotation via SOCKS5 proxy pool
-// api.telegram.org is NOT here — it uses Cloudflare Worker proxy directly
-// EMPTY: No domains routed through SOCKS5 proxy.
-// opencode.ai connects directly (not blocked by HF Spaces).
-// Telegram routes through Cloudflare Worker via apiRoot config.
-// Using Tor or SOCKS5 proxies for IP rotation gets accounts locked.
-// If rate-limited, use OPENCODE_API_KEYS (multi-key rotation) instead.
-const SOCKS5_DOMAINS = [];
+// Domains routed through SOCKS5 proxy (set by env var).
+// SOCKS5_PROXY_URL = "socks5://host:port" (e.g. your Render Tor proxy)
+// SOCKS5_PROXY_DOMAINS = "opencode.ai,api.telegram.org" (comma-separated)
+// When SOCKS5_PROXY_URL is unset (default): direct connection, no proxy.
+const SOCKS5_DOMAINS = process.env.SOCKS5_PROXY_DOMAINS
+  ? process.env.SOCKS5_PROXY_DOMAINS.split(',').map(s => s.trim()).filter(Boolean)
+  : [];
 
 const isInternal = (h) => {
   const n = String(h || "").trim().toLowerCase();
