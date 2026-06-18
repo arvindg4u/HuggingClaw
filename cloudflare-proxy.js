@@ -175,6 +175,7 @@ async function telegramViaWorker(url, options) {
   if (urlObj.hostname !== 'api.telegram.org') return null;
   
   const proxyUrl = `${CF_PROXY_URL}/telegram${urlObj.pathname}${urlObj.search}`;
+  log(`Telegram via Worker: ${urlObj.pathname}`);
   try {
     const resp = await origFetch.call(globalThis, proxyUrl, {
       ...options,
@@ -229,11 +230,21 @@ if (origFetch) {
     
     // ── Telegram: use Cloudflare Worker proxy directly (fast path, no SOCKS5) ──
     if (url.hostname === 'api.telegram.org') {
+      log(`Telegram fetch intercepted, CF_PROXY_URL=${CF_PROXY_URL ? 'set' : 'not set'}`);
       return new Promise((resolve, reject) => {
         telegramViaWorker(url, { method: req.method, headers: Object.fromEntries(req.headers.entries()) })
-          .then(r => { if (r) { resolve(r); return; }
+          .then(r => { 
+            if (r) { 
+              log(`Telegram via Worker SUCCESS (status=${r.status})`);
+              resolve(r); 
+              return; 
+            }
+            log('Telegram Worker returned null, trying direct IPs...');
             telegramDirectIpFallback(url, { method: req.method, headers: Object.fromEntries(req.headers.entries()) })
-              .then(r2 => { if (r2) resolve(r2); else reject(new Error('Telegram unreachable')); })
+              .then(r2 => { 
+                if (r2) { log(`Telegram via direct IP SUCCESS`); resolve(r2); } 
+                else reject(new Error('Telegram unreachable')); 
+              })
               .catch(reject);
           })
           .catch(reject);
@@ -421,6 +432,11 @@ tls.connect = function(...args) {
 };
 
 log(`SOCKS5 routing: ${SOCKS5_DOMAINS.join(", ")} → ${SOCKS5_HOST}:${SOCKS5_PORT}`);
+if (CF_PROXY_URL) {
+  log(`Cloudflare Worker proxy available for Telegram: ${CF_PROXY_URL}`);
+} else {
+  log(`Cloudflare Worker proxy NOT configured — set CLOUDFLARE_PROXY_URL env var`);
+}
 if (Object.keys(DNS_OVERRIDE).length) {
   log(`DNS override: ${Object.keys(DNS_OVERRIDE).join(", ")}`);
 }
