@@ -116,7 +116,7 @@ def socks5_connect_test(proxy_host, proxy_port, target_host, target_port, timeou
             s.recv(dl + 2)
         elif atyp == 0x04: s.recv(18)
         
-        # Try TLS handshake to verify it's a real connection
+        # TLS handshake required — we need HTTPS, not just TCP+SOCKS
         try:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
@@ -125,7 +125,8 @@ def socks5_connect_test(proxy_host, proxy_port, target_host, target_port, timeou
             tls.do_handshake()
             tls.close()
         except Exception:
-            pass  # TLS might fail for non-Telegram hosts, but SOCKS5 worked
+            s.close()
+            return False
         
         s.close()
         return True
@@ -237,6 +238,9 @@ async def socks5_handler(reader, writer):
             writer.close()
             return
         
+        nmethods = data[1]
+        if nmethods > 0:
+            await asyncio.wait_for(reader.readexactly(nmethods), timeout=10)
         writer.write(bytes([0x05, 0x00]))
         await writer.drain()
         

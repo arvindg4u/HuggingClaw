@@ -98,9 +98,22 @@ function socks5Connect(targetHost, targetPort, timeout = 30000) {
 }
 
 // ── DNS Override (for domains where direct IPs are not firewalled) ──
+// Telegram direct IPs (bypass HF DNS block — IPs might also be firewalled)
+const TELEGRAM_IPS = [
+  "149.154.167.220", "149.154.167.221", "149.154.167.222",
+  "149.154.167.223", "149.154.167.224", "149.154.167.225",
+  "149.154.167.226", "149.154.167.227", "149.154.167.228",
+  "149.154.167.229", "149.154.167.230", "149.154.167.231",
+  "149.154.167.232", "149.154.167.233", "149.154.167.234",
+  "149.154.175.50",  "91.108.56.100",   "91.108.56.101",
+  "91.108.56.110",   "91.108.56.111",   "91.108.56.120",
+  "91.108.56.121",   "91.108.56.130",   "91.108.56.131",
+];
+
 const DNS_OVERRIDE = {
   "web.whatsapp.com": ["157.240.3.52", "157.240.7.52"],
   "wss.web.whatsapp.com": ["157.240.3.52", "157.240.7.52"],
+  "api.telegram.org": TELEGRAM_IPS,
 };
 
 const origLookup = dns.lookup;
@@ -167,6 +180,50 @@ http.request = function(...args) {
   return origHttp.call(this, nopts, cb);
 };
 
+// Cloudflare Worker proxy URL for Telegram fallback (set via env)
+const CF_PROXY_URL = (typeof process !== 'undefined' && process.env && process.env.CLOUDFLARE_PROXY_URL) || null;
+
+// Telegram direct-IP fallback fetch (bypass DNS without SOCKS)
+async function telegramFallbackFetch(url, options) {
+  const urlObj = new URL(url);
+  if (urlObj.hostname !== 'api.telegram.org') return null;
+  
+  // Try direct IPs sequentially
+  for (const ip of TELEGRAM_IPS.slice(0, 5)) {
+    try {
+      const directUrl = new URL(url);
+      directUrl.hostname = ip;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      const resp = await origFetch.call(globalThis, directUrl.toString(), {
+        ...options,
+        headers: { ...options?.headers, host: 'api.telegram.org', 'x-hc': 'true' },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      if (resp.ok || resp.status === 400) return resp;
+    } catch (e) {
+      log(`Telegram IP fallback failed for ${ip}: ${e.message}`);
+    }
+  }
+  
+  // Try Cloudflare Worker proxy if configured
+  if (CF_PROXY_URL) {
+    try {
+      const proxyUrl = `${CF_PROXY_URL}/telegram${urlObj.pathname}${urlObj.search}`;
+      const resp = await origFetch.call(globalThis, proxyUrl, {
+        ...options,
+        headers: { ...options?.headers, 'x-hc': 'true' },
+      });
+      if (resp.ok || resp.status === 400) return resp;
+    } catch (e) {
+      log(`Cloudflare proxy fallback failed: ${e.message}`);
+    }
+  }
+  
+  return null;
+}
+
 // ── 3. Patch fetch ──
 const origFetch = globalThis.fetch;
 if (origFetch) {
@@ -176,42 +233,57 @@ if (origFetch) {
     if (req.headers.get("x-hc") === "true" || !needsProxy(url.hostname)) return origFetch.call(this, input, init);
     
     return new Promise((resolve, reject) => {
+      // Try SOCKS5 proxy first
       const chunks = [];
       const headers = {};
       if (req.headers && req.headers.entries) {
         for (const [k, v] of req.headers.entries()) headers[k] = v;
       }
-      const nodeReq = https.request(url, {
-        method: req.method,
-        headers: { ...headers, "x-hc": "true" },
-        createConnection: (o, c) => {
-          socks5Connect(o.host || o.hostname || "localhost", o.port || 443, 60000)
-            .then(s => c(null, s)).catch(e => c(e));
-          return new net.Socket();
-        },
-        timeout: 60000,
-      }, (res) => {
-        res.on("data", c => chunks.push(c));
-        res.on("end", () => {
-          resolve(new Response(Buffer.concat(chunks), {
-            status: res.statusCode,
-            statusText: res.statusMessage,
-            headers: Object.fromEntries(Object.entries(res.headers || {})),
-          }));
+      const doSocks5 = () => {
+        const nodeReq = https.request(url, {
+          method: req.method,
+          headers: { ...headers, "x-hc": "true" },
+          createConnection: (o, c) => {
+            socks5Connect(o.host || o.hostname || "localhost", o.port || 443, 30000)
+              .then(s => c(null, s)).catch(e => c(e));
+            return new net.Socket();
+          },
+          timeout: 30000,
+        }, (res) => {
+          res.on("data", c => chunks.push(c));
+          res.on("end", () => {
+            resolve(new Response(Buffer.concat(chunks), {
+              status: res.statusCode,
+              statusText: res.statusMessage,
+              headers: Object.fromEntries(Object.entries(res.headers || {})),
+            }));
+          });
         });
-      });
-      nodeReq.on("error", reject);
-      nodeReq.on("timeout", () => { nodeReq.destroy(); reject(new Error("fetch timeout")); });
-      
-      if (req.body && typeof req.body.getReader === "function") {
-        req.body.getReader().read().then(function pump({ done, value }) {
-          if (done) { nodeReq.end(); return; }
-          nodeReq.write(value);
-          return req.body.getReader().read().then(pump);
-        }).catch(reject);
-      } else {
-        nodeReq.end();
-      }
+        nodeReq.on("error", (e) => {
+          log(`SOCKS5 fetch failed for ${url.hostname}: ${e.message}`);
+          // Try fallback for Telegram
+          if (url.hostname === 'api.telegram.org') {
+            telegramFallbackFetch(url, { method: req.method, headers }).then(r => {
+              if (r) resolve(r);
+              else reject(e);
+            }).catch(reject);
+          } else {
+            reject(e);
+          }
+        });
+        nodeReq.on("timeout", () => { nodeReq.destroy(); nodeReq.emit('error', new Error('fetch timeout')); });
+        
+        if (req.body && typeof req.body.getReader === "function") {
+          req.body.getReader().read().then(function pump({ done, value }) {
+            if (done) { nodeReq.end(); return; }
+            nodeReq.write(value);
+            return req.body.getReader().read().then(pump);
+          }).catch(reject);
+        } else {
+          nodeReq.end();
+        }
+      };
+      doSocks5();
     });
   };
 }
