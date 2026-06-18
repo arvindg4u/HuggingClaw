@@ -890,7 +890,7 @@ chmod 600 "$EXISTING_CONFIG"
 
 # ── Enable Gateway Preload Fixes ──
 # This preload script keeps iframe embedding working on HF Spaces.
-export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/cloudflare-proxy.js --require /home/node/app/multi-provider-key-rotator.cjs"
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs"
 
 # ── Startup Summary ──
 echo ""
