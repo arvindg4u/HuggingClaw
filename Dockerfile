@@ -20,7 +20,7 @@ ARG DEV_MODE=false
 # override by setting DEV_MODE=false as an HF Space Variable to opt out.
 
 # Install system dependencies (+ optional JupyterLab deps in DEV_MODE)
-# tor for SOCKS5 IP rotation (opencode.ai/zen rate-limit bypass)
+# tor package kept for compatibility but NOT started (causes account locks)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     sudo \

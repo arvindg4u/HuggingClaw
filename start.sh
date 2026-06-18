@@ -322,62 +322,18 @@ else
   echo "HF_TOKEN not set — running without dataset persistence."
 fi
 
-# ── Start Tor SOCKS5 Proxy (IP rotation for opencode.ai/zen) ──
-# Tor runs a local SOCKS5 proxy on 127.0.0.1:9050 that provides
-# automatic IP rotation every ~10 minutes. Only opencode.ai (the
-# LLM provider) is routed through Tor — Telegram uses Cloudflare
-# Worker proxy via apiRoot config, so Tor usage doesn't violate
-# HF Spaces ToS (no blocked domains are bypassed through Tor).
-TOR_PID=""
-TOR_HEALTHY=false
-echo "Starting Tor SOCKS5 proxy for IP rotation..."
-# Kill any stale Tor from previous run
-if [ -f /tmp/tor.pid ]; then
-  kill "$(cat /tmp/tor.pid)" 2>/dev/null || true
-  rm -f /tmp/tor.pid
-fi
-# Create writable directories for Tor (user: node)
-mkdir -p /tmp/tor-data /tmp/tor-run
-chmod 700 /tmp/tor-data /tmp/tor-run
-# Write minimal torrc (avoids /etc/tor/torrc permission issues)
-cat > /tmp/torrc << 'TOREOF'
-SOCKSPort 9050
-DataDirectory /tmp/tor-data
-PidFile /tmp/tor.pid
-Log notice stdout
-RunAsDaemon 1
-TOREOF
-# Start Tor as daemon with custom config
-tor -f /tmp/torrc > /dev/null 2>&1
-# Wait for Tor to be ready (check SOCKS port)
-for i in $(seq 1 30); do
-  if (echo > /dev/tcp/127.0.0.1/9050) 2>/dev/null; then
-    TOR_HEALTHY=true
-    break
-  fi
-  sleep 1
-done
-if [ "$TOR_HEALTHY" = "true" ]; then
-  TOR_PID=$(cat /tmp/tor.pid 2>/dev/null || echo "")
-  echo "Tor SOCKS5 proxy ready on 127.0.0.1:9050 (auto-rotate every 10 min)"
-  # Pre-warm Tor circuits by making a background request
-  (timeout 15 curl -s --socks5-hostname 127.0.0.1:9050 "https://check.torproject.org/" > /dev/null 2>&1) &
-  echo "Tor circuits pre-warming in background"
-  # ── Tor circuit rotation loop (new exit IP every 10 min) ──
-  (
-    sleep 120
-    while true; do
-      if [ -n "$TOR_PID" ] && kill -0 "$TOR_PID" 2>/dev/null; then
-        kill -HUP "$TOR_PID" 2>/dev/null || true
-      fi
-      sleep 600
-    done
-  ) &
-  echo "IP rotation active — new exit node every 10 minutes"
-else
-  echo "Warning: Tor failed to start within 30s. Check if tor package is installed."
-  echo "opencode.ai will connect directly (may hit IP rate limits)."
-fi
+# ── No proxy needed for opencode.ai/zen ──
+# IMPORTANT: opencode.ai is NOT blocked by HF Spaces egress firewall.
+# Connecting directly is fast, reliable, and ToS-compliant.
+# 
+# Previous attempts using Tor or SOCKS5 proxy pools for IP rotation
+# resulted in HF account locks (ToS violation detected).
+# 
+# If you hit rate limits on opencode.ai/zen, use multiple API keys:
+#   OPENCODE_API_KEYS="key1,key2,key3"
+# OpenClaw has built-in multi-key rotation. No proxy needed.
+#
+# Telegram uses Cloudflare Worker proxy via apiRoot config below.
 # ── Build config ──
 CONFIG_JSON=$(cat <<'CONFIGEOF'
 {
@@ -911,11 +867,8 @@ if [ -n "${HF_TOKEN:-}" ]; then
 else
   echo "Backup    : disabled"
 fi
-if [ "$TOR_HEALTHY" = "true" ]; then
-  echo "Proxy     : Tor SOCKS5 (opencode.ai via 127.0.0.1:9050, rotates every 10 min)"
-else
-  echo "Proxy     : none (opencode.ai direct — may hit rate limits)"
-fi
+# No proxy — opencode.ai connects directly (ToS-compliant)
+echo "Proxy     : direct (opencode.ai not blocked by HF Spaces)" 
 # HUGGINGCLAW_JUPYTER_ENABLED env var se override allow karo
 # (env-builder "Enable Jupyter terminal" toggle yahi set karta hai)
 if hc_is_true "${HUGGINGCLAW_JUPYTER_ENABLED:-false}"; then

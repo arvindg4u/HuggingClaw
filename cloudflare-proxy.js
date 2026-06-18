@@ -26,9 +26,12 @@ const SOCKS5_PORT = 9050;
 
 // Domains that need IP rotation via SOCKS5 proxy pool
 // api.telegram.org is NOT here — it uses Cloudflare Worker proxy directly
-const SOCKS5_DOMAINS = [
-  "opencode.ai",
-];
+// EMPTY: No domains routed through SOCKS5 proxy.
+// opencode.ai connects directly (not blocked by HF Spaces).
+// Telegram routes through Cloudflare Worker via apiRoot config.
+// Using Tor or SOCKS5 proxies for IP rotation gets accounts locked.
+// If rate-limited, use OPENCODE_API_KEYS (multi-key rotation) instead.
+const SOCKS5_DOMAINS = [];
 
 const isInternal = (h) => {
   const n = String(h || "").trim().toLowerCase();
