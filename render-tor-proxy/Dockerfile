@@ -116,11 +116,16 @@ def socks5_connect_sync(target_host, target_port):
 
 async def handle_conn(reader, writer):
     """Handle one TCP connection: HTTP health check or WebSocket proxy."""
+    # Read until we have the complete HTTP headers (ended by \r\n\r\n)
     try:
-        data = await asyncio.wait_for(reader.read(8192), timeout=15)
+        data = await asyncio.wait_for(reader.readuntil(b'\r\n\r\n'), timeout=15)
+    except asyncio.TimeoutError:
+        writer.close(); return
+    except asyncio.IncompleteReadError as e:
+        data = e.partial
         if not data:
             writer.close(); return
-    except asyncio.TimeoutError:
+    except ConnectionError:
         writer.close(); return
 
     # Peek: is this a WebSocket upgrade or plain HTTP?
