@@ -342,6 +342,8 @@ for i in $(seq 1 30); do
 done
 if [ "$PROXY_POOL_READY" = "true" ]; then
   echo "Proxy pool ready on 127.0.0.1:9050 (built-in fallbacks + auto-rotate every 10 min)"
+  echo "Waiting 15s for pool to find Telegram-capable proxies..."
+  sleep 15
 else
   echo "Warning: Proxy pool not ready after 30s"
 fi
