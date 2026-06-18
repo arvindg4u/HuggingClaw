@@ -342,6 +342,18 @@ net.connect = function(...args) {
   if (!opts.host && !opts.path) opts = { host: args[0], port: args[1] };
   
   const hn = (opts.host || "").trim().toLowerCase();
+  
+  // ── Telegram: connect through Cloudflare Worker directly ──
+  if (hn === 'api.telegram.org' && CF_PROXY_URL) {
+    const cfUrl = new URL(CF_PROXY_URL);
+    log(`Telegram net.connect via Worker`);
+    const nopts = { ...opts, _hc: true,
+      host: cfUrl.hostname,
+      port: parseInt(cfUrl.port) || (opts.port || 443),
+    };
+    return origNetConnect.call(this, nopts);
+  }
+  
   if (opts._hc || !needsProxy(hn)) return origNetConnect.call(this, ...args);
   
   // Create a proxy socket
@@ -404,6 +416,19 @@ tls.connect = function(...args) {
   else if (typeof args[0] === "number") opts = { port: args[0], host: args[1] || "localhost" };
   
   const hn = (opts.host || opts.servername || "").trim().toLowerCase();
+  
+  // ── Telegram: connect through Cloudflare Worker directly ──
+  if (hn === 'api.telegram.org' && CF_PROXY_URL) {
+    const cfUrl = new URL(CF_PROXY_URL);
+    log(`Telegram tls.connect via Worker`);
+    const nopts = { ...opts, _hc: true,
+      host: cfUrl.hostname,
+      servername: cfUrl.hostname,
+      port: parseInt(cfUrl.port) || 443,
+    };
+    return origTls.call(this, nopts);
+  }
+  
   if (opts._hc || !needsProxy(hn)) return origTls.call(this, ...args);
   
   const port = opts.port || 443;
