@@ -47,25 +47,34 @@ const domainMatch = (h, list) => {
 const needsProxy = (h) => !isInternal(h) && domainMatch(h, SOCKS5_DOMAINS);
 
 // SOCKS5 connect helper
-// Connect through proxy: tries SOCKS5, falls back to HTTP CONNECT
+// Connect through proxy: tries SOCKS5 or HTTP CONNECT, falls back to direct
 function proxyConnect(targetHost, targetPort, timeout = 30000) {
   if (!SOCKS5_HOST) {
     // No proxy configured — direct TCP
-    return new Promise((resolve, reject) => {
-      const s = net.createConnection({ host: targetHost, port: targetPort, timeout });
-      s.on('connect', () => resolve(s));
-      s.on('error', reject);
-    });
+    return directConnect(targetHost, targetPort, timeout);
   }
   
   // Try SOCKS5 first (if proxy URL is socks5://)
   if (typeof process !== 'undefined' && process.env && process.env.SOCKS5_PROXY_URL &&
       process.env.SOCKS5_PROXY_URL.startsWith('socks5')) {
-    return socks5Connect(targetHost, targetPort, timeout);
+    return socks5Connect(targetHost, targetPort, timeout)
+      .catch(() => directConnect(targetHost, targetPort, timeout));
   }
   
   // HTTP CONNECT proxy (for http:// or https:// proxy URLs — works on Render, Cloudflare, etc.)
-  return httpConnectProxy(targetHost, targetPort, timeout);
+  // Falls back to direct if proxy is unreachable (e.g. Render sleeping)
+  return httpConnectProxy(targetHost, targetPort, timeout)
+    .catch(() => directConnect(targetHost, targetPort, timeout));
+}
+
+// Direct TCP connection (no proxy)
+function directConnect(targetHost, targetPort, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const s = net.createConnection({ host: targetHost, port: targetPort, timeout });
+    s.on('connect', () => resolve(s));
+    s.on('error', reject);
+    setTimeout(() => { s.destroy(); reject(new Error('direct connect timeout')); }, timeout);
+  });
 }
 
 // SOCKS5 connection (direct to Tor SOCKS port)
