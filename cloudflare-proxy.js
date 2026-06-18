@@ -23,7 +23,7 @@ const log = (...args) => console.error("[hc-proxy]", ...args);
 // ── SOCKS5 Proxy Pool Config ──
 const SOCKS5_HOST = process.env.SOCKS5_PROXY_URL ? new URL(process.env.SOCKS5_PROXY_URL).hostname : null;
 const SOCKS5_PORT = process.env.SOCKS5_PROXY_URL
-  ? (parseInt(new URL(process.env.SOCKS5_PROXY_URL).port) || (process.env.SOCKS5_PROXY_URL.startsWith('https') ? 443 : 9050)) : null;
+  ? (parseInt(new URL(process.env.SOCKS5_PROXY_URL).port) || (process.env.SOCKS5_PROXY_URL.startsWith('https') || process.env.SOCKS5_PROXY_URL.startsWith('wss') ? 443 : 9050)) : null;
 
 // Domains routed through SOCKS5 proxy (set by env var).
 // SOCKS5_PROXY_URL = "socks5://host:port" (e.g. your Render Tor proxy)
@@ -54,18 +54,24 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
     return directConnect(targetHost, targetPort, timeout);
   }
   
+  const pUrl = (typeof process !== 'undefined' && process.env && process.env.SOCKS5_PROXY_URL) || '';
+  
   // Try SOCKS5 first (if proxy URL is socks5://)
-  if (typeof process !== 'undefined' && process.env && process.env.SOCKS5_PROXY_URL &&
-      process.env.SOCKS5_PROXY_URL.startsWith('socks5')) {
+  if (pUrl.startsWith('socks5')) {
     return socks5Connect(targetHost, targetPort, timeout)
       .catch(() => directConnect(targetHost, targetPort, timeout));
   }
   
-  // HTTP CONNECT proxy (for http:// or https:// proxy URLs)
-  // Falls back to WebSocket tunnel (works through Cloudflare/Render)
-  // then falls back to direct if all proxy methods fail
-  return httpConnectProxy(targetHost, targetPort, timeout)
-    .catch(() => wsConnectProxy(targetHost, targetPort, timeout)
+  // WebSocket proxy (for wss:// or ws:// URLs) — directly, no HTTP CONNECT attempt
+  if (pUrl.startsWith('wss') || pUrl.startsWith('ws://')) {
+    return wsConnectProxy(targetHost, targetPort, timeout)
+      .catch(() => directConnect(targetHost, targetPort, timeout));
+  }
+  
+  // For https:// URLs: try WebSocket first with quick timeout (bypasses Cloudflare TCP blocks),
+  // then HTTP CONNECT, then direct
+  return wsConnectProxy(targetHost, targetPort, Math.min(timeout, 8000))
+    .catch(() => httpConnectProxy(targetHost, targetPort, timeout)
       .catch(() => directConnect(targetHost, targetPort, timeout)));
 }
 
@@ -591,7 +597,11 @@ function httpConnectProxy(targetHost, targetPort, timeout = 30000) {
 function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
   return new Promise((resolve, reject) => {
     const proxyUrl = process.env.SOCKS5_PROXY_URL || '';
-    const wsUrl = proxyUrl.replace(/^https?/, 'wss') + '/proxy';
+    let wsUrl = proxyUrl;
+    // If the URL is https/http, convert to wss for WebSocket. If already ws/wss, keep as-is.
+    if (wsUrl.startsWith('http://')) wsUrl = wsUrl.replace(/^http:/, 'ws:');
+    else if (wsUrl.startsWith('https://')) wsUrl = wsUrl.replace(/^https:/, 'wss:');
+    wsUrl += '/proxy';
     
     let ws;
     try { ws = new WebSocket(wsUrl); } catch(e) { reject(e); return; }

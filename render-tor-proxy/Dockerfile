@@ -10,7 +10,7 @@ RUN pip3 install --no-cache-dir --break-system-packages websockets
 COPY <<'PYEOF' /proxy.py
 #!/usr/bin/env python3
 """WebSocket-to-Tor proxy — connects through Cloudflare + Render, tunnels through Tor."""
-import asyncio, os, socket, struct, json
+import asyncio, os, socket, struct, json, subprocess
 import websockets
 
 SOCKS5_HOST = "127.0.0.1"
@@ -85,7 +85,7 @@ async def main():
     # Start Tor
     proc = await asyncio.create_subprocess_exec(
         "tor", "-f", "/tmp/torrc",
-        stdout=asyncio.DEVNULL, stderr=asyncio.DEVNULL
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     await asyncio.sleep(5)
     
