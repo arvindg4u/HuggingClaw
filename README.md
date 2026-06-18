@@ -27,8 +27,6 @@ secrets:
     description: "Comma-separated Telegram user IDs for access"
   - name: TELEGRAM_BOT_TOKEN
     description: "Telegram bot token from BotFather"
-  - name: HF_TOKEN
-    description: "HuggingFace token with Write access — enables automatic workspace backup."
   - name: WHATSAPP_ENABLED
     description: "Set to 'true' to enable WhatsApp pairing support."
 ---
