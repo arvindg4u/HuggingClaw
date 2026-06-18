@@ -61,10 +61,12 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
       .catch(() => directConnect(targetHost, targetPort, timeout));
   }
   
-  // HTTP CONNECT proxy (for http:// or https:// proxy URLs — works on Render, Cloudflare, etc.)
-  // Falls back to direct if proxy is unreachable (e.g. Render sleeping)
+  // HTTP CONNECT proxy (for http:// or https:// proxy URLs)
+  // Falls back to WebSocket tunnel (works through Cloudflare/Render)
+  // then falls back to direct if all proxy methods fail
   return httpConnectProxy(targetHost, targetPort, timeout)
-    .catch(() => directConnect(targetHost, targetPort, timeout));
+    .catch(() => wsConnectProxy(targetHost, targetPort, timeout)
+      .catch(() => directConnect(targetHost, targetPort, timeout)));
 }
 
 // Direct TCP connection (no proxy)
@@ -583,5 +585,71 @@ function httpConnectProxy(targetHost, targetPort, timeout = 30000) {
     setTimeout(() => { rawSocket.destroy(); reject(new Error('CONNECT timeout')); }, timeout);
   });
 }
+
+// WebSocket proxy (tunnels through Cloudflare + Render via WSS)
+// Works where SOCKS5/HTTP CONNECT are blocked by Cloudflare
+function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const proxyUrl = process.env.SOCKS5_PROXY_URL || '';
+    const wsUrl = proxyUrl.replace(/^https?/, 'wss') + '/proxy';
+    
+    let ws;
+    try { ws = new WebSocket(wsUrl); } catch(e) { reject(e); return; }
+    const timer = setTimeout(() => { try { ws.close(); } catch(e){} reject(new Error('ws timeout')); }, timeout);
+    
+    ws.onopen = () => {
+      // Send target info
+      ws.send(JSON.stringify({ host: targetHost, port: targetPort }));
+    };
+    
+    ws.onmessage = (event) => {
+      const msg = typeof event.data === 'string' ? event.data : event.data.toString();
+      try {
+        const json = JSON.parse(msg);
+        if (json.error) { ws.close(); reject(new Error(json.error)); return; }
+        if (json.status === 'connected') {
+          clearTimeout(timer);
+          // Create a passthrough socket-like object using WebSocket
+          const tunnel = {
+            ws: ws,
+            _buffer: [],
+            _onData: null,
+            _onEnd: null,
+            _onError: null,
+            _ended: false,
+            write: function(data) { try { ws.send(data instanceof Buffer ? data : Buffer.from(data)); } catch(e){} return true; },
+            end: function(data) { if(data) this.write(data); this._ended = true; try{ws.close();}catch(e){} if(this._onEnd) this._onEnd(); },
+            destroy: function() { try{ws.close();}catch(e){} },
+            on: function(evt, cb) {
+              if (evt === 'data') this._onData = cb;
+              else if (evt === 'end') this._onEnd = cb;
+              else if (evt === 'error') this._onError = cb;
+              else if (evt === 'close') this._onEnd = cb;
+              return this;
+            },
+            removeAllListeners: function() { this._onData = null; this._onEnd = null; this._onError = null; },
+            setKeepAlive: function() {},
+            setTimeout: function() {},
+          };
+          
+          ws.onmessage = (e) => {
+            const d = typeof e.data === 'string' ? Buffer.from(e.data) : (e.data instanceof Buffer ? e.data : Buffer.from(e.data));
+            if (tunnel._onData) tunnel._onData(d);
+          };
+          ws.onclose = () => { if(tunnel._onEnd) tunnel._onEnd(); };
+          ws.onerror = (e) => { if(tunnel._onError) tunnel._onError(e); };
+          
+          resolve(tunnel);
+        }
+      } catch(e) { 
+        if (!json) { /* binary data before connected? buffer it */ }
+      }
+    };
+    
+    ws.onerror = (e) => { clearTimeout(timer); reject(e); };
+    ws.onclose = () => { clearTimeout(timer); reject(new Error('ws closed')); };
+  });
+}
+
 
 module.exports = {};
