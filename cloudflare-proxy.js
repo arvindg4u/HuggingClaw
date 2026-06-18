@@ -134,6 +134,24 @@ https.request = function(...args) {
   } else { opts = { ...args[0] }; cb = args[1]; }
   
   const hn = opts.hostname || (opts.host ? String(opts.host).split(":")[0] : "");
+  
+  // ── Telegram: rewrite URL to go through Cloudflare Worker ──
+  if (hn === 'api.telegram.org' && CF_PROXY_URL) {
+    const cfUrl = new URL(CF_PROXY_URL);
+    const origPath = opts.path || '/';
+    const nopts = { ...opts, _hc: true,
+      hostname: cfUrl.hostname,
+      host: cfUrl.hostname,
+      port: cfUrl.port || 443,
+      path: '/telegram' + origPath,
+      headers: { ...(opts.headers || {}), 'x-hc': 'true' },
+      createConnection: undefined,
+      socket: undefined,
+    };
+    log(`Telegram https.request via Worker: ${origPath}`);
+    return origHttps.call(this, nopts, cb);
+  }
+  
   if (opts._hc || !needsProxy(hn)) return origHttps.call(this, ...args);
   
   const nopts = { ...opts, _hc: true, createConnection: (o, c) => {
@@ -156,6 +174,25 @@ http.request = function(...args) {
   } else { opts = { ...args[0] }; cb = args[1]; }
   
   const hn = opts.hostname || (opts.host ? String(opts.host).split(":")[0] : "");
+  
+  // ── Telegram: rewrite URL to go through Cloudflare Worker ──
+  if (hn === 'api.telegram.org' && CF_PROXY_URL) {
+    const cfUrl = new URL(CF_PROXY_URL);
+    const origPath = opts.path || '/';
+    // HTTP for Telegram is unlikely but handle it
+    const isHttps = String(opts.protocol || '').startsWith('https') || cfUrl.protocol === 'https:';
+    const nopts = { ...opts, _hc: true,
+      hostname: cfUrl.hostname,
+      host: cfUrl.hostname,
+      port: cfUrl.port || (isHttps ? 443 : 80),
+      path: '/telegram' + origPath,
+      headers: { ...(opts.headers || {}), 'x-hc': 'true' },
+      createConnection: undefined,
+      socket: undefined,
+    };
+    return isHttps ? origHttps.call(this, nopts, cb) : origHttp.call(this, nopts, cb);
+  }
+  
   if (opts._hc || !needsProxy(hn)) return origHttp.call(this, ...args);
   
   const nopts = { ...opts, _hc: true, createConnection: (o, c) => {
