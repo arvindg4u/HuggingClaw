@@ -4,12 +4,13 @@
 FROM alpine:3.19
 
 RUN apk add --no-cache tor python3 py3-pip
-RUN pip3 install --no-cache-dir --break-system-packages websockets
+RUN pip3 install --no-cache-dir --break-system-packages "websockets>=13"
 
 # WebSocket-to-Tor proxy
 COPY <<'PYEOF' /proxy.py
 #!/usr/bin/env python3
-"""WebSocket-to-Tor proxy — connects through Cloudflare + Render, tunnels through Tor."""
+"""WebSocket-to-Tor proxy — connects through Cloudflare + Render, tunnels through Tor.
+   Uses websockets>=13 which properly handles HTTP health checks via process_request."""
 import asyncio, os, socket, struct, json, subprocess
 import websockets
 
@@ -59,17 +60,16 @@ async def relay(ws, tcp_sock):
 
 async def handle_ws(ws):
     try:
-        # First message: JSON with target host/port
         msg = await asyncio.wait_for(ws.recv(), timeout=15)
         config = json.loads(msg if isinstance(msg, str) else msg.decode())
         target_host = config.get("host", "opencode.ai")
         target_port = config.get("port", 443)
-        
+
         tcp_sock = await socks5_connect(target_host, target_port)
         if not tcp_sock:
             await ws.send(json.dumps({"error": "proxy connect failed"}))
             return
-        
+
         await ws.send(json.dumps({"status": "connected"}))
         await relay(ws, tcp_sock)
         tcp_sock.close()
@@ -77,8 +77,11 @@ async def handle_ws(ws):
         try: await ws.send(json.dumps({"error": str(e)}))
         except: pass
 
-async def health_check(request):
-    return websockets.HTTPResponse(200, {"Content-Type": "text/plain"}, b"OK")
+async def health_check(connection, request):
+    """Handle HTTP health checks (GET and HEAD). websockets>=13 calls this for non-GET methods too."""
+    if request.path == "/" or request.path == "/health" or request.path == "/proxy":
+        return websockets.HTTPResponse(200, {"Content-Type": "text/plain"}, b"OK")
+    return None  # Not a health check path — proceed with WebSocket upgrade
 
 async def main():
     print(f"WebSocket proxy on 0.0.0.0:{HTTP_PORT}")
@@ -88,10 +91,10 @@ async def main():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     await asyncio.sleep(5)
-    
+
     async def handler(ws):
         await handle_ws(ws)
-    
+
     async with websockets.serve(handler, "0.0.0.0", HTTP_PORT, process_request=health_check):
         await asyncio.Future()
 
