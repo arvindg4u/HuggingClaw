@@ -605,6 +605,7 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
     
     let ws;
     try { ws = new WebSocket(wsUrl); } catch(e) { reject(e); return; }
+    ws.binaryType = 'arraybuffer';
     const timer = setTimeout(() => { try { ws.close(); } catch(e){} reject(new Error('ws timeout')); }, timeout);
     
     ws.onopen = () => {
@@ -613,7 +614,11 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
     };
     
     ws.onmessage = (event) => {
-      const msg = typeof event.data === 'string' ? event.data : event.data.toString();
+      let msg;
+      if (typeof event.data === 'string') msg = event.data;
+      else if (event.data instanceof ArrayBuffer) msg = Buffer.from(event.data).toString();
+      else if (ArrayBuffer.isView(event.data)) msg = Buffer.from(event.data.buffer, event.data.byteOffset, event.data.byteLength).toString();
+      else msg = event.data.toString();
       try {
         const json = JSON.parse(msg);
         if (json.error) { ws.close(); reject(new Error(json.error)); return; }
@@ -643,7 +648,11 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
           };
           
           ws.onmessage = (e) => {
-            const d = typeof e.data === 'string' ? Buffer.from(e.data) : (e.data instanceof Buffer ? e.data : Buffer.from(e.data));
+            let d;
+            if (typeof e.data === 'string') d = Buffer.from(e.data);
+            else if (e.data instanceof ArrayBuffer) d = Buffer.from(e.data);
+            else if (ArrayBuffer.isView(e.data)) d = Buffer.from(e.data.buffer, e.data.byteOffset, e.data.byteLength);
+            else d = Buffer.from(e.data);
             if (tunnel._onData) tunnel._onData(d);
           };
           ws.onclose = () => { if(tunnel._onEnd) tunnel._onEnd(); };
