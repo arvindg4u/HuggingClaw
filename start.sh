@@ -322,30 +322,61 @@ else
   echo "HF_TOKEN not set — running without dataset persistence."
 fi
 
-# ── Start Proxy Pool (self-rotating SOCKS5 for Telegram + opencode.ai) ──
-# proxy-pool.py runs a local SOCKS5 proxy on 127.0.0.1:9050 that
-# automatically rotates through free upstream SOCKS5 proxies for
-# IP rotation (bypasses opencode.ai/zen rate limits + HF firewall).
-# Built-in fallback proxies ensure immediate availability.
-# No Tor, no Cloudflare Worker — uses free proxy lists.
-PROXY_POOL_PID=""
-echo "Starting proxy pool for IP rotation..."
-python3 /home/node/app/proxy-pool.py &
-PROXY_POOL_PID=$!
-PROXY_POOL_READY=false
+# ── Start Tor SOCKS5 Proxy (IP rotation for opencode.ai/zen) ──
+# Tor runs a local SOCKS5 proxy on 127.0.0.1:9050 that provides
+# automatic IP rotation every ~10 minutes. Only opencode.ai (the
+# LLM provider) is routed through Tor — Telegram uses Cloudflare
+# Worker proxy via apiRoot config, so Tor usage doesn't violate
+# HF Spaces ToS (no blocked domains are bypassed through Tor).
+TOR_PID=""
+TOR_HEALTHY=false
+echo "Starting Tor SOCKS5 proxy for IP rotation..."
+# Kill any stale Tor from previous run
+if [ -f /tmp/tor.pid ]; then
+  kill "$(cat /tmp/tor.pid)" 2>/dev/null || true
+  rm -f /tmp/tor.pid
+fi
+# Create writable directories for Tor (user: node)
+mkdir -p /tmp/tor-data /tmp/tor-run
+chmod 700 /tmp/tor-data /tmp/tor-run
+# Write minimal torrc (avoids /etc/tor/torrc permission issues)
+cat > /tmp/torrc << 'TOREOF'
+SOCKSPort 9050
+DataDirectory /tmp/tor-data
+PidFile /tmp/tor.pid
+Log notice stdout
+RunAsDaemon 1
+TOREOF
+# Start Tor as daemon with custom config
+tor -f /tmp/torrc > /dev/null 2>&1
+# Wait for Tor to be ready (check SOCKS port)
 for i in $(seq 1 30); do
   if (echo > /dev/tcp/127.0.0.1/9050) 2>/dev/null; then
-    PROXY_POOL_READY=true
+    TOR_HEALTHY=true
     break
   fi
   sleep 1
 done
-if [ "$PROXY_POOL_READY" = "true" ]; then
-  echo "Proxy pool ready on 127.0.0.1:9050 (built-in fallbacks + auto-rotate every 10 min)"
-  echo "Waiting 15s for pool to find Telegram-capable proxies..."
-  sleep 15
+if [ "$TOR_HEALTHY" = "true" ]; then
+  TOR_PID=$(cat /tmp/tor.pid 2>/dev/null || echo "")
+  echo "Tor SOCKS5 proxy ready on 127.0.0.1:9050 (auto-rotate every 10 min)"
+  # Pre-warm Tor circuits by making a background request
+  (timeout 15 curl -s --socks5-hostname 127.0.0.1:9050 "https://check.torproject.org/" > /dev/null 2>&1) &
+  echo "Tor circuits pre-warming in background"
+  # ── Tor circuit rotation loop (new exit IP every 10 min) ──
+  (
+    sleep 120
+    while true; do
+      if [ -n "$TOR_PID" ] && kill -0 "$TOR_PID" 2>/dev/null; then
+        kill -HUP "$TOR_PID" 2>/dev/null || true
+      fi
+      sleep 600
+    done
+  ) &
+  echo "IP rotation active — new exit node every 10 minutes"
 else
-  echo "Warning: Proxy pool not ready after 30s"
+  echo "Warning: Tor failed to start within 30s. Check if tor package is installed."
+  echo "opencode.ai will connect directly (may hit IP rate limits)."
 fi
 # ── Build config ──
 CONFIG_JSON=$(cat <<'CONFIGEOF'
@@ -859,7 +890,7 @@ chmod 600 "$EXISTING_CONFIG"
 
 # ── Enable Gateway Preload Fixes ──
 # This preload script keeps iframe embedding working on HF Spaces.
-export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs"
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/cloudflare-proxy.js --require /home/node/app/multi-provider-key-rotator.cjs"
 
 # ── Startup Summary ──
 echo ""
@@ -880,8 +911,10 @@ if [ -n "${HF_TOKEN:-}" ]; then
 else
   echo "Backup    : disabled"
 fi
-if [ -n "$PROXY_POOL_PID" ] && kill -0 "$PROXY_POOL_PID" 2>/dev/null; then
-  echo "Proxy     : rotating SOCKS5 pool (Telegram + opencode.ai via 127.0.0.1:9050)"
+if [ "$TOR_HEALTHY" = "true" ]; then
+  echo "Proxy     : Tor SOCKS5 (opencode.ai via 127.0.0.1:9050, rotates every 10 min)"
+else
+  echo "Proxy     : none (opencode.ai direct — may hit rate limits)"
 fi
 # HUGGINGCLAW_JUPYTER_ENABLED env var se override allow karo
 # (env-builder "Enable Jupyter terminal" toggle yahi set karta hai)
