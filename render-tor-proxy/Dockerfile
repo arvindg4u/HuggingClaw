@@ -3,12 +3,24 @@
 # Tor runs OUTSIDE HF Spaces = no ToS violation.
 FROM alpine:3.19
 
-RUN apk add --no-cache tor socat
+RUN apk add --no-cache tor
 
-# Health check script + Tor runner
+# Health check server (tiny HTTP server using nc + printf)
+RUN cat > /health.sh << 'HEOF'
+#!/bin/sh
+PORT=${PORT:-10000}
+while true; do
+  nc -l -p "$PORT" -e /bin/sh -c 'printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"' 2>/dev/null
+done
+HEOF
+
+RUN chmod +x /health.sh
+
+# Tor startup script
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/sh
-# Minimal torrc
+
+# Write torrc
 cat > /tmp/torrc << 'TOREOC'
 SOCKSPort 0.0.0.0:9050
 DataDirectory /tmp/tor-data
@@ -25,17 +37,17 @@ chmod 700 /tmp/tor-data
 tor -f /tmp/torrc &
 TOR_PID=$!
 
-# Health check server on Render's PORT (required for web service)
-# Responds with HTTP 200 to any request
-PORT=${PORT:-10000}
-echo "Starting health check on port $PORT"
-socat TCP-LISTEN:$PORT,fork,reuseaddr SYSTEM:'echo -e "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"' &
+# Start health check server in background (for Render's health checks)
+/health.sh &
+HEALTH_PID=$!
 
-# Wait for Tor
-sleep 3
-echo "Tor SOCKS5 ready on 0.0.0.0:9050"
+# Wait for Tor to bootstrap
+echo "Waiting for Tor to bootstrap..."
+sleep 5
 
 # Keep running
+echo "Tor SOCKS5 ready on 0.0.0.0:9050"
+echo "Health check on PORT=$PORT"
 wait $TOR_PID
 EOF
 
