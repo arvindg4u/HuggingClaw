@@ -719,7 +719,10 @@ fi
 
 # Telegram API root — DNS override in cloudflare-proxy.js handles resolution
 # to hardcoded IPs, so we just use the standard API endpoint directly.
-TELEGRAM_API_ROOT="https://api.telegram.org"
+# If CLOUDFLARE_PROXY_URL is set, route Telegram through Cloudflare Worker proxy
+# This bypasses HF Spaces DNS blocks for api.telegram.org
+TELEGRAM_API_ROOT="${CLOUDFLARE_PROXY_URL:+${CLOUDFLARE_PROXY_URL}/telegram}"
+TELEGRAM_API_ROOT="${TELEGRAM_API_ROOT:-https://api.telegram.org}"
 
 
 # Telegram (supports multiple user IDs, comma-separated)
