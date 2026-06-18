@@ -322,17 +322,18 @@ else
   echo "HF_TOKEN not set — running without dataset persistence."
 fi
 
-# ── Start Proxy Pool (self-rotating SOCKS5 for opencode.ai) ──
+# ── Start Proxy Pool (self-rotating SOCKS5 for Telegram + opencode.ai) ──
 # proxy-pool.py runs a local SOCKS5 proxy on 127.0.0.1:9050 that
 # automatically rotates through free upstream SOCKS5 proxies for
-# IP rotation (bypasses opencode.ai/zen rate limits).
+# IP rotation (bypasses opencode.ai/zen rate limits + HF firewall).
+# Built-in fallback proxies ensure immediate availability.
 # No Tor, no Cloudflare Worker — uses free proxy lists.
 PROXY_POOL_PID=""
 echo "Starting proxy pool for IP rotation..."
 python3 /home/node/app/proxy-pool.py &
 PROXY_POOL_PID=$!
 PROXY_POOL_READY=false
-for i in $(seq 1 15); do
+for i in $(seq 1 30); do
   if (echo > /dev/tcp/127.0.0.1/9050) 2>/dev/null; then
     PROXY_POOL_READY=true
     break
@@ -340,9 +341,9 @@ for i in $(seq 1 15); do
   sleep 1
 done
 if [ "$PROXY_POOL_READY" = "true" ]; then
-  echo "Proxy pool ready on 127.0.0.1:9050 (auto-rotates every 10 min)"
+  echo "Proxy pool ready on 127.0.0.1:9050 (built-in fallbacks + auto-rotate every 10 min)"
 else
-  echo "Warning: Proxy pool not ready after 15s — opencode.ai may connect directly"
+  echo "Warning: Proxy pool not ready after 30s"
 fi
 # ── Build config ──
 CONFIG_JSON=$(cat <<'CONFIGEOF'
@@ -875,7 +876,7 @@ else
   echo "Backup    : disabled"
 fi
 if [ -n "$PROXY_POOL_PID" ] && kill -0 "$PROXY_POOL_PID" 2>/dev/null; then
-  echo "Proxy     : rotating SOCKS5 pool via 127.0.0.1:9050"
+  echo "Proxy     : rotating SOCKS5 pool (Telegram + opencode.ai via 127.0.0.1:9050)"
 fi
 # HUGGINGCLAW_JUPYTER_ENABLED env var se override allow karo
 # (env-builder "Enable Jupyter terminal" toggle yahi set karta hai)

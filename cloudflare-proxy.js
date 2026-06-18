@@ -1,18 +1,17 @@
 /**
- * HuggingClaw Proxy — DNS Override + SOCKS5 Routing
+ * HuggingClaw Proxy — SOCKS5 Routing for Blocked Domains
  *
- * Two mechanisms to bypass HF Spaces network restrictions:
+ * Routes traffic for blocked domains (Telegram, opencode.ai, WhatsApp)
+ * through a local self-rotating SOCKS5 proxy pool at 127.0.0.1:9050.
  *
- * 1. DNS OVERRIDE (for api.telegram.org):
- *    Patches Node.js dns module to resolve blocked domains to hardcoded IPs.
- *    HF Spaces blocks DNS for api.telegram.org but direct IP connections work.
- *    No proxy, no Tor — completely transparent and undetectable.
+ * HF Spaces blocks DNS AND direct IP connections to certain high-abuse
+ * domains (api.telegram.org). The SOCKS5 proxy pool solves both:
+ *   1. DNS resolution happens inside the SOCKS5 tunnel (proxy does DNS)
+ *   2. Egress IP is from the free proxy, not the HF Space IP
+ *   3. Auto-rotates every 10 min for rate-limit bypass
  *
- * 2. SOCKS5 ROUTING (for opencode.ai, WhatsApp):
- *    Routes traffic through a local self-rotating SOCKS5 proxy pool
- *    to provide IP rotation for rate-limit bypass.
- *
- * The local proxy pool runs on 127.0.0.1:9050 (proxy-pool.py).
+ * Additionally patches Node.js DNS to return hardcoded IPs as fallback
+ * for domains where direct connection works (WhatsApp WebSocket).
  */
 
 "use strict";
@@ -27,112 +26,68 @@ const { URL } = require("url");
 const log = (...args) => console.error("[hc-proxy]", ...args);
 
 // ═══════════════════════════════════════════════════════════════
-// PART 1: DNS Override for Telegram
+// DNS Override (for domains where direct IP works)
 // ═══════════════════════════════════════════════════════════════
+// api.telegram.org is NOT here — HF blocks its IPs directly.
+// Only use DNS override for domains where IPs are not firewalled.
 
-// Hardcoded Telegram Bot API IPs (api.telegram.org)
-const TELEGRAM_API_IPS = [
-  "149.154.167.220",   // Primary Telegram Bot API
-  "149.154.166.110",   // Alternative
-  "91.108.4.134",      // Alternative
-  "149.154.167.221",   // Additional
-  "149.154.175.50",    // Additional
-];
-
-// Hardcoded WhatsApp IPs (web.whatsapp.com, wss.web.whatsapp.com)
-const WHATSAPP_IPS = [
-  "157.240.3.52",      // web.whatsapp.com
-  "157.240.7.52",      // Alternative
-  "157.240.17.52",     // Alternative
-];
-
-// Domains we override DNS for
 const DNS_OVERRIDE_DOMAINS = {
-  "api.telegram.org": TELEGRAM_API_IPS,
-  "web.whatsapp.com": WHATSAPP_IPS,
-  "wss.web.whatsapp.com": WHATSAPP_IPS,
+  // WhatsApp WebSocket hosts — HF may only block DNS, not IPs
+  "web.whatsapp.com": ["157.240.3.52", "157.240.7.52"],
+  "wss.web.whatsapp.com": ["157.240.3.52", "157.240.7.52"],
 };
 
-// Patch dns.lookup (used by Node.js for all DNS resolution)
+// Patch dns.lookup
 const originalLookup = dns.lookup;
 dns.lookup = function patchedLookup(hostname, options, callback) {
   if (typeof options === "function") { callback = options; options = {}; }
-  
   const domain = (hostname || "").toString().toLowerCase();
   const ips = DNS_OVERRIDE_DOMAINS[domain];
-  
   if (ips && ips.length > 0) {
-    const ip = ips[0]; // Use first IP
+    const ip = ips[0];
     const family = ip.includes(":") ? 6 : 4;
-    if (typeof callback === "function") {
-      callback(null, ip, family);
-    }
+    if (typeof callback === "function") callback(null, ip, family);
     return { onerror: () => {} };
   }
-  
-  // Fall through to original
-  if (typeof options === "function") {
-    return originalLookup(hostname, options);
-  }
+  if (typeof options === "function") return originalLookup(hostname, options);
   return originalLookup(hostname, options, callback);
 };
 
-// Patch dns.resolve4 (used by some libraries)
+// Patch dns.resolve4
 const originalResolve4 = dns.resolve4;
 dns.resolve4 = function patchedResolve4(hostname, options, callback) {
   if (typeof options === "function") { callback = options; options = {}; }
-  
   const domain = (hostname || "").toString().toLowerCase();
   const ips = DNS_OVERRIDE_DOMAINS[domain];
   if (ips && ips.length > 0) {
     if (typeof callback === "function") callback(null, ips);
     return;
   }
-  
-  if (typeof options === "function") {
-    return originalResolve4(hostname, options);
-  }
+  if (typeof options === "function") return originalResolve4(hostname, options);
   return originalResolve4(hostname, options, callback);
 };
 
-// Patch dns.resolve (covers resolve6, resolveAny etc.)
-const originalResolve = dns.resolve;
-dns.resolve = function patchedResolve(hostname, rrtype, callback) {
-  if (typeof rrtype === "function") { callback = rrtype; rrtype = "A"; }
-  
-  const domain = (hostname || "").toString().toLowerCase();
-  const ips = DNS_OVERRIDE_DOMAINS[domain];
-  if (ips && ips.length > 0 && (rrtype === "A" || rrtype === "ANY")) {
-    if (typeof callback === "function") callback(null, ips);
-    return;
-  }
-  
-  if (typeof rrtype === "function") {
-    return originalResolve(hostname, rrtype);
-  }
-  return originalResolve(hostname, rrtype, callback);
-};
-
-log("DNS override active for:", Object.keys(DNS_OVERRIDE_DOMAINS).join(", "));
+if (Object.keys(DNS_OVERRIDE_DOMAINS).length > 0) {
+  log("DNS override for:", Object.keys(DNS_OVERRIDE_DOMAINS).join(", "));
+}
 
 // ═══════════════════════════════════════════════════════════════
-// PART 2: SOCKS5 Routing for opencode.ai + WhatsApp WebSocket
+// SOCKS5 Routing (for ALL blocked domains via local proxy pool)
 // ═══════════════════════════════════════════════════════════════
 
 const SOCKS5_HOST = "127.0.0.1";
 const SOCKS5_PORT = 9050;
 
-// Domains routed through local SOCKS5 proxy pool
 const SOCKS5_DOMAINS = [
-  "opencode.ai",
-  "web.whatsapp.com",
-  "wss.web.whatsapp.com",
-  "whatsapp.net",
+  "api.telegram.org",      // HF blocks DNS + IPs — route through proxy
+  "opencode.ai",           // IP rotation for rate limits
+  "web.whatsapp.com",      // WhatsApp WebSocket
+  "wss.web.whatsapp.com",  // WhatsApp Secure WebSocket
+  "whatsapp.net",          // WhatsApp media/CDN
 ];
 
 const DEBUG = false;
 
-// Helpers
 const isInternalHost = (hostname) => {
   const n = String(hostname || "").trim().toLowerCase();
   if (!n) return true;
@@ -148,11 +103,11 @@ const matchesDomain = (hostname, domainList) => {
 const shouldProxyViaSOCKS5 = (hostname) =>
   !isInternalHost(hostname) && matchesDomain(hostname, SOCKS5_DOMAINS);
 
-// SOCKS5 Tunnel (pure Node.js)
+// SOCKS5 Tunnel
 function socks5Connect(targetHost, targetPort) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({ host: SOCKS5_HOST, port: SOCKS5_PORT }, () => {
-      socket.write(Buffer.from([0x05, 0x01, 0x00])); // SOCKS5: no auth
+      socket.write(Buffer.from([0x05, 0x01, 0x00]));
     });
     let state = 0;
     let buf = Buffer.alloc(0);
@@ -179,8 +134,8 @@ function socks5Connect(targetHost, targetPort) {
           socket.destroy();
           return reject(new Error(`SOCKS5 connect failed: ${rep}`));
         }
-        let respLen = 4;
         const atyp = buf[3];
+        let respLen = 4;
         if (atyp === 0x01) respLen = 10;
         else if (atyp === 0x03) respLen = 4 + 1 + buf[4] + 2;
         else if (atyp === 0x04) respLen = 4 + 16 + 2;
@@ -203,91 +158,102 @@ function createSocks5ServerSocket(options, callback) {
   const hostname = options.host || options.hostname || "localhost";
   const port = options.port || 80;
   socks5Connect(hostname, port)
-    .then((socket) => {
-      if (typeof callback === "function") callback(null, socket);
-    })
-    .catch((err) => {
-      if (typeof callback === "function") callback(err);
-    });
+    .then((socket) => { if (typeof callback === "function") callback(null, socket); })
+    .catch((err) => { if (typeof callback === "function") callback(err); });
   return new net.Socket();
 }
 
-// ── 1. Patch net.connect / net.createConnection (raw TCP/WebSocket) ──
+// ── 1. Patch net.connect / net.createConnection ──
 const originalNetConnect = net.connect;
 net.connect = function patchedNetConnect(...args) {
   let options = {};
-  if (typeof args[0] === "object" && args[0] !== null) {
-    options = args[0];
-  } else if (typeof args[0] === "number") {
-    options = { port: args[0], host: args[1] || "localhost" };
-  } else if (typeof args[0] === "string") {
-    options = { path: args[0] };
-  }
+  if (typeof args[0] === "object" && args[0] !== null) options = args[0];
+  else if (typeof args[0] === "number") options = { port: args[0], host: args[1] || "localhost" };
+  else if (typeof args[0] === "string") options = { path: args[0] };
   if (!options.host && !options.path) options = { host: args[0], port: args[1] };
 
   const hostname = (options.host || "").trim().toLowerCase();
   if (options._hc_proxied || !shouldProxyViaSOCKS5(hostname)) {
     return originalNetConnect.call(this, ...args);
   }
-  if (DEBUG) log(`net.connect: Routing ${hostname} via SOCKS5`);
-  const socksOpts = { ...options, _hc_proxied: true };
+  if (DEBUG) log(`net.connect: ${hostname} via SOCKS5`);
+
+  // Return a proxy socket
   const socket = new net.Socket();
+  const origOn = socket.on.bind(socket);
+  let proxiedSocket = null;
+
   socks5Connect(options.host || "localhost", options.port || 80)
-    .then((socksSocket) => {
-      socket.emit("connect"); // Signal the socket is ready
-      // Replace socket methods to proxy through socksSocket
-      const origOn = socket.on.bind(socket);
-      socket.on = function(evt, cb) {
-        if (evt === "data") socksSocket.on("data", cb);
-        if (evt === "error") socksSocket.on("error", cb);
-        if (evt === "close") socksSocket.on("close", cb);
-        if (evt === "end") socksSocket.on("end", cb);
-        return origOn(evt, cb);
-      };
-      socket.write = socksSocket.write.bind(socksSocket);
-      socket.end = socksSocket.end.bind(socksSocket);
-      socket.destroy = socksSocket.destroy.bind(socksSocket);
+    .then((socks) => {
+      proxiedSocket = socks;
+      socket.emit("connect");
     })
     .catch((err) => {
       if (DEBUG) log(`SOCKS5 net.connect error: ${err.message}`);
-      // Fallback to direct (in case proxy pool is down)
-      return originalNetConnect.call(this, ...args);
+      socket.destroy(err);
     });
+
+  socket.on = function(evt, cb) {
+    if (proxiedSocket) {
+      if (evt === "data") proxiedSocket.on("data", cb);
+      else if (evt === "error") proxiedSocket.on("error", cb);
+      else if (evt === "close") proxiedSocket.on("close", cb);
+      else if (evt === "end") proxiedSocket.on("end", cb);
+      return origOn(evt, cb);
+    }
+    // Queue until SOCKS5 connects
+    const self = this;
+    const checkConn = setInterval(() => {
+      if (proxiedSocket) {
+        clearInterval(checkConn);
+        if (evt === "data") proxiedSocket.on("data", cb);
+        else if (evt === "error") proxiedSocket.on("error", cb);
+        else if (evt === "close") proxiedSocket.on("close", cb);
+        else if (evt === "end") proxiedSocket.on("end", cb);
+      }
+    }, 50);
+    setTimeout(() => clearInterval(checkConn), 15000);
+    return origOn(evt, cb);
+  };
+  socket.write = function(...wargs) {
+    if (proxiedSocket) return proxiedSocket.write(...wargs);
+    return false;
+  };
+  socket.end = function(...wargs) {
+    if (proxiedSocket) return proxiedSocket.end(...wargs);
+    return origOn("end", () => {});
+  };
+  socket.destroy = function(...wargs) {
+    if (proxiedSocket) return proxiedSocket.destroy(...wargs);
+    return origOn("close", () => {});
+  };
   return socket;
 };
 
-// ── 2. Patch tls.connect (for WSS WebSocket connections) ──
+// ── 2. Patch tls.connect ──
 const originalTlsConnect = tls.connect;
 tls.connect = function patchedTlsConnect(...args) {
   let options = {};
-  if (typeof args[0] === "object" && args[0] !== null) {
-    options = args[0];
-  } else if (typeof args[0] === "number") {
-    options = { port: args[0], host: args[1] || "localhost" };
-  }
+  if (typeof args[0] === "object" && args[0] !== null) options = args[0];
+  else if (typeof args[0] === "number") options = { port: args[0], host: args[1] || "localhost" };
 
   const hostname = (options.host || options.servername || "").trim().toLowerCase();
   if (options._hc_proxied || !shouldProxyViaSOCKS5(hostname)) {
     return originalTlsConnect.call(this, ...args);
   }
-  if (DEBUG) log(`tls.connect: Routing ${hostname} via SOCKS5`);
+  if (DEBUG) log(`tls.connect: ${hostname} via SOCKS5`);
 
   const port = options.port || 443;
-  const socket = new tls.TLSSocket(new net.Socket(), {
-    ...options,
-    _hc_proxied: true,
-  });
-  
+  const socket = new tls.TLSSocket(new net.Socket(), { ...options, _hc_proxied: true });
+
   socks5Connect(hostname, port)
     .then((socksSocket) => {
-      // Create TLS over the SOCKS5 connection
       const tlsSocket = tls.connect({
         socket: socksSocket,
         host: hostname,
         servername: options.servername || hostname,
         rejectUnauthorized: options.rejectUnauthorized !== false,
       });
-      // Pipe TLSSocket events to our socket
       tlsSocket.on("data", (d) => socket.emit("data", d));
       tlsSocket.on("error", (e) => socket.emit("error", e));
       tlsSocket.on("close", () => socket.emit("close"));
@@ -304,7 +270,7 @@ tls.connect = function patchedTlsConnect(...args) {
   return socket;
 };
 
-// ── 3. Patch https.request (for outbound API calls) ──
+// ── 3. Patch https.request ──
 const originalHttpsRequest = https.request;
 https.request = function patchedHttpsRequest(arg1, arg2, arg3) {
   let options = {}, callback;
@@ -319,7 +285,7 @@ https.request = function patchedHttpsRequest(arg1, arg2, arg3) {
   if (options._hc_proxied || !shouldProxyViaSOCKS5(hostname)) {
     return originalHttpsRequest.call(this, arg1, arg2, arg3);
   }
-  if (DEBUG) log(`https.request: Routing ${hostname} via SOCKS5`);
+  if (DEBUG) log(`https.request: ${hostname} via SOCKS5`);
   const newOpts = { ...options, _hc_proxied: true, createConnection: createSocks5ServerSocket };
   return originalHttpsRequest.call(this, newOpts, callback);
 };
@@ -339,7 +305,7 @@ http.request = function patchedHttpRequest(arg1, arg2, arg3) {
   if (options._hc_proxied || !shouldProxyViaSOCKS5(hostname)) {
     return originalHttpRequest.call(this, arg1, arg2, arg3);
   }
-  if (DEBUG) log(`http.request: Routing ${hostname} via SOCKS5`);
+  if (DEBUG) log(`http.request: ${hostname} via SOCKS5`);
   const newOpts = { ...options, _hc_proxied: true, createConnection: createSocks5ServerSocket };
   return originalHttpRequest.call(this, newOpts, callback);
 };
@@ -354,12 +320,11 @@ if (originalFetch) {
     if (req.headers.get("x-hc-proxied") === "true" || !shouldProxyViaSOCKS5(hostname)) {
       return originalFetch.call(this, input, init);
     }
-    if (DEBUG) log(`fetch: Routing ${hostname} via SOCKS5`);
-    const u = new URL(req.url);
-    
+    if (DEBUG) log(`fetch: ${hostname} via SOCKS5`);
+
     return new Promise((resolve, reject) => {
       const chunks = [];
-      const nodeReq = https.request(u, {
+      const nodeReq = https.request(url, {
         method: req.method,
         headers: Object.fromEntries((req.headers || new Map()).entries ? req.headers.entries() : []),
         createConnection: createSocks5ServerSocket,
@@ -370,16 +335,14 @@ if (originalFetch) {
           resolve(new Response(Buffer.concat(chunks), {
             status: nodeRes.statusCode,
             statusText: nodeRes.statusMessage,
-            headers: Object.fromEntries(
-              (nodeRes.headers || []).entries ? Object.entries(nodeRes.headers) : []
-            ),
+            headers: Object.fromEntries(Object.entries(nodeRes.headers || {})),
           }));
         });
       });
       nodeReq.on("error", reject);
       nodeReq.on("timeout", () => { nodeReq.destroy(); reject(new Error("SOCKS5 fetch timeout")); });
-      
-      if (req.body) {
+
+      if (req.body && req.body.getReader) {
         req.body.getReader().read().then(function pump({ done, value }) {
           if (done) { nodeReq.end(); return; }
           nodeReq.write(value);
@@ -392,12 +355,6 @@ if (originalFetch) {
   };
 }
 
-// Startup banner
-try {
-  const fs = require("fs");
-  fs.writeFileSync("/tmp/.hc-proxy-banner-shown", "1", { flag: "wx" });
-  log(`DNS override: ${Object.keys(DNS_OVERRIDE_DOMAINS).join(", ")}`);
-  log(`SOCKS5 routing: ${SOCKS5_DOMAINS.join(", ")} → 127.0.0.1:${SOCKS5_PORT}`);
-} catch (_) {}
+log(`SOCKS5: ${SOCKS5_DOMAINS.join(", ")} → 127.0.0.1:${SOCKS5_PORT}`);
 
 module.exports = {};
