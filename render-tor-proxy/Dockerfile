@@ -4,7 +4,7 @@
 FROM alpine:3.19
 
 RUN apk add --no-cache tor python3 py3-pip
-RUN pip3 install --no-cache-dir websockets
+RUN pip3 install --no-cache-dir --break-system-packages websockets
 
 # WebSocket-to-Tor proxy
 COPY <<'PYEOF' /proxy.py
