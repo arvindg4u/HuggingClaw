@@ -186,8 +186,10 @@ https.request = function(...args) {
   if (opts._hc || !needsProxy(hn)) return origHttps.call(this, ...args);
 
   const nopts = { ...opts, _hc: true, createConnection: (o, c) => {
-    socks5Connect(o.host || o.hostname || "localhost", o.port || 443).then(s => c(null, s)).catch(e => c(e));
-    return new net.Socket();
+    proxyConnect(o.host || o.hostname || "localhost", o.port || 443)
+      .then(s => c(null, s)).catch(e => c(e));
+    // Must NOT return new net.Socket() — Node would use that instead
+    // of the callback socket. Return undefined → Node uses callback.
   }};
   return origHttps.call(this, nopts, cb);
 };
@@ -227,7 +229,7 @@ http.request = function(...args) {
 
   const nopts = { ...opts, _hc: true, createConnection: (o, c) => {
     proxyConnect(o.host || o.hostname || "localhost", o.port || 80).then(s => c(null, s)).catch(e => c(e));
-    return new net.Socket();
+    // Don't return new net.Socket() — Node uses callback when undefined.
   }};
   return origHttp.call(this, nopts, cb);
 };
@@ -333,7 +335,7 @@ function applyFetchPatch() {
         createConnection: (o, c) => {
           proxyConnect(o.host || o.hostname || "localhost", o.port || 443, 30000)
             .then(s => c(null, s)).catch(e => c(e));
-          return new net.Socket();
+          // Don't return new net.Socket() — Node uses callback when undefined.
         },
         timeout: 30000,
       }, (res) => {
