@@ -640,7 +640,7 @@ function proxyHTTP(req, res, targetHost, targetPort, options = {}) {
 
 // ── HTTP server ──
 const server = http.createServer(async (req, res) => {
-  const { pathname } = parseRequestUrl(req.url);
+  const { pathname, search } = parseRequestUrl(req.url);
 
   // Lightweight endpoint for client-side fallback detection.
   // Called by the dashboard JS if it suspects the server-rendered SPACE_IS_PRIVATE
@@ -822,6 +822,16 @@ const server = http.createServer(async (req, res) => {
   // OpenClaw Control UI mounted under /app. Retry without the mount prefix on
   // 404 so deployments keep working across OpenClaw basePath behavior changes.
   if (pathname === APP_BASE || pathname.startsWith(APP_BASE + "/")) {
+    // If no ?token= in URL, redirect to include GATEWAY_TOKEN so the
+    // Control UI JS picks it up from the URL query string and authenticates.
+    if (GATEWAY_TOKEN && (
+      search === "" || search === "?" || search.indexOf("token=") === -1
+    )) {
+      const separator = search && search !== "?" ? "&" : "?";
+      const redirectUrl = `${pathname}${separator}token=${GATEWAY_TOKEN}`;
+      res.writeHead(302, { Location: redirectUrl, "Cache-Control": "no-store" });
+      return res.end();
+    }
     if (isDirectHfSpaceRequest) {
       res.writeHead(200, { "Content-Type": "text/html" });
       return res.end(renderPrivateRedirect(HF_SPACE_URL));
