@@ -39,3 +39,4 @@ temp/
 # os junk
 .DS_Store
 Thumbs.db
+telegram-worker-proxy/
