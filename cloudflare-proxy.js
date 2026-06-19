@@ -4,12 +4,11 @@
  * Routes traffic for blocked domains (Telegram, opencode.ai, WhatsApp)
  * through local self-rotating SOCKS5 proxy pool at 127.0.0.1:9050.
  *
+ * Also provides Cloudflare Worker proxy fast path for Telegram.
  * HF Spaces blocks DNS AND direct IP connections to certain domains.
- * SOCKS5 pool solves both: proxy does DNS, egress is from free proxy IP.
- * Auto-rotates every 10 min for rate-limit bypass.
+ * This patches https.request, http.request, fetch, net.connect, and
+ * tls.connect to route through SOCKS5 proxy for blocked domains.
  */
-
-"use strict";
 
 const https = require("https");
 const http = require("http");
@@ -17,6 +16,7 @@ const net = require("net");
 const tls = require("tls");
 const dns = require("dns");
 const { URL } = require("url");
+const { Duplex } = require("stream");
 
 const log = (...args) => console.error("[hc-proxy]", ...args);
 
@@ -34,16 +34,17 @@ const SOCKS5_DOMAINS = process.env.SOCKS5_PROXY_DOMAINS
   : [];
 
 const isInternal = (h) => {
-  const n = String(h || "").trim().toLowerCase();
-  return !n || n === "localhost" || n === "127.0.0.1" || n === "::1" || n === "0.0.0.0" ||
-    n.endsWith(".hf.space") || n.endsWith(".huggingface.co");
+  const hc = typeof h === "string" ? h.toLowerCase() : "";
+  return /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|::1|localhost)/.test(hc);
 };
-
 const domainMatch = (h, list) => {
-  const n = String(h || "").trim().toLowerCase();
-  return list.some(d => n === d || n.endsWith(`.${d}`));
+  if (!list || list.length === 0) return false;
+  const hc = h.toLowerCase();
+  return list.some(d => {
+    if (d.startsWith("*.")) return hc.endsWith(d.slice(1));
+    return hc === d || hc.endsWith("." + d);
+  });
 };
-
 const needsProxy = (h) => !isInternal(h) && domainMatch(h, SOCKS5_DOMAINS);
 
 // SOCKS5 connect helper
@@ -53,21 +54,21 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
     // No proxy configured — direct TCP
     return directConnect(targetHost, targetPort, timeout);
   }
-  
+
   const pUrl = (typeof process !== 'undefined' && process.env && process.env.SOCKS5_PROXY_URL) || '';
-  
+
   // Try SOCKS5 first (if proxy URL is socks5://)
   if (pUrl.startsWith('socks5')) {
     return socks5Connect(targetHost, targetPort, timeout)
       .catch(() => directConnect(targetHost, targetPort, timeout));
   }
-  
+
   // WebSocket proxy (for wss:// or ws:// URLs) — directly, no HTTP CONNECT attempt
   if (pUrl.startsWith('wss') || pUrl.startsWith('ws://')) {
     return wsConnectProxy(targetHost, targetPort, timeout)
       .catch(() => directConnect(targetHost, targetPort, timeout));
   }
-  
+
   // For https:// URLs: try WebSocket first with quick timeout (bypasses Cloudflare TCP blocks),
   // then HTTP CONNECT, then direct
   // Allow 30s for WebSocket proxy — cold Tor + cold Render free tier
@@ -82,9 +83,9 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
 function directConnect(targetHost, targetPort, timeout = 30000) {
   return new Promise((resolve, reject) => {
     const s = net.createConnection({ host: targetHost, port: targetPort, timeout });
-    s.on('connect', () => resolve(s));
-    s.on('error', reject);
-    setTimeout(() => { s.destroy(); reject(new Error('direct connect timeout')); }, timeout);
+    s.on("connect", () => resolve(s));
+    s.on("error", (e) => reject(e));
+    s.setTimeout(timeout, () => { s.destroy(); reject(new Error('direct connect timeout')); });
   });
 }
 
@@ -96,9 +97,9 @@ function socks5Connect(targetHost, targetPort, timeout = 30000) {
     });
     let state = 0;
     let buf = Buffer.alloc(0);
-    
+
     const cleanup = () => { socket.removeListener("data", onData); };
-    
+
     const onData = (data) => {
       buf = Buffer.concat([buf, data]);
       try {
@@ -173,35 +174,19 @@ https.request = function(...args) {
   let opts = {}, cb;
   if (typeof args[0] === "string" || args[0] instanceof URL) {
     const u = typeof args[0] === "string" ? new URL(args[0]) : args[0];
-    opts = { protocol: u.protocol, hostname: u.hostname, port: u.port, path: u.pathname + u.search };
+    opts = { protocol: u.protocol, hostname: u.hostname, port: u.port, path: u.pathname + u.search,
+             method: "GET", headers: {} };
     if (typeof args[1] === "object" && args[1]) { Object.assign(opts, args[1]); cb = args[2]; }
     else { cb = args[1]; }
   } else { opts = { ...args[0] }; cb = args[1]; }
-  
+
   const hn = opts.hostname || (opts.host ? String(opts.host).split(":")[0] : "");
-  
-  // ── Telegram: rewrite URL to go through Cloudflare Worker ──
-  if (hn === 'api.telegram.org' && CF_PROXY_URL) {
-    const cfUrl = new URL(CF_PROXY_URL);
-    const origPath = opts.path || '/';
-    const nopts = { ...opts, _hc: true,
-      hostname: cfUrl.hostname,
-      host: cfUrl.hostname,
-      port: cfUrl.port || 443,
-      path: '/telegram' + origPath,
-      headers: { ...(opts.headers || {}), 'x-hc': 'true' },
-      createConnection: undefined,
-      socket: undefined,
-    };
-    log(`Telegram https.request via Worker: ${origPath}`);
-    return origHttps.call(this, nopts, cb);
-  }
-  
+  const port = opts.port || 443;
+
   if (opts._hc || !needsProxy(hn)) return origHttps.call(this, ...args);
-  
+
   const nopts = { ...opts, _hc: true, createConnection: (o, c) => {
-    const h = o.host || o.hostname || "localhost";
-    socks5Connect(h, o.port || 443).then(s => c(null, s)).catch(e => c(e));
+    socks5Connect(o.host || o.hostname || "localhost", o.port || 443).then(s => c(null, s)).catch(e => c(e));
     return new net.Socket();
   }};
   return origHttps.call(this, nopts, cb);
@@ -217,9 +202,9 @@ http.request = function(...args) {
     if (typeof args[1] === "object" && args[1]) { Object.assign(opts, args[1]); cb = args[2]; }
     else { cb = args[1]; }
   } else { opts = { ...args[0] }; cb = args[1]; }
-  
+
   const hn = opts.hostname || (opts.host ? String(opts.host).split(":")[0] : "");
-  
+
   // ── Telegram: rewrite URL to go through Cloudflare Worker ──
   if (hn === 'api.telegram.org' && CF_PROXY_URL) {
     const cfUrl = new URL(CF_PROXY_URL);
@@ -237,9 +222,9 @@ http.request = function(...args) {
     };
     return isHttps ? origHttps.call(this, nopts, cb) : origHttp.call(this, nopts, cb);
   }
-  
+
   if (opts._hc || !needsProxy(hn)) return origHttp.call(this, ...args);
-  
+
   const nopts = { ...opts, _hc: true, createConnection: (o, c) => {
     proxyConnect(o.host || o.hostname || "localhost", o.port || 80).then(s => c(null, s)).catch(e => c(e));
     return new net.Socket();
@@ -255,7 +240,7 @@ async function telegramViaWorker(url, options) {
   if (!CF_PROXY_URL) return null;
   const urlObj = new URL(url);
   if (urlObj.hostname !== 'api.telegram.org') return null;
-  
+
   const proxyUrl = `${CF_PROXY_URL}/telegram${urlObj.pathname}${urlObj.search}`;
   log(`Telegram via Worker: ${urlObj.pathname}`);
   try {
@@ -274,68 +259,68 @@ async function telegramViaWorker(url, options) {
 async function telegramDirectIpFallback(url, options) {
   const urlObj = new URL(url);
   if (urlObj.hostname !== 'api.telegram.org') return null;
-  
-  const TELEGRAM_IPS = [
-    "149.154.167.220", "149.154.167.221", "149.154.167.222",
-    "149.154.167.223", "149.154.167.224",
-  ];
-  
-  for (const ip of TELEGRAM_IPS) {
+
+  // Build list of candidate IPs: DNS override + hardcoded fallback IPs
+  const candidates = [...(DNS_OVERRIDE["api.telegram.org"] || []), "149.154.167.220", "149.154.167.221", "149.154.167.222", "149.154.167.99", "91.108.56.100"];
+
+  for (const ip of candidates) {
     try {
-      const directUrl = new URL(url);
-      directUrl.hostname = ip;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
-      const resp = await origFetch.call(globalThis, directUrl.toString(), {
+      const testUrl = `https://${ip}${urlObj.pathname}${urlObj.search}`;
+      const resp = await origFetch.call(globalThis, testUrl, {
         ...options,
-        headers: { ...(options?.headers || {}), host: 'api.telegram.org', 'x-hc': 'true' },
+        headers: { ...options?.headers, host: 'api.telegram.org', 'x-hc': 'true' },
         signal: controller.signal,
       });
       clearTimeout(timeout);
-      if (resp.ok || resp.status === 400) return resp;
-    } catch (e) {
-      // IP blocked, try next
-    }
+      if (resp.ok || resp.status < 500) return resp;
+    } catch (e) { /* try next IP */ }
   }
   return null;
 }
 
 // ── 3. Patch fetch ──
 const origFetch = globalThis.fetch;
-if (origFetch) {
+let fetchPatched = false;
+
+function applyFetchPatch() {
+  if (fetchPatched || !origFetch) return;
+  fetchPatched = true;
+
   globalThis.fetch = async function(input, init) {
     const req = input instanceof Request ? input : new Request(input, init);
     const url = new URL(req.url);
-    
+
     // Already proxied — pass through
     if (req.headers.get("x-hc") === "true") return origFetch.call(this, input, init);
-    
+
     // ── Telegram: use Cloudflare Worker proxy directly (fast path, no SOCKS5) ──
     if (url.hostname === 'api.telegram.org') {
       log(`Telegram fetch intercepted, CF_PROXY_URL=${CF_PROXY_URL ? 'set' : 'not set'}`);
       return new Promise((resolve, reject) => {
         telegramViaWorker(url, { method: req.method, headers: Object.fromEntries(req.headers.entries()) })
-          .then(r => { 
-            if (r) { 
+          .then(r => {
+            if (r) {
               log(`Telegram via Worker SUCCESS (status=${r.status})`);
-              resolve(r); 
-              return; 
+              resolve(r);
+              return;
             }
             log('Telegram Worker returned null, trying direct IPs...');
             telegramDirectIpFallback(url, { method: req.method, headers: Object.fromEntries(req.headers.entries()) })
-              .then(r2 => { 
-                if (r2) { log(`Telegram via direct IP SUCCESS`); resolve(r2); } 
-                else reject(new Error('Telegram unreachable')); 
+              .then(r2 => {
+                if (r2) { log(`Telegram via direct IP SUCCESS`); resolve(r2); }
+                else reject(new Error('Telegram unreachable'));
               })
               .catch(reject);
           })
           .catch(reject);
       });
     }
-    
+
     // ── SOCKS5 domains (opencode.ai): use proxy pool ──
     if (!needsProxy(url.hostname)) return origFetch.call(this, input, init);
-    
+
     return new Promise((resolve, reject) => {
       const chunks = [];
       const headers = {};
@@ -363,7 +348,7 @@ if (origFetch) {
       });
       nodeReq.on("error", (e) => { reject(e); });
       nodeReq.on("timeout", () => { nodeReq.destroy(); reject(new Error('fetch timeout')); });
-      
+
       if (req.body && typeof req.body.getReader === "function") {
         req.body.getReader().read().then(function pump({ done, value }) {
           if (done) { nodeReq.end(); return; }
@@ -385,9 +370,9 @@ net.connect = function(...args) {
   else if (typeof args[0] === "number") opts = { port: args[0], host: args[1] || "localhost" };
   else if (typeof args[0] === "string") opts = { path: args[0] };
   if (!opts.host && !opts.path) opts = { host: args[0], port: args[1] };
-  
+
   const hn = (opts.host || "").trim().toLowerCase();
-  
+
   // ── Telegram: connect through Cloudflare Worker directly ──
   if (hn === 'api.telegram.org' && CF_PROXY_URL) {
     const cfUrl = new URL(CF_PROXY_URL);
@@ -398,71 +383,46 @@ net.connect = function(...args) {
     };
     return origNetConnect.call(this, nopts);
   }
-  
+
   if (opts._hc || !needsProxy(hn)) return origNetConnect.call(this, ...args);
-  
+
   // Create a proxy socket
   const socks = new net.Socket();
   socks._hc_proxied = true;
-  
+
   socks5Connect(opts.host || "localhost", opts.port || 80)
     .then(s => {
-      socks._hc_socket = s;
+      // Replace the socket's underlying connection by re-emitting
       socks.emit("connect");
+      socks._hc_socket = s;
+      // Forward data
+      s.on("data", (d) => { socks.emit("data", d); });
+      s.on("end", () => { socks.emit("end"); });
+      s.on("close", () => { socks.emit("close"); });
+      s.on("error", (e) => { socks.emit("error", e); });
     })
-    .catch(e => socks.destroy(e));
-  
-  socks.write = function(...wa) {
-    if (socks._hc_socket) return socks._hc_socket.write(...wa);
-    return false;
+    .catch(e => { socks.emit("error", e); });
+
+  socks._hc_write = socks.write;
+  socks.write = function(data, ...args) {
+    if (this._hc_socket) return this._hc_socket.write(data, ...args);
+    return this._hc_write.call(this, data, ...args);
   };
-  socks.end = function(...wa) {
-    if (socks._hc_socket) return socks._hc_socket.end(...wa);
-    socks.destroy();
-    return socks;
-  };
-  socks.destroy = function(...wa) {
-    if (socks._hc_socket) socks._hc_socket.destroy(...wa);
-    return net.Socket.prototype.destroy.call(socks, ...wa);
-  };
-  
-  const origOn = socks.on.bind(socks);
-  socks.on = function(evt, cb) {
-    if (socks._hc_socket) {
-      if (evt === "data") socks._hc_socket.on("data", cb);
-      else if (evt === "error") socks._hc_socket.on("error", cb);
-      else if (evt === "close") socks._hc_socket.on("close", cb);
-      else if (evt === "end") socks._hc_socket.on("end", cb);
-      else origOn(evt, cb);
-      return socks;
-    }
-    // Queue until SOCKS5 connects
-    const check = setInterval(() => {
-      if (socks._hc_socket) {
-        clearInterval(check);
-        if (evt === "data") socks._hc_socket.on("data", cb);
-        else if (evt === "error") socks._hc_socket.on("error", cb);
-        else if (evt === "close") socks._hc_socket.on("close", cb);
-        else if (evt === "end") socks._hc_socket.on("end", cb);
-      }
-    }, 10);
-    setTimeout(() => clearInterval(check), 15000);
-    return origOn(evt, cb);
-  };
-  
+
   return socks;
 };
 
-// ── 5. Patch tls.connect (for WSS) ──
-const origTls = tls.connect;
+// ── 5. Patch tls.connect (for HTTPS over SOCKS5) ──
+const origTlsConnect = tls.connect;
 tls.connect = function(...args) {
-  let opts = {};
-  if (typeof args[0] === "object" && args[0]) opts = args[0];
-  else if (typeof args[0] === "number") opts = { port: args[0], host: args[1] || "localhost" };
-  
-  const hn = (opts.host || opts.servername || "").trim().toLowerCase();
-  
-  // ── Telegram: connect through Cloudflare Worker directly ──
+  let opts = {}, cb;
+  if (typeof args[0] === "object" && args[0]) { opts = args[0]; cb = args[1]; }
+  else if (typeof args[0] === "number") { opts = { port: args[0], host: args[1] }; cb = args[2]; }
+  else { opts = { port: args[0], host: args[1] }; cb = args[2]; }
+
+  const hn = (opts.host || "").trim().toLowerCase();
+
+  // ── Telegram: rewrite to Cloudflare Worker ──
   if (hn === 'api.telegram.org' && CF_PROXY_URL) {
     const cfUrl = new URL(CF_PROXY_URL);
     log(`Telegram tls.connect via Worker`);
@@ -471,151 +431,66 @@ tls.connect = function(...args) {
       servername: cfUrl.hostname,
       port: parseInt(cfUrl.port) || 443,
     };
-    return origTls.call(this, nopts);
+    return origTlsConnect.call(this, nopts, cb);
   }
-  
-  if (opts._hc || !needsProxy(hn)) return origTls.call(this, ...args);
-  
-  const port = opts.port || 443;
-  // Return a TLSSocket that connects via SOCKS5
-  try {
-    const tlsSocket = new tls.TLSSocket(null, { ...opts, _hc: true });
-    
-    proxyConnect(hn, port, 30000)
-      .then(socks => {
-        const wrapped = tls.connect({
-          socket: socks,
-          host: hn,
-          servername: opts.servername || hn,
-          rejectUnauthorized: opts.rejectUnauthorized !== false,
-        });
-        // Pipe events
-        tlsSocket._hc_tls = wrapped;
-        tlsSocket.emit("connect");
-      })
-      .catch(e => tlsSocket.destroy(e));
-    
-    tlsSocket.write = function(...wa) {
-      if (tlsSocket._hc_tls) return tlsSocket._hc_tls.write(...wa);
-      return false;
+
+  if (opts._hc || !needsProxy(hn)) return origTlsConnect.call(this, ...args);
+
+  // Create a SOCKS5 connection and wrap TLS over it
+  const tunnelPromise = socks5Connect(opts.host || "localhost", opts.port || 443);
+
+  // We return a socket immediately and upgrade it when tunnel is ready
+  const pending = new net.Socket();
+  pending._hc_tunnel_pending = true;
+
+  tunnelPromise.then((socks) => {
+    const tlsSocket = origTlsConnect({
+      socket: socks,
+      host: opts.host || "localhost",
+      servername: opts.servername || opts.host || "localhost",
+      rejectUnauthorized: opts.rejectUnauthorized !== false,
+    });
+
+    tlsSocket.on("secureConnect", () => {
+      // Replace the pending socket by forwarding events
+      pending.emit("connect");
+      tlsSocket.on("data", (d) => pending.emit("data", d));
+      tlsSocket.on("end", () => pending.emit("end"));
+      tlsSocket.on("close", () => pending.emit("close"));
+      tlsSocket.on("error", (e) => pending.emit("error", e));
+    });
+
+    pending._hc_tlsSocket = tlsSocket;
+    pending.write = function(data, ...args) {
+      if (this._hc_tlsSocket) return this._hc_tlsSocket.write(data, ...args);
+      return net.Socket.prototype.write.call(this, data, ...args);
     };
-    tlsSocket.end = function(...wa) {
-      if (tlsSocket._hc_tls) return tlsSocket._hc_tls.end(...wa);
-      tlsSocket.destroy();
-      return tlsSocket;
-    };
-    tlsSocket.destroy = function(...wa) {
-      if (tlsSocket._hc_tls) tlsSocket._hc_tls.destroy(...wa);
-      return tls.TLSSocket.prototype.destroy.call(tlsSocket, ...wa);
-    };
-    
-    const origTlsOn = tlsSocket.on.bind(tlsSocket);
-    tlsSocket.on = function(evt, cb) {
-      if (tlsSocket._hc_tls) {
-        if (evt === "data") tlsSocket._hc_tls.on("data", cb);
-        else if (evt === "error") tlsSocket._hc_tls.on("error", cb);
-        else if (evt === "close") tlsSocket._hc_tls.on("close", cb);
-        else if (evt === "end") tlsSocket._hc_tls.on("end", cb);
-        else origTlsOn(evt, cb);
-        return tlsSocket;
-      }
-      const check = setInterval(() => {
-        if (tlsSocket._hc_tls) {
-          clearInterval(check);
-          if (evt === "data") tlsSocket._hc_tls.on("data", cb);
-          else if (evt === "error") tlsSocket._hc_tls.on("error", cb);
-          else if (evt === "close") tlsSocket._hc_tls.on("close", cb);
-          else if (evt === "end") tlsSocket._hc_tls.on("end", cb);
-        }
-      }, 10);
-      setTimeout(() => clearInterval(check), 15000);
-      return origTlsOn(evt, cb);
-    };
-    
-    return tlsSocket;
-  } catch (e) {
-    return origTls.call(this, ...args);
-  }
+  }).catch(e => {
+    pending.emit("error", e);
+  });
+
+  return pending;
 };
 
-log(`SOCKS5 routing: ${SOCKS5_DOMAINS.join(", ")} → ${SOCKS5_HOST}:${SOCKS5_PORT}`);
-if (CF_PROXY_URL) {
-  log(`Cloudflare Worker proxy available for Telegram: ${CF_PROXY_URL}`);
-} else {
-  log(`Cloudflare Worker proxy NOT configured — set CLOUDFLARE_PROXY_URL env var`);
-}
-if (Object.keys(DNS_OVERRIDE).length) {
-  log(`DNS override: ${Object.keys(DNS_OVERRIDE).join(", ")}`);
-}
-
-
-// HTTP CONNECT proxy (works through standard HTTP/HTTPS ports — Render/Cloudflare compatible)
-// Connects via TLS when proxy URL is https://, raw TCP for http://
-function httpConnectProxy(targetHost, targetPort, timeout = 30000) {
-  return new Promise((resolve, reject) => {
-    const proxyPort = SOCKS5_PORT || 443;
-    const useTls = typeof process !== 'undefined' && process.env && process.env.SOCKS5_PROXY_URL
-      && process.env.SOCKS5_PROXY_URL.startsWith('https');
-    
-    const rawSocket = net.createConnection({ host: SOCKS5_HOST, port: proxyPort, timeout }, () => {
-      const socket = useTls
-        ? tls.connect({ socket: rawSocket, host: SOCKS5_HOST, servername: SOCKS5_HOST, rejectUnauthorized: false })
-        : rawSocket;
-      
-      const doConnect = () => {
-        const req = "CONNECT " + targetHost + ":" + targetPort + " HTTP/1.1\r\nHost: " + targetHost + ":" + targetPort + "\r\n\r\n";
-        socket.write(req);
-        
-        let buf = Buffer.alloc(0);
-        const onData = (data) => {
-          buf = Buffer.concat([buf, data]);
-          if (buf.includes(Buffer.from("\r\n\r\n"))) {
-            const status = buf.toString('utf-8', 0, buf.indexOf('\r\n'));
-            if (status.includes('200')) {
-              socket.removeAllListeners('data');
-              resolve(socket);
-            } else {
-              socket.destroy();
-              reject(new Error('CONNECT failed: ' + status));
-            }
-          }
-        };
-        socket.on('data', onData);
-      };
-      
-      if (useTls) {
-        socket.once('secureConnect', doConnect);
-      } else {
-        doConnect();
-      }
-    });
-    
-    rawSocket.on('error', reject);
-    setTimeout(() => { rawSocket.destroy(); reject(new Error('CONNECT timeout')); }, timeout);
-  });
-}
-
-// WebSocket proxy (tunnels through Cloudflare + Render via WSS)
-// Works where SOCKS5/HTTP CONNECT are blocked by Cloudflare
+// ── WebSocket proxy connection ──
 function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
   return new Promise((resolve, reject) => {
     const proxyUrl = process.env.SOCKS5_PROXY_URL || '';
     let wsUrl = proxyUrl;
-    // If the URL is https/http, convert to wss for WebSocket. If already ws/wss, keep as-is.
     if (wsUrl.startsWith('http://')) wsUrl = wsUrl.replace(/^http:/, 'ws:');
     else if (wsUrl.startsWith('https://')) wsUrl = wsUrl.replace(/^https:/, 'wss:');
     wsUrl += '/proxy';
-    
+
     let ws;
     try { ws = new WebSocket(wsUrl); } catch(e) { reject(e); return; }
     ws.binaryType = 'arraybuffer';
     const timer = setTimeout(() => { try { ws.close(); } catch(e){} reject(new Error('ws timeout')); }, timeout);
-    
+
     ws.onopen = () => {
       // Send target info
       ws.send(JSON.stringify({ host: targetHost, port: targetPort }));
     };
-    
+
     ws.onmessage = (event) => {
       let msg;
       if (typeof event.data === 'string') msg = event.data;
@@ -627,51 +502,82 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
         if (json.error) { ws.close(); reject(new Error(json.error)); return; }
         if (json.status === 'connected') {
           clearTimeout(timer);
-          // Create a passthrough socket-like object using WebSocket
-          const tunnel = {
-            ws: ws,
-            _buffer: [],
-            _onData: null,
-            _onEnd: null,
-            _onError: null,
-            _ended: false,
-            write: function(data) { try { ws.send(data instanceof Buffer ? data : Buffer.from(data)); } catch(e){} return true; },
-            end: function(data) { if(data) this.write(data); this._ended = true; try{ws.close();}catch(e){} if(this._onEnd) this._onEnd(); },
-            destroy: function() { try{ws.close();}catch(e){} },
-            on: function(evt, cb) {
-              if (evt === 'data') this._onData = cb;
-              else if (evt === 'end') this._onEnd = cb;
-              else if (evt === 'error') this._onError = cb;
-              else if (evt === 'close') this._onEnd = cb;
-              return this;
+          // Create a proper Duplex stream wrapping the WebSocket.
+          // tls.connect() requires a proper stream.Duplex for the `socket` option.
+          // A plain object with on/write/end methods causes silent TLS failure.
+          const tunnel = new Duplex({
+            write(chunk, encoding, callback) {
+              try { ws.send(chunk instanceof Buffer ? chunk : Buffer.from(chunk)); }
+              catch(e) { callback(e); return; }
+              callback();
             },
-            removeAllListeners: function() { this._onData = null; this._onEnd = null; this._onError = null; },
-            setKeepAlive: function() {},
-            setTimeout: function() {},
-          };
-          
+            final(callback) {
+              try { ws.close(); } catch(e) {}
+              callback();
+            },
+            read(size) {},
+            destroy(err, callback) {
+              try { ws.close(); } catch(e) {}
+              callback(err);
+            },
+          });
+          tunnel._ended = false;
+          tunnel.setKeepAlive = tunnel.setTimeout = () => {};
+
           ws.onmessage = (e) => {
             let d;
             if (typeof e.data === 'string') d = Buffer.from(e.data);
             else if (e.data instanceof ArrayBuffer) d = Buffer.from(e.data);
             else if (ArrayBuffer.isView(e.data)) d = Buffer.from(e.data.buffer, e.data.byteOffset, e.data.byteLength);
             else d = Buffer.from(e.data);
-            if (tunnel._onData) tunnel._onData(d);
+            tunnel.push(d);
           };
-          ws.onclose = () => { if(tunnel._onEnd) tunnel._onEnd(); };
-          ws.onerror = (e) => { if(tunnel._onError) tunnel._onError(e); };
-          
+          ws.onclose = () => {
+            tunnel._ended = true;
+            tunnel.push(null);
+          };
+          ws.onerror = () => {
+            tunnel.destroy(new Error('WebSocket error'));
+          };
+
           resolve(tunnel);
         }
-      } catch(e) { 
+      } catch(e) {
         if (!json) { /* binary data before connected? buffer it */ }
       }
     };
-    
+
     ws.onerror = (e) => { clearTimeout(timer); reject(e); };
     ws.onclose = () => { clearTimeout(timer); reject(new Error('ws closed')); };
   });
 }
 
+// HTTP CONNECT proxy fallback
+function httpConnectProxy(targetHost, targetPort, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    if (!SOCKS5_HOST) return reject(new Error('No proxy configured'));
+    const s = net.createConnection({ host: SOCKS5_HOST, port: SOCKS5_PORT });
+    s.setTimeout(timeout, () => { s.destroy(); reject(new Error('HTTP CONNECT timeout')); });
+    s.on("connect", () => {
+      s.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`);
+    });
+    let resp = '';
+    s.on("data", (d) => {
+      resp += d.toString();
+      if (resp.includes('\r\n\r\n')) {
+        if (resp.includes('200')) resolve(s);
+        else { s.destroy(); reject(new Error(`HTTP CONNECT failed: ${resp.split('\r\n')[0]}`)); }
+      }
+    });
+    s.on("error", reject);
+  });
+}
+
+// Apply patches
+applyFetchPatch();
+
+log(`SOCKS5 routing: ${SOCKS5_DOMAINS.join(", ")} → ${SOCKS5_HOST}:${SOCKS5_PORT}`);
+log(`Cloudflare Worker proxy available for Telegram: ${CF_PROXY_URL || 'not configured'}`);
+log(`DNS override: ${Object.keys(DNS_OVERRIDE).join(", ")}`);
 
 module.exports = {};

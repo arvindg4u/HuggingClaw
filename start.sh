@@ -63,6 +63,8 @@ load_env_bundle
 LLM_MODEL="$(trim_var "${LLM_MODEL:-}")"
 GATEWAY_TOKEN="$(trim_var "${GATEWAY_TOKEN:-}")"
 export GATEWAY_TOKEN
+export SOCKS5_PROXY_URL
+export SOCKS5_PROXY_DOMAINS
 OPENCLAW_PASSWORD="$(trim_var "${OPENCLAW_PASSWORD:-}")"
 LLM_API_KEY="$(trim_var "${LLM_API_KEY:-}")"
 
