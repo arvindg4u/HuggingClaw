@@ -87,16 +87,10 @@ async def write_ws_msg(writer, data):
 
 # ── SOCKS5 through Tor ──
 
-def socks5_connect_sync(target_host, target_port, per_host_timeout=15):
-    """Synchronous SOCKS5 connect through local Tor (runs in executor).
-
-    Uses per_host_timeout (not the default 30s) so Tor failures fall
-    through to direct TCP quickly.
-
-    Returns a connected socket (via Tor) or None.
-    """
+def socks5_connect_sync(target_host, target_port):
+    """Synchronous SOCKS5 connect through local Tor (runs in executor)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(per_host_timeout)
+    s.settimeout(20)
     try:
         s.connect((SOCKS5_HOST, SOCKS5_PORT))
         s.sendall(bytes([0x05, 0x01, 0x00]))
@@ -111,18 +105,6 @@ def socks5_connect_sync(target_host, target_port, per_host_timeout=15):
         if atyp == 0x01:    s.recv(6)
         elif atyp == 0x03:  s.recv(s.recv(1)[0] + 2)
         elif atyp == 0x04:  s.recv(18)
-        return s
-    except:
-        try: s.close()
-        except: pass
-        return None
-
-def direct_connect_sync(target_host, target_port):
-    """Direct TCP connect (bypasses Tor, uses Render's egress IP)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(20)
-    try:
-        s.connect((target_host, target_port))
         return s
     except:
         try: s.close()
@@ -191,12 +173,9 @@ async def handle_conn(reader, writer):
     target_host = cfg.get("host", "opencode.ai")
     target_port = cfg.get("port", 443)
 
-    # Connect: try Tor SOCKS5 first (IP rotation), then direct TCP (fallback)
+    # Connect through Tor SOCKS5
     loop = asyncio.get_event_loop()
     tcp = await loop.run_in_executor(None, socks5_connect_sync, target_host, target_port)
-    if tcp is None:
-        # Tor failed — try direct TCP through Render's own IP
-        tcp = await loop.run_in_executor(None, direct_connect_sync, target_host, target_port)
     if tcp is None:
         await write_ws_msg(writer, json.dumps({"error": "proxy connect failed"}).encode())
         writer.close(); return
@@ -238,21 +217,18 @@ async def main():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
-    # Wait for Tor to actually be ready by polling SOCKS5 port
-    # Tor cold start takes 10-30s — fixed sleep is unreliable
-    for attempt in range(30):
-        try:
-            loop = asyncio.get_event_loop()
-            s = await loop.run_in_executor(None, lambda: _check_socks("127.0.0.1", 9050))
-            if s:
-                s.close()
-                print(f"Tor ready after {attempt+1}s")
-                break
-        except:
-            pass
+    # Wait for Tor to actually be ready — tests if SOCKS5 can CONNECT,
+    # not just if the port is open. Tor cold start takes 10-30s.
+    for attempt in range(60):
+        ok = await loop.run_in_executor(None, lambda: _check_socks("127.0.0.1", 9050))
+        if ok:
+            print(f"Tor ready after {attempt+1}s (SOCKS5 CONNECT verified)")
+            break
+        if attempt < 5 or attempt % 5 == 0:
+            print(f"Waiting for Tor... ({attempt+1}s)")
         await asyncio.sleep(1)
     else:
-        print("Warning: Tor not ready after 30s — continuing anyway")
+        print("Warning: Tor not ready after 60s — continuing anyway")
 
     server = await asyncio.start_server(handle_conn, "0.0.0.0", HTTP_PORT)
     async with server:
@@ -260,20 +236,27 @@ async def main():
         await server.serve_forever()
 
 def _check_socks(host, port):
-    """Return a socket if SOCKS5 responds, None otherwise."""
+    """Return True if SOCKS5 port is listening AND Tor can CONNECT somewhere.
+       This verifies Tor can actually route, not just that the port is open."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3)
+        s.settimeout(5)
         s.connect((host, port))
         s.sendall(bytes([0x05, 0x01, 0x00]))
         resp = s.recv(2)
-        if resp == bytes([0x05, 0x00]):
-            return s
+        if resp != bytes([0x05, 0x00]): s.close(); return False
+        # Try CONNECT to verify Tor can actually route — just test with
+        # a likely-fast target (opencode.ai). 5s timeout is enough.
+        hbuf = b"opencode.ai"
+        req = bytes([0x05, 0x01, 0x00, 0x03, len(hbuf)]) + hbuf + (443).to_bytes(2, 'big')
+        s.sendall(req)
+        resp = s.recv(4)
         s.close()
+        return len(resp) >= 4 and resp[1] == 0x00
     except:
         try: s.close()
         except: pass
-    return None
+        return False
 
 if __name__ == "__main__":
     asyncio.run(main())
