@@ -87,10 +87,16 @@ async def write_ws_msg(writer, data):
 
 # ── SOCKS5 through Tor ──
 
-def socks5_connect_sync(target_host, target_port):
-    """Synchronous SOCKS5 connect through local Tor (runs in executor)."""
+def socks5_connect_sync(target_host, target_port, per_host_timeout=15):
+    """Synchronous SOCKS5 connect through local Tor (runs in executor).
+
+    Uses per_host_timeout (not the default 30s) so Tor failures fall
+    through to direct TCP quickly.
+
+    Returns a connected socket (via Tor) or None.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(30)
+    s.settimeout(per_host_timeout)
     try:
         s.connect((SOCKS5_HOST, SOCKS5_PORT))
         s.sendall(bytes([0x05, 0x01, 0x00]))
@@ -105,7 +111,18 @@ def socks5_connect_sync(target_host, target_port):
         if atyp == 0x01:    s.recv(6)
         elif atyp == 0x03:  s.recv(s.recv(1)[0] + 2)
         elif atyp == 0x04:  s.recv(18)
-        # s stays in blocking mode for executor thread
+        return s
+    except:
+        try: s.close()
+        except: pass
+        return None
+
+def direct_connect_sync(target_host, target_port):
+    """Direct TCP connect (bypasses Tor, uses Render's egress IP)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(20)
+    try:
+        s.connect((target_host, target_port))
         return s
     except:
         try: s.close()
@@ -174,9 +191,12 @@ async def handle_conn(reader, writer):
     target_host = cfg.get("host", "opencode.ai")
     target_port = cfg.get("port", 443)
 
-    # Connect through Tor SOCKS5
+    # Connect: try Tor SOCKS5 first (IP rotation), then direct TCP (fallback)
     loop = asyncio.get_event_loop()
     tcp = await loop.run_in_executor(None, socks5_connect_sync, target_host, target_port)
+    if tcp is None:
+        # Tor failed — try direct TCP through Render's own IP
+        tcp = await loop.run_in_executor(None, direct_connect_sync, target_host, target_port)
     if tcp is None:
         await write_ws_msg(writer, json.dumps({"error": "proxy connect failed"}).encode())
         writer.close(); return
