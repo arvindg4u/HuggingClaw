@@ -844,6 +844,21 @@ else
 fi
 chmod 600 "$EXISTING_CONFIG"
 
+# ── Ensure controlUi.allowedOrigins includes Space host ──
+# This fixes "origin not allowed" errors when connecting from the HF Space URL.
+# SPACE_HOST is auto-set by HF Spaces. Also merge in ALLOWED_ORIGINS env var.
+if [ -n "${SPACE_HOST:-}" ]; then
+  SPACE_ORIGIN="https://${SPACE_HOST}"
+  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq --arg origin "$SPACE_ORIGIN" '
+    .gateway.controlUi.allowedOrigins = ((.gateway.controlUi.allowedOrigins // []) + [$origin] | unique)
+  ')
+fi
+if [ -n "${ALLOWED_ORIGINS:-}" ]; then
+  ORIGINS_JSON=$(echo "$ALLOWED_ORIGINS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R . | jq -s .)
+  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq ".gateway.controlUi.allowedOrigins += $ORIGINS_JSON | .gateway.controlUi.allowedOrigins |= unique")
+fi
+echo "$CONFIG_JSON" > "$EXISTING_CONFIG"
+
 # ── Enable Gateway Preload Fixes ──
 # This preload script keeps iframe embedding working on HF Spaces.
 export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs"
