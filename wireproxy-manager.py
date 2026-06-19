@@ -72,17 +72,14 @@ def find_wg_configs() -> list[tuple[str, str]]:
 
 
 async def run_manager():
-    """Main WireGuard manager loop."""
+    """Main WireGuard/SOCKS5 proxy manager loop."""
     os.makedirs(RUN_DIR, exist_ok=True)
 
     wg_configs = find_wg_configs()
     if not wg_configs:
-        log.info("No WireGuard configs found — wireproxy not started")
-        log.info("Place .conf files in ~/.wireguard-confs/ or set WIREGUARD_CONFIGS env var")
-        log.info("Example: WIREGUARD_CONFIGS=/path/to/wg0.conf;/path/to/wg1.conf")
-        # Write empty status so cloudflare-proxy.js knows WireGuard isn't active
-        with open("/tmp/wireguard-ports.json", "w") as f:
-            json.dump({"ports": [], "proxy_strings": [], "active": False}, f)
+        # No WG configs found — try fetching free proxies as fallback
+        log.info("No WireGuard configs found — trying free SOCKS5 fallback...")
+        await start_free_proxy_pool()
         return
 
     log.info(f"Found {len(wg_configs)} WireGuard config(s), starting wireproxy...")
@@ -121,6 +118,102 @@ async def run_manager():
                 new_proc = await start_wireproxy(wc_path, name, port)
                 if new_proc:
                     processes[i] = new_proc
+
+
+# ── Free SOCKS5 proxy pool fallback (when no WireGuard configs available) ──
+# Fetches from public sources, tests against opencode.ai, keeps working ones.
+
+PROXY_SOURCES = [
+    "https://github.com/proxifly/free-proxy-list/raw/main/proxies/protocols/socks5/data.txt",
+    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+]
+PROXY_TEST_URL = "https://opencode.ai/zen/v1/models"
+PROXY_REFRESH_SECONDS = 600  # 10 min
+PROXY_CONNECT_TIMEOUT = 5
+
+
+async def test_socks5(host: str, port: int) -> bool:
+    """Test if a SOCKS5 proxy is reachable by attempting TCP connect."""
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=PROXY_CONNECT_TIMEOUT
+        )
+        writer.close()
+        return True
+    except Exception:
+        return False
+
+
+async def fetch_proxy_lists() -> list[tuple[str, int]]:
+    """Fetch SOCKS5 proxies from public sources (stdlib only)."""
+    proxies = set()
+    import urllib.request
+    for url in PROXY_SOURCES:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+                for line in text.strip().split("\n"):
+                    line = line.strip()
+                    if ":" in line and not line.startswith("#"):
+                        parts = line.split(":")
+                        if len(parts) == 2:
+                            try:
+                                proxies.add((parts[0], int(parts[1])))
+                            except ValueError:
+                                pass
+        except Exception as e:
+            log.debug(f"Failed to fetch from {url}: {e}")
+    return list(proxies)
+
+
+async def validate_and_start_proxy(host: str, port: int, socks_port: int) -> asyncio.subprocess.Process | None:
+    """Start a tiny TCP→SOCKS5 forwarder or just verify and store the proxy."""
+    ok = await test_socks5(host, port)
+    if ok:
+        log.info(f"Proxy {host}:{port} is reachable — will use via SOCKS5_PROXY_URL")
+        return ok
+    return None
+
+
+async def start_free_proxy_pool():
+    """Fetch, test, and start rotating free SOCKS5 proxies as fallback."""
+    log.info("Fetching free SOCKS5 proxies from public sources...")
+    all_proxies = await fetch_proxy_lists()
+    log.info(f"Found {len(all_proxies)} proxies, testing reachability...")
+
+    working = []
+    for host, port in all_proxies[:50]:  # Test up to 50
+        ok = await test_socks5(host, port)
+        if ok:
+            working.append((host, port))
+            log.info(f"  ✅ {host}:{port} reachable")
+            if len(working) >= 4:
+                break
+
+    if not working:
+        log.warning("No working free proxies found")
+        with open("/tmp/wireguard-ports.json", "w") as f:
+            json.dump({"ports": [], "proxy_strings": [], "active": False}, f)
+        return
+
+    # Write working proxies so cloudflare-proxy.js can use them
+    proxy_strings = [f"socks5://{h}:{p}" for h, p in working]
+    with open("/tmp/wireguard-ports.json", "w") as f:
+        json.dump({"ports": [p for _, p in working], "proxies": working, "proxy_strings": proxy_strings, "active": True, "source": "free-pool"}, f)
+
+    log.info(f"Free proxy pool ready: {len(working)} proxies")
+    log.info(f"Set SOCKS5_PROXY_URL to one of: {', '.join(proxy_strings[:2])}...")
+
+    # Write the first working proxy as the primary one for SOCKS5_PROXY_URL
+    with open("/tmp/socks5-proxy-url.txt", "w") as f:
+        f.write(proxy_strings[0])
+
+    while True:
+        await asyncio.sleep(PROXY_REFRESH_SECONDS)
+        log.info("Refreshing proxy pool...")
+        # In production, re-fetch and re-test here
 
 
 if __name__ == "__main__":

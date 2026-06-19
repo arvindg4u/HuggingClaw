@@ -64,7 +64,7 @@ LLM_MODEL="$(trim_var "${LLM_MODEL:-}")"
 GATEWAY_TOKEN="$(trim_var "${GATEWAY_TOKEN:-}")"
 export GATEWAY_TOKEN
 export SOCKS5_PROXY_URL
-export SOCKS5_PROXY_DOMAINS
+export SOCKS5_PROXY_DOMAINS="${SOCKS5_PROXY_DOMAINS:-opencode.ai,api.telegram.org}"
 OPENCLAW_PASSWORD="$(trim_var "${OPENCLAW_PASSWORD:-}")"
 LLM_API_KEY="$(trim_var "${LLM_API_KEY:-}")"
 
@@ -1804,8 +1804,24 @@ while true; do
     fi
   fi
 
-  # ── Start WireGuard proxy manager (if wireproxy binary and configs exist) ──
+  # ── Start WireGuard proxy manager (or free SOCKS5 proxy pool fallback) ──
   start_wireproxy_manager
+
+  # If SOCKS5_PROXY_URL is still unset, check if wireproxy found proxies
+  if [ -z "${SOCKS5_PROXY_URL:-}" ]; then
+    if [ -f /tmp/socks5-proxy-url.txt ]; then
+      SOCKS5_PROXY_URL=$(cat /tmp/socks5-proxy-url.txt)
+      export SOCKS5_PROXY_URL
+      echo "Auto-detected SOCKS5 proxy: ${SOCKS5_PROXY_URL}"
+    elif [ -f /tmp/wireguard-ports.json ]; then
+      WG_PROXY=$(python3 -c "import json; d=json.load(open('/tmp/wireguard-ports.json')); s=d.get('proxy_strings',[]); print(s[0] if s else '')" 2>/dev/null)
+      if [ -n "$WG_PROXY" ]; then
+        SOCKS5_PROXY_URL="$WG_PROXY"
+        export SOCKS5_PROXY_URL
+        echo "Auto-detected WireGuard SOCKS5: ${SOCKS5_PROXY_URL}"
+      fi
+    fi
+  fi
 
   echo "Launching OpenClaw gateway on port ${GATEWAY_PORT}..."
 
