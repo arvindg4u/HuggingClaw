@@ -66,7 +66,7 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
   // WebSocket proxy (for wss:// or ws:// URLs) — directly, no HTTP CONNECT attempt
   if (pUrl.startsWith('wss') || pUrl.startsWith('ws://')) {
     return wsConnectProxy(targetHost, targetPort, timeout)
-      .catch(() => directConnect(targetHost, targetPort, timeout));
+      .catch(() => tlsConnectProxy(targetHost, targetPort, timeout));
   }
 
   // For https:// URLs: try WebSocket first with quick timeout (bypasses Cloudflare TCP blocks),
@@ -473,6 +473,48 @@ tls.connect = function(...args) {
 
   return pending;
 };
+
+// ── TLS + HTTP CONNECT proxy (fallback when WS fails) ──
+// Node's built-in WebSocket fails against some TLS configs (Render),
+// but tls.connect + HTTP CONNECT always works.
+function tlsConnectProxy(targetHost, targetPort, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const proxyUrl = process.env.SOCKS5_PROXY_URL || '';
+    let host, port;
+    try {
+      const u = new URL(proxyUrl);
+      host = u.hostname;
+      port = parseInt(u.port) || 443;
+    } catch(e) { reject(e); return; }
+
+    const socket = tls.connect({ host, port, rejectUnauthorized: false }, () => {
+      socket.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`);
+    });
+
+    let resp = '';
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('TLS CONNECT timeout'));
+    }, timeout);
+
+    socket.on('data', (d) => {
+      resp += d.toString();
+      if (resp.includes('\r\n\r\n')) {
+        if (resp.includes('200 Connection Established')) {
+          clearTimeout(timer);
+          resolve(socket);
+        } else {
+          clearTimeout(timer);
+          socket.destroy();
+          reject(new Error(`HTTP CONNECT failed: ${resp.split('\r\n')[0]}`));
+        }
+      }
+    });
+
+    socket.on('error', (e) => { clearTimeout(timer); reject(e); });
+    socket.on('close', () => { clearTimeout(timer); reject(new Error('TLS CONNECT closed')); });
+  });
+}
 
 // ── WebSocket proxy connection ──
 function wsConnectProxy(targetHost, targetPort, timeout = 30000) {

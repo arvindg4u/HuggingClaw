@@ -129,7 +129,63 @@ async def handle_conn(reader, writer):
         writer.close(); return
 
     # Peek: is this a WebSocket upgrade or plain HTTP?
+    request_line = data.split(b'\r\n', 1)[0].decode('utf-8', errors='replace')
     is_ws_upgrade = b'upgrade: websocket' in data.lower()
+    is_connect = request_line.upper().startswith('CONNECT ')
+
+    if is_connect:
+        # ── HTTP CONNECT proxy (for Node.js TLS clients) ──
+        # Parse target from "CONNECT host:port HTTP/1.1"
+        parts = request_line.split(' ')
+        if len(parts) >= 2:
+            target = parts[1]
+        else:
+            writer.write(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+            await writer.drain(); writer.close(); return
+
+        if ':' in target:
+            target_host, target_port_str = target.rsplit(':', 1)
+            target_port = int(target_port_str)
+        else:
+            target_host = target
+            target_port = 443
+
+        # Connect through Tor SOCKS5
+        loop = asyncio.get_event_loop()
+        tcp = await loop.run_in_executor(None, socks5_connect_sync, target_host, target_port)
+        if tcp is None:
+            writer.write(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+            await writer.drain(); writer.close(); return
+
+        # 200 Connection Established
+        writer.write(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+        await writer.drain()
+
+        # Bidirectional relay (tcp is sync socket, reader/writer are asyncio)
+        # After CONNECT, all data is raw TCP — no WebSocket framing
+        async def _tcp2remote():
+            try:
+                while True:
+                    d = await reader.read(65536)
+                    if not d: break
+                    await loop.run_in_executor(None, tcp.sendall, d)
+            except: pass
+
+        async def _remote2tcp():
+            try:
+                while True:
+                    d = await loop.run_in_executor(None, tcp.recv, 65536)
+                    if not d: break
+                    writer.write(d)
+                    await writer.drain()
+            except: pass
+
+        await asyncio.gather(_tcp2remote(), _remote2tcp())
+        try: tcp.close()
+        except: pass
+        try: writer.close()
+        except: pass
+        return
 
     if not is_ws_upgrade:
         # Health check — any HTTP method (GET, HEAD, etc.)
