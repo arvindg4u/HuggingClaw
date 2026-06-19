@@ -3,28 +3,27 @@ const https = require("https");
 const net = require("net");
 const tls = require("tls");
 const { WebSocketServer } = require("ws");
+const { URL } = require("url");
 
 const PORT = process.env.PORT || 10000;
-const SOCKS_PORT = 9050;
 
 /**
- * HuggingClaw WebSocket-to-TCP Relay
+ * HuggingClaw WebSocket-to-TCP Relay — single-port mode
  *
- * HF Spaces blocks outbound WhatsApp connections. This relay:
- * 1. Accepts WebSocket connections from HF Space
- * 2. Upgrades to TCP/TLS to target (web.whatsapp.com)
- * 3. Bidirectional relay — WebSocket ↔ TCP
- *
- * Also provides SOCKS5 proxy on :9050 for HTTP CONNECT.
+ * Same port (PORT) handles:
+ *   - HTTP health checks   GET /health
+ *   - WebSocket relay      WS /whatsapp?host=X&port=Y
+ *   - SOCKS5 proxy         Raw TCP, first byte 0x05
+ *   - HTTP CONNECT proxy   CONNECT host:port HTTP/1.1
  */
 
-// ── SOCKS5 Proxy ──
-const socksServer = net.createServer((clientSocket) => {
-  let state = 0; // 0=auth, 1=request
-  let buf = Buffer.alloc(0);
+function socks5Connect(clientSocket, data) {
+  let buf = Buffer.from(data);
+  let state = 0;
+  let targetHost, targetPort;
 
-  clientSocket.on("data", (data) => {
-    buf = Buffer.concat([buf, data]);
+  const onData = (d) => {
+    buf = Buffer.concat([buf, d]);
 
     if (state === 0 && buf.length >= 2) {
       if (buf[0] !== 0x05) { clientSocket.destroy(); return; }
@@ -35,43 +34,50 @@ const socksServer = net.createServer((clientSocket) => {
     }
 
     if (state === 1 && buf.length >= 4) {
-      const ver = buf[0];
-      const cmd = buf[1];
       const atyp = buf[3];
-      let host, port, headerLen;
-
-      if (atyp === 0x01) { // IPv4
+      if (atyp === 0x01) {
         if (buf.length < 10) return;
-        host = buf.slice(4, 8).join(".");
-        port = buf.readUInt16BE(8);
-        headerLen = 10;
-      } else if (atyp === 0x03) { // Domain
+        targetHost = buf.slice(4, 8).join(".");
+        targetPort = buf.readUInt16BE(8);
+      } else if (atyp === 0x03) {
         const len = buf[4];
         if (buf.length < 7 + len) return;
-        host = buf.slice(5, 5 + len).toString();
-        port = buf.readUInt16BE(5 + len);
-        headerLen = 7 + len;
+        targetHost = buf.slice(5, 5 + len).toString();
+        targetPort = buf.readUInt16BE(5 + len);
       } else { clientSocket.destroy(); return; }
 
-      // Connect to target
-      const target = net.createConnection({ host, port }, () => {
+      const target = net.createConnection({ host: targetHost, port: targetPort }, () => {
         clientSocket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]));
         target.pipe(clientSocket);
         clientSocket.pipe(target);
       });
       target.on("error", () => clientSocket.destroy());
       clientSocket.on("error", () => target.destroy());
-      buf = Buffer.alloc(0);
       state = 2;
     }
+  };
+
+  clientSocket.on("data", onData);
+}
+
+function httpConnectProxy(clientSocket, data) {
+  const req = data.toString();
+  const match = req.match(/^CONNECT\s+([^:]+):(\d+)\s+HTTP/i);
+  if (!match) { clientSocket.destroy(); return; }
+
+  const targetHost = match[1];
+  const targetPort = parseInt(match[2]);
+
+  const target = net.createConnection({ host: targetHost, port: targetPort }, () => {
+    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    target.pipe(clientSocket);
+    clientSocket.pipe(target);
   });
-});
+  target.on("error", () => clientSocket.destroy());
+  clientSocket.on("error", () => target.destroy());
+}
 
-socksServer.listen(SOCKS_PORT, "0.0.0.0", () => {
-  console.log(`SOCKS5 proxy ready on :${SOCKS_PORT}`);
-});
-
-// ── WebSocket-to-TCP Relay ──
+// ── Host-level WebSocket → TCP relay ──
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws, req) => {
@@ -83,60 +89,40 @@ wss.on("connection", (ws, req) => {
   console.log(`WS relay: ${targetHost}:${targetPort}`);
 
   let targetSocket;
-  const targetCleanup = () => { try { targetSocket?.end(); } catch {} };
+  const cleanup = () => { try { targetSocket?.end(); } catch {} };
 
-  if (useTls) {
-    targetSocket = tls.connect(targetPort, targetHost, { rejectUnauthorized: false }, () => {
-      ws.send(JSON.stringify({ type: "connected" }));
-    });
-  } else {
-    targetSocket = net.createConnection(targetPort, targetHost, () => {
-      ws.send(JSON.stringify({ type: "connected" }));
-    });
-  }
+  const connectTarget = () => {
+    if (useTls) {
+      targetSocket = tls.connect(targetPort, targetHost, { rejectUnauthorized: false }, () => {
+        try { ws.send(JSON.stringify({ type: "connected" })); } catch {}
+      });
+    } else {
+      targetSocket = net.createConnection(targetPort, targetHost, () => {
+        try { ws.send(JSON.stringify({ type: "connected" })); } catch {}
+      });
+    }
 
-  targetSocket.on("data", (data) => {
-    if (ws.readyState === ws.OPEN) ws.send(data);
-  });
-  targetSocket.on("error", (e) => {
-    console.log(`TCP error: ${e.message}`);
-    try { ws.close(); } catch {}
-  });
-  targetSocket.on("close", () => { try { ws.close(); } catch {} });
+    targetSocket.on("data", (d) => { try { if (ws.readyState === ws.OPEN) ws.send(d); } catch {} });
+    targetSocket.on("error", (e) => { console.log(`TCP err: ${e.message}`); cleanup(); try { ws.close(); } catch {} });
+    targetSocket.on("close", () => { try { ws.close(); } catch {} });
+  };
 
-  ws.on("message", (data) => {
-    try {
-      // Check if it's a control message
-      const msg = JSON.parse(data.toString());
-      if (msg.type === "target") {
-        // Reconnect to new target
-        targetCleanup();
-        // (simplified: reconnect logic)
-        return;
-      }
-    } catch {}
-    // Binary data — forward to target
-    try { targetSocket.write(Buffer.from(data)); } catch {}
+  connectTarget();
+
+  ws.on("message", (d) => {
+    try { targetSocket?.write(Buffer.from(d)); } catch {}
   });
-  ws.on("close", targetCleanup);
-  ws.on("error", targetCleanup);
+  ws.on("close", cleanup);
+  ws.on("error", cleanup);
 });
 
-// ── HTTP Server (for health checks + WebSocket upgrade) ──
+// ── Single-port connection handler ──
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://localhost");
 
-  // Health check
   if (url.pathname === "/health" || url.pathname === "/") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", socks: `:${SOCKS_PORT}`, wsRelay: true }));
-    return;
-  }
-
-  // WhatsApp WebSocket relay path
-  if (url.pathname === "/whatsapp" || url.pathname.startsWith("/whatsapp/")) {
-    res.writeHead(426, { "Content-Type": "text/plain" });
-    res.end("WebSocket connection required");
+    res.end(JSON.stringify({ status: "ok", socks5: `:${PORT}`, wsRelay: true }));
     return;
   }
 
@@ -144,20 +130,37 @@ const server = http.createServer((req, res) => {
   res.end("Not found");
 });
 
-// WebSocket upgrade handling
+// WebSocket upgrade
 server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url, "http://localhost");
   if (url.pathname.startsWith("/whatsapp") || url.pathname.startsWith("/ws")) {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
   } else {
     socket.destroy();
   }
 });
 
+// Detect SOCKS5 / HTTP CONNECT on the same port
+server.on("connection", (socket) => {
+  socket.once("data", (data) => {
+    if (data.length === 0) return;
+
+    const firstByte = data[0];
+
+    if (firstByte === 0x05) {
+      // SOCKS5
+      socks5Connect(socket, data);
+    } else if (firstByte === 0x43) {
+      // 'C' — HTTP CONNECT
+      httpConnectProxy(socket, data);
+    } else {
+      // Regular HTTP — re-emit to HTTP server
+      socket.unshift(data);
+    }
+  });
+});
+
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Relay server ready on :${PORT}`);
-  console.log(`  WS endpoint: /whatsapp?host=web.whatsapp.com&port=443`);
-  console.log(`  SOCKS5: :${SOCKS_PORT}`);
+  console.log(`Relay ready on :${PORT}`);
+  console.log(`  SOCKS5 / HTTP CONNECT / WS / HTTP — all on same port`);
 });
