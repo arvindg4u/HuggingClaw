@@ -17,6 +17,7 @@ const tls = require("tls");
 const dns = require("dns");
 const { URL } = require("url");
 const { Duplex } = require("stream");
+const crypto = require("crypto");
 
 const log = (...args) => console.error("[hc-proxy]", ...args);
 
@@ -516,83 +517,135 @@ function tlsConnectProxy(targetHost, targetPort, timeout = 30000) {
   });
 }
 
-// ── WebSocket proxy connection ──
+// ── WebSocket proxy connection (manual TLS+WS) ──
+// Node's built-in WebSocket class fails against Render/Cloudflare (code 1006).
+// Raw tls.connect() + manual WebSocket upgrade always works.
+const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB5E4BE6AC6";
+
 function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
   return new Promise((resolve, reject) => {
     const proxyUrl = process.env.SOCKS5_PROXY_URL || '';
-    let wsUrl = proxyUrl;
-    if (wsUrl.startsWith('http://')) wsUrl = wsUrl.replace(/^http:/, 'ws:');
-    else if (wsUrl.startsWith('https://')) wsUrl = wsUrl.replace(/^https:/, 'wss:');
-    wsUrl += '/proxy';
+    let host, port;
+    try {
+      const u = new URL(proxyUrl);
+      host = u.hostname;
+      port = parseInt(u.port) || 443;
+    } catch(e) { reject(new Error('invalid proxy URL')); return; }
 
-    let ws;
-    try { ws = new WebSocket(wsUrl); } catch(e) { reject(e); return; }
-    ws.binaryType = 'arraybuffer';
-    const timer = setTimeout(() => { try { ws.close(); } catch(e){} reject(new Error('ws timeout')); }, timeout);
+    const timer = setTimeout(() => reject(new Error('ws timeout')), timeout);
+    let state = 0; // 0=connecting, 1=handshake, 2=tunnel
+    let buf = Buffer.alloc(0);
+    let tunnel = null;
 
-    ws.onopen = () => {
-      // Send target info
-      ws.send(JSON.stringify({ host: targetHost, port: targetPort }));
-    };
+    const socket = tls.connect({ host, port, servername: host, rejectUnauthorized: false }, () => {
+      const key = crypto.randomBytes(16).toString('base64');
+      socket.write(
+        'GET / HTTP/1.1\r\n' +
+        'Host: ' + host + '\r\n' +
+        'Upgrade: websocket\r\n' +
+        'Connection: Upgrade\r\n' +
+        'Sec-WebSocket-Key: ' + key + '\r\n' +
+        'Sec-WebSocket-Version: 13\r\n' +
+        '\r\n'
+      );
+    });
 
-    ws.onmessage = (event) => {
-      let msg;
-      if (typeof event.data === 'string') msg = event.data;
-      else if (event.data instanceof ArrayBuffer) msg = Buffer.from(event.data).toString();
-      else if (ArrayBuffer.isView(event.data)) msg = Buffer.from(event.data.buffer, event.data.byteOffset, event.data.byteLength).toString();
-      else msg = event.data.toString();
-      try {
-        const json = JSON.parse(msg);
-        if (json.error) { ws.close(); reject(new Error(json.error)); return; }
-        if (json.status === 'connected') {
-          clearTimeout(timer);
-          // Create a proper Duplex stream wrapping the WebSocket.
-          // tls.connect() requires a proper stream.Duplex for the `socket` option.
-          // A plain object with on/write/end methods causes silent TLS failure.
-          const tunnel = new Duplex({
-            write(chunk, encoding, callback) {
-              try { ws.send(chunk instanceof Buffer ? chunk : Buffer.from(chunk)); }
-              catch(e) { callback(e); return; }
-              callback();
-            },
-            final(callback) {
-              try { ws.close(); } catch(e) {}
-              callback();
-            },
-            read(size) {},
-            destroy(err, callback) {
-              try { ws.close(); } catch(e) {}
-              callback(err);
-            },
-          });
-          tunnel._ended = false;
-          tunnel.setKeepAlive = tunnel.setTimeout = () => {};
-
-          ws.onmessage = (e) => {
-            let d;
-            if (typeof e.data === 'string') d = Buffer.from(e.data);
-            else if (e.data instanceof ArrayBuffer) d = Buffer.from(e.data);
-            else if (ArrayBuffer.isView(e.data)) d = Buffer.from(e.data.buffer, e.data.byteOffset, e.data.byteLength);
-            else d = Buffer.from(e.data);
-            tunnel.push(d);
-          };
-          ws.onclose = () => {
-            tunnel._ended = true;
-            tunnel.push(null);
-          };
-          ws.onerror = () => {
-            tunnel.destroy(new Error('WebSocket error'));
-          };
-
-          resolve(tunnel);
-        }
-      } catch(e) {
-        if (!json) { /* binary data before connected? buffer it */ }
+    function wsSend(data) {
+      const mask = crypto.randomBytes(4);
+      const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      let hdrLen = 2;
+      if (payload.length >= 126) hdrLen = 4;
+      const frame = Buffer.alloc(hdrLen + 4 + payload.length);
+      frame[0] = 0x82;
+      if (payload.length < 126) {
+        frame[1] = 0x80 | payload.length;
+      } else {
+        frame[1] = 0x80 | 126;
+        frame.writeUInt16BE(payload.length, 2);
       }
-    };
+      mask.copy(frame, hdrLen);
+      for (let i = 0; i < payload.length; i++)
+        frame[hdrLen + 4 + i] = payload[i] ^ mask[i % 4];
+      socket.write(frame);
+    }
 
-    ws.onerror = (e) => { clearTimeout(timer); reject(e); };
-    ws.onclose = () => { clearTimeout(timer); reject(new Error('ws closed')); };
+    socket.on('data', (d) => {
+      buf = Buffer.concat([buf, d]);
+      if (state === 0) {
+        // Parse HTTP response headers for WS upgrade
+        const idx = buf.indexOf('\r\n\r\n');
+        if (idx === -1) return;
+        const hs = buf.slice(0, idx).toString();
+        if (!hs.includes('101')) {
+          clearTimeout(timer);
+          reject(new Error('WS handshake failed: ' + hs.split('\r\n')[0]));
+          return;
+        }
+        buf = buf.slice(idx + 4);
+        state = 1;
+        wsSend(JSON.stringify({ host: targetHost, port: targetPort }));
+      }
+      // Parse frames (state 1 = waiting for 'connected', state 2 = tunnel)
+      while (buf.length >= 2) {
+        const opcode = buf[0] & 0x0F;
+        let len = buf[1] & 0x7F;
+        let offset = 2;
+        if (len === 126) {
+          if (buf.length < 4) break;
+          len = buf.readUInt16BE(2); offset = 4;
+        } else if (len === 127) {
+          if (buf.length < 10) break;
+          len = Number(buf.readBigUInt64BE(2)); offset = 10;
+        }
+        if (buf[1] & 0x80) offset += 4; // mask bit
+        if (buf.length < offset + len) break;
+        const payload = buf.slice(offset, offset + len);
+        buf = buf.slice(offset + len);
+
+        if (opcode === 0x8) {
+          clearTimeout(timer);
+          reject(new Error('proxy closed: ' + (payload.length > 2 ? payload.slice(2).toString() : 'code=' + payload.readUInt16BE(0))));
+          return;
+        }
+        if (opcode === 0x9) continue; // ping
+
+        if (state === 1) {
+          const msg = payload.toString();
+          try {
+            const json = JSON.parse(msg);
+            if (json.error) {
+              clearTimeout(timer);
+              reject(new Error(json.error));
+              return;
+            }
+            if (json.status === 'connected') {
+              clearTimeout(timer);
+              tunnel = new Duplex({
+                write(chunk, encoding, callback) {
+                  wsSend(chunk);
+                  callback();
+                },
+                final(callback) { try { socket.end(); } catch(e) {} callback(); },
+                read(size) {},
+                destroy(err, callback) { try { socket.destroy(); } catch(e) {} callback(err); },
+              });
+              tunnel._ended = false;
+              tunnel.setKeepAlive = tunnel.setTimeout = () => {};
+              state = 2;
+              resolve(tunnel);
+            }
+          } catch(e) {}
+        } else if (state === 2 && tunnel) {
+          tunnel.push(payload);
+        }
+      }
+    });
+
+    socket.on('error', (e) => { clearTimeout(timer); reject(e); });
+    socket.on('close', () => {
+      clearTimeout(timer);
+      if (tunnel && !tunnel._ended) { tunnel._ended = true; tunnel.push(null); }
+    });
   });
 }
 
