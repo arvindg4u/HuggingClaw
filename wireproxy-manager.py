@@ -179,6 +179,10 @@ async def validate_and_start_proxy(host: str, port: int, socks_port: int) -> asy
 
 async def start_free_proxy_pool():
     """Fetch, test, and start rotating free SOCKS5 proxies as fallback."""
+    # Write a status file immediately so start.sh knows we're working
+    with open("/tmp/wireguard-ports.json", "w") as f:
+        json.dump({"ports": [], "proxy_strings": [], "active": False, "status": "fetching"}, f)
+
     log.info("Fetching free SOCKS5 proxies from public sources...")
     all_proxies = await fetch_proxy_lists()
     log.info(f"Found {len(all_proxies)} proxies, testing reachability...")
@@ -189,6 +193,10 @@ async def start_free_proxy_pool():
         if ok:
             working.append((host, port))
             log.info(f"  ✅ {host}:{port} reachable")
+            # Write each working proxy incrementally so start.sh can pick it up
+            proxy_url = f"socks5://{host}:{port}"
+            with open("/tmp/socks5-proxy-url.txt", "w") as f:
+                f.write(proxy_url)
             if len(working) >= 4:
                 break
 
