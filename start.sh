@@ -846,18 +846,23 @@ chmod 600 "$EXISTING_CONFIG"
 
 # ── Ensure controlUi.allowedOrigins includes Space host ──
 # This fixes "origin not allowed" errors when connecting from the HF Space URL.
+# CRITICAL: Read the FILE on disk (not CONFIG_JSON template) — when a config
+# was restored from DevData and patched above, the file has all restored
+# channels/plugins that the template doesn't have. Operating on CONFIG_JSON
+# would overwrite them.
 # SPACE_HOST is auto-set by HF Spaces. Also merge in ALLOWED_ORIGINS env var.
+CURRENT_CONFIG=$(cat "$EXISTING_CONFIG")
 if [ -n "${SPACE_HOST:-}" ]; then
   SPACE_ORIGIN="https://${SPACE_HOST}"
-  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq --arg origin "$SPACE_ORIGIN" '
+  CURRENT_CONFIG=$(echo "$CURRENT_CONFIG" | jq --arg origin "$SPACE_ORIGIN" '
     .gateway.controlUi.allowedOrigins = ((.gateway.controlUi.allowedOrigins // []) + [$origin] | unique)
   ')
 fi
 if [ -n "${ALLOWED_ORIGINS:-}" ]; then
   ORIGINS_JSON=$(echo "$ALLOWED_ORIGINS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R . | jq -s .)
-  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq ".gateway.controlUi.allowedOrigins += $ORIGINS_JSON | .gateway.controlUi.allowedOrigins |= unique")
+  CURRENT_CONFIG=$(echo "$CURRENT_CONFIG" | jq ".gateway.controlUi.allowedOrigins += $ORIGINS_JSON | .gateway.controlUi.allowedOrigins |= unique")
 fi
-echo "$CONFIG_JSON" > "$EXISTING_CONFIG"
+echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
 
 # ── Enable Gateway Preload Fixes ──
 # This preload script keeps iframe embedding working on HF Spaces.
