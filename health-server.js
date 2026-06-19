@@ -830,6 +830,7 @@ const server = http.createServer(async (req, res) => {
       publicPrefix: APP_BASE,
       stripPrefix: APP_BASE,
       retryWithoutPrefixOn404: true,
+      extraHeaders: GATEWAY_TOKEN ? { authorization: `Bearer ${GATEWAY_TOKEN}` } : {},
     });
   }
 
@@ -845,7 +846,9 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": "text/html" });
     return res.end(renderPrivateRedirect(HF_SPACE_URL));
   }
-  proxyHTTP(req, res, GATEWAY_HOST, GATEWAY_PORT);
+  proxyHTTP(req, res, GATEWAY_HOST, GATEWAY_PORT, {
+    extraHeaders: GATEWAY_TOKEN ? { authorization: `Bearer ${GATEWAY_TOKEN}` } : {},
+  });
 });
 
 // ── WebSocket upgrade (JupyterLab kernels + terminals need this) ──
@@ -864,10 +867,15 @@ server.on("upgrade", (req, socket, head) => {
     ps.write(`X-Forwarded-Host: ${req.headers.host || ""}\r\n`);
     ps.write("X-Forwarded-Proto: https\r\n");
     if (publicPrefix) ps.write(`X-Forwarded-Prefix: ${publicPrefix}\r\n`);
+    // Inject GATEWAY_TOKEN for OpenClaw Control UI WebSocket connections
+    // so the browser doesn't need to enter it manually.
+    if (!isJupyter && GATEWAY_TOKEN) {
+      ps.write(`Authorization: Bearer ${GATEWAY_TOKEN}\r\n`);
+    }
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
       const header = req.rawHeaders[i];
       const lower = header.toLowerCase();
-      if (["host", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-prefix"].includes(lower)) continue;
+      if (["host", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-prefix", "authorization"].includes(lower)) continue;
       ps.write(`${header}: ${req.rawHeaders[i + 1]}\r\n`);
     }
     ps.write("\r\n");
