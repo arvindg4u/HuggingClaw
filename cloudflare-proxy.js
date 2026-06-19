@@ -213,7 +213,6 @@ http.request = function(...args) {
   if (hn === 'api.telegram.org' && CF_PROXY_URL) {
     const cfUrl = new URL(CF_PROXY_URL);
     const origPath = opts.path || '/';
-    // HTTP for Telegram is unlikely but handle it
     const isHttps = String(opts.protocol || '').startsWith('https') || cfUrl.protocol === 'https:';
     const nopts = { ...opts, _hc: true,
       hostname: cfUrl.hostname,
@@ -224,6 +223,29 @@ http.request = function(...args) {
       createConnection: undefined,
       socket: undefined,
     };
+    return isHttps ? origHttps.call(this, nopts, cb) : origHttp.call(this, nopts, cb);
+  }
+
+  // ── WhatsApp WebSocket: route WebSocket upgrade through Cloudflare Worker ──
+  // Baileys ws library sends HTTP request with Upgrade: websocket header
+  if ((hn === 'web.whatsapp.com' || hn === 'wss.web.whatsapp.com') && CF_PROXY_URL) {
+    const cfUrl = new URL(CF_PROXY_URL);
+    const origPath = opts.path || '/';
+    const isHttps = String(opts.protocol || '').startsWith('https') || cfUrl.protocol === 'https:';
+    // Set x-target-host so CF Worker knows to proxy to WhatsApp
+    const headers = { ...(opts.headers || {}), 'x-target-host': hn, 'x-hc': 'true' };
+    // Preserve Host header for WhatsApp
+    headers['Host'] = hn;
+    const nopts = { ...opts, _hc: true,
+      hostname: cfUrl.hostname,
+      host: cfUrl.hostname,
+      port: cfUrl.port || (isHttps ? 443 : 80),
+      path: '/whatsapp' + origPath,
+      headers: headers,
+      createConnection: undefined,
+      socket: undefined,
+    };
+    log(`WhatsApp http.request via Worker: ${hn}${origPath}`);
     return isHttps ? origHttps.call(this, nopts, cb) : origHttp.call(this, nopts, cb);
   }
 
