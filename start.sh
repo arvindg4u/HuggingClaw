@@ -1751,6 +1751,19 @@ while true; do
   if [ "${AUTO_DOCTOR:-false}" = "true" ]; then
     openclaw doctor --fix || true
   fi
+
+  # ── Pre-warm proxy chain ──
+  # Cold Render Tor proxy + cold Tor take 10-20s to bootstrap.
+  # Warming it here prevents the first LLM request from timing out.
+  if [ -n "${SOCKS5_PROXY_URL:-}" ]; then
+    if echo "$SOCKS5_PROXY_URL" | grep -qE "^wss?://"; then
+      PROXY_HOST=$(echo "$SOCKS5_PROXY_URL" | sed 's|^wss\?://||;s|/.*$||;s|:.*$||')
+      echo "[pre-warm] Waking proxy chain: ${PROXY_HOST}..."
+      curl -sk --max-time 15 "https://${PROXY_HOST}/" >/dev/null 2>&1 && \
+        echo "[pre-warm] Proxy health check passed" || \
+        echo "[pre-warm] Proxy health check failed (non-fatal, continuing)"
+    fi
+  fi
   echo "Launching OpenClaw gateway on port ${GATEWAY_PORT}..."
 
   GATEWAY_ARGS=(gateway run --port "${GATEWAY_PORT}" --bind lan)

@@ -70,7 +70,10 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
   
   // For https:// URLs: try WebSocket first with quick timeout (bypasses Cloudflare TCP blocks),
   // then HTTP CONNECT, then direct
-  return wsConnectProxy(targetHost, targetPort, Math.min(timeout, 8000))
+  // Allow 30s for WebSocket proxy — cold Tor + cold Render free tier
+  // can take 10-20s to bootstrap. 8s was too short and caused fallback to
+  // direct TCP, which bypassed Tor and lost IP rotation.
+  return wsConnectProxy(targetHost, targetPort, Math.min(timeout, 30000))
     .catch(() => httpConnectProxy(targetHost, targetPort, timeout)
       .catch(() => directConnect(targetHost, targetPort, timeout)));
 }
