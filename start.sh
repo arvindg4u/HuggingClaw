@@ -64,7 +64,7 @@ LLM_MODEL="$(trim_var "${LLM_MODEL:-}")"
 GATEWAY_TOKEN="$(trim_var "${GATEWAY_TOKEN:-}")"
 export GATEWAY_TOKEN
 export SOCKS5_PROXY_URL
-export SOCKS5_PROXY_DOMAINS="${SOCKS5_PROXY_DOMAINS:-opencode.ai,api.telegram.org}"
+export SOCKS5_PROXY_DOMAINS
 OPENCLAW_PASSWORD="$(trim_var "${OPENCLAW_PASSWORD:-}")"
 LLM_API_KEY="$(trim_var "${LLM_API_KEY:-}")"
 
@@ -325,13 +325,6 @@ else
   echo "HF_TOKEN not set — running without dataset persistence."
 fi
 
-# ── No proxy needed for opencode.ai/zen (direct connection) ──
-# IMPORTANT: opencode.ai is NOT blocked by HF Spaces egress firewall.
-# Connecting directly is fast, reliable, and ToS-compliant.
-#
-# For IP rotation, set SOCKS5_PROXY_URL to an external SOCKS5 proxy.
-#
-# Set SOCKS5_PROXY_URL=socks5://127.0.0.1:9050 to enable Tor routing.
 # ── Build config ──
 CONFIG_JSON=$(cat <<'CONFIGEOF'
 {
@@ -1711,35 +1704,6 @@ start_guardian_once() {
   echo "WhatsApp Guardian started (PID: $GUARDIAN_PID)"
 }
 
-# ── Start WireGuard proxy manager (userspace, no kernel module needed) ──
-# Uses wireproxy to expose WireGuard tunnels as SOCKS5 proxies.
-# Config files in ~/.wireguard-confs/*.conf or WIREGUARD_CONFIGS env var.
-start_wireproxy_manager() {
-  if [ -n "${WG_PROXY_PID:-}" ] && kill -0 "$WG_PROXY_PID" 2>/dev/null; then
-    return 0
-  fi
-  if ! command -v wireproxy >/dev/null 2>&1; then
-    echo "WireProxy: not installed — skipping (use SOCKS5_PROXY_URL for IP rotation)"
-    return 0
-  fi
-  mkdir -p /home/node/.wireguard-confs 2>/dev/null
-  echo "WireProxy: starting manager..."
-  python3 -u /home/node/app/wireproxy-manager.py &
-  WG_PROXY_PID=$!
-  sleep 3
-  if kill -0 "$WG_PROXY_PID" 2>/dev/null; then
-    if [ -f /tmp/wireguard-ports.json ]; then
-      WG_PORTS=$(python3 -c "import json; d=json.load(open("/tmp/wireguard-ports.json")); print(" ".join(str(p) for p in d.get("ports",[])))" 2>/dev/null)
-      if [ -n "$WG_PORTS" ]; then
-        echo "WireProxy: active on SOCKS5 ports $WG_PORTS"
-      else
-        echo "WireProxy: running (no WG configs — place .conf files in ~/.wireguard-confs/)"
-      fi
-    fi
-  else
-    echo "WireProxy: manager failed to start"
-  fi
-}
 
 
 
@@ -1801,25 +1765,6 @@ while true; do
         sleep 1
       done
       echo "[pre-warm] Proxy chain ready"
-    fi
-  fi
-
-  # ── Start WireGuard proxy manager (or free SOCKS5 proxy pool fallback) ──
-  start_wireproxy_manager
-
-  # If SOCKS5_PROXY_URL is still unset, check if wireproxy found proxies
-  if [ -z "${SOCKS5_PROXY_URL:-}" ]; then
-    if [ -f /tmp/socks5-proxy-url.txt ]; then
-      SOCKS5_PROXY_URL=$(cat /tmp/socks5-proxy-url.txt)
-      export SOCKS5_PROXY_URL
-      echo "Auto-detected SOCKS5 proxy: ${SOCKS5_PROXY_URL}"
-    elif [ -f /tmp/wireguard-ports.json ]; then
-      WG_PROXY=$(python3 -c "import json; d=json.load(open('/tmp/wireguard-ports.json')); s=d.get('proxy_strings',[]); print(s[0] if s else '')" 2>/dev/null)
-      if [ -n "$WG_PROXY" ]; then
-        SOCKS5_PROXY_URL="$WG_PROXY"
-        export SOCKS5_PROXY_URL
-        echo "Auto-detected WireGuard SOCKS5: ${SOCKS5_PROXY_URL}"
-      fi
     fi
   fi
 
