@@ -1711,6 +1711,37 @@ start_guardian_once() {
   echo "WhatsApp Guardian started (PID: $GUARDIAN_PID)"
 }
 
+# ── Start WireGuard proxy manager (userspace, no kernel module needed) ──
+# Uses wireproxy to expose WireGuard tunnels as SOCKS5 proxies.
+# Config files in ~/.wireguard-confs/*.conf or WIREGUARD_CONFIGS env var.
+start_wireproxy_manager() {
+  if [ -n "${WG_PROXY_PID:-}" ] && kill -0 "$WG_PROXY_PID" 2>/dev/null; then
+    return 0
+  fi
+  if ! command -v wireproxy >/dev/null 2>&1; then
+    echo "WireProxy: not installed — skipping (use SOCKS5_PROXY_URL for IP rotation)"
+    return 0
+  fi
+  mkdir -p /home/node/.wireguard-confs 2>/dev/null
+  echo "WireProxy: starting manager..."
+  python3 -u /home/node/app/wireproxy-manager.py &
+  WG_PROXY_PID=$!
+  sleep 3
+  if kill -0 "$WG_PROXY_PID" 2>/dev/null; then
+    if [ -f /tmp/wireguard-ports.json ]; then
+      WG_PORTS=$(python3 -c "import json; d=json.load(open("/tmp/wireguard-ports.json")); print(" ".join(str(p) for p in d.get("ports",[])))" 2>/dev/null)
+      if [ -n "$WG_PORTS" ]; then
+        echo "WireProxy: active on SOCKS5 ports $WG_PORTS"
+      else
+        echo "WireProxy: running (no WG configs — place .conf files in ~/.wireguard-confs/)"
+      fi
+    fi
+  else
+    echo "WireProxy: manager failed to start"
+  fi
+}
+
+
 
 
 # ── Start D-Bus session (once, before gateway loop) ──
@@ -1772,6 +1803,10 @@ while true; do
       echo "[pre-warm] Proxy chain ready"
     fi
   fi
+
+  # ── Start WireGuard proxy manager (if wireproxy binary and configs exist) ──
+  start_wireproxy_manager
+
   echo "Launching OpenClaw gateway on port ${GATEWAY_PORT}..."
 
   GATEWAY_ARGS=(gateway run --port "${GATEWAY_PORT}" --bind lan)

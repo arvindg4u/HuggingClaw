@@ -1,20 +1,25 @@
 # ════════════════════════════════════════════════════════════════
-# 🦞 HuggingClaw + 💻 JupyterLab Terminal
+# 🦞 HuggingClaw + 💻 JupyterLab Terminal + 🔄 WireGuard IP Rotation
 # ════════════════════════════════════════════════════════════════
 # Port 7861 (exposed): Dashboard + reverse proxy
 #   /          → HuggingClaw dashboard
 #   /app/      → OpenClaw gateway (internal :7860)
 #   /terminal/ → JupyterLab terminal (internal :8888)
 #
-# NO Tor/snowflake/obfs binaries — HF scans for these.
-# IP rotation via external SOCKS5_PROXY_URL.
+# IP rotation via wireproxy (userspace WireGuard → SOCKS5).
+# No Tor/snowflake/obfs binaries — HF scans for these.
 # ════════════════════════════════════════════════════════════════
 
 # ── Stage 1: Pull pre-built OpenClaw ──
 ARG OPENCLAW_VERSION=latest
 FROM ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION} AS openclaw
 
-# ── Stage 2: Runtime ──
+# ── Stage 2: Build wireproxy (userspace WireGuard → SOCKS5) ──
+FROM golang:alpine AS wireproxy-build
+RUN apk add --no-cache git ca-certificates && \
+    go install github.com/windtf/wireproxy/cmd/wireproxy@v1.1.2
+
+# ── Stage 3: Runtime ──
 FROM node:22-slim
 ARG OPENCLAW_VERSION=latest
 ARG DEV_MODE=false
@@ -24,6 +29,7 @@ ARG DEV_MODE=false
 
 # Install system dependencies (+ optional JupyterLab deps in DEV_MODE)
 # No Tor/snowflake/obfs4 — these trigger HF bans via image scanning.
+# wireproxy (userspace WireGuard → SOCKS5) built in Go stage above.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     sudo \
@@ -59,6 +65,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     --no-install-recommends && \
     pip3 install --no-cache-dir --break-system-packages huggingface_hub hf_transfer && \
     rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built wireproxy from build stage (userspace WireGuard → SOCKS5)
+COPY --from=wireproxy-build /go/bin/wireproxy /usr/local/bin/wireproxy
 
 # Install JupyterLab only when DEV_MODE is enabled (build-time)
 # This avoids installing large packages when terminal is not needed
@@ -97,6 +106,7 @@ RUN ln -s /home/node/.openclaw/openclaw-app/openclaw.mjs /usr/local/bin/openclaw
 
 # Copy HuggingClaw files
 COPY --chown=1000:1000 cloudflare-proxy.js /opt/cloudflare-proxy.js
+COPY --chown=1000:1000 wireproxy-manager.py /home/node/app/wireproxy-manager.py
 COPY --chown=1000:1000 health-server.js /home/node/app/health-server.js
 COPY --chown=1000:1000 login.html /home/node/app/login.html
 COPY --chown=1000:1000 iframe-fix.cjs /home/node/app/iframe-fix.cjs
@@ -110,7 +120,8 @@ COPY --chown=1000:1000 jupyter-devdata-sync.py /home/node/app/jupyter-devdata-sy
 RUN chmod +x /home/node/app/start.sh \
               /home/node/app/openclaw-sync.py \
               /home/node/app/jupyter-devdata-sync.py \
-              /home/node/app/multi-provider-key-rotator.cjs
+              /home/node/app/multi-provider-key-rotator.cjs \
+              /home/node/app/wireproxy-manager.py
 
 USER node
 
