@@ -227,6 +227,17 @@ function getKeepaliveStatus() {
     if (fs.existsSync(CLOUDFLARE_KEEPALIVE_STATUS_FILE))
       return JSON.parse(fs.readFileSync(CLOUDFLARE_KEEPALIVE_STATUS_FILE, "utf8"));
   } catch {}
+  // Auto-detect cron-job.org or UptimeRobot pings by checking recent /health hits
+  try {
+    const hits = JSON.parse(fs.readFileSync("/tmp/health-ping-tracker.json", "utf8") || "[]");
+    const recent = hits.filter(t => Date.now() - t < 600000); // last 10 min
+    if (recent.length >= 2) {
+      const avgGap = (recent[recent.length - 1] - recent[0]) / recent.length / 1000;
+      if (avgGap < 360) { // pings more often than every 6 min = keepalive
+        return { configured: true, status: "active", targetUrl: "/health", method: "external-pinger" };
+      }
+    }
+  } catch {}
   return null;
 }
 
@@ -652,6 +663,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === "/health") {
+    // Track pings for keepalive detection
+    try {
+      const tracker = "/tmp/health-ping-tracker.json";
+      const hits = JSON.parse(fs.readFileSync(tracker, "utf8") || "[]");
+      hits.push(Date.now());
+      if (hits.length > 50) hits.splice(0, hits.length - 50);
+      fs.writeFileSync(tracker, JSON.stringify(hits));
+    } catch (e) { try { fs.writeFileSync("/tmp/health-ping-tracker.json", JSON.stringify([Date.now()])); } catch {} }
     const gatewayReady = await probePort(GATEWAY_HOST, GATEWAY_PORT, "/health");
     res.writeHead(gatewayReady ? 200 : 503, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ status: gatewayReady ? "ok" : "degraded", gatewayReady, uptime: formatUptime(Date.now() - startTime), sync: getSyncStatus(), keepalive: getKeepaliveStatus() }));
