@@ -83,9 +83,9 @@ RUN mkdir -p /home/node/.tor-data && chown -R 1000:1000 /home/node/.tor-data && 
       echo 'MaxCircuitDirtiness 30'; \
       echo 'NewCircuitPeriod 30'; \
       echo 'UseBridges 1'; \
-      echo 'ClientTransportPlugin meek_lite exec /usr/local/bin/meek-client'; \
+      echo 'ClientTransportPlugin meek exec /usr/local/bin/meek-client'; \
       echo 'ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy'; \
-      echo 'Bridge meek_lite 0.0.2.0:1 url=https://meek.azureedge.net/ front=ajax.aspcdn.com'; \
+      echo 'Bridge meek 0.0.2.0:1 url=https://meek.azureedge.net/ front=ajax.aspcdn.com'; \
     } > /etc/tor/torrc
 
 # Install JupyterLab only when DEV_MODE is enabled (build-time)
