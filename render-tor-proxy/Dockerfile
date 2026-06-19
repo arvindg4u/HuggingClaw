@@ -220,7 +220,7 @@ async def main():
     # Wait for Tor to actually be ready — tests if SOCKS5 can CONNECT,
     # not just if the port is open. Tor cold start takes 10-30s.
     for attempt in range(60):
-        ok = await loop.run_in_executor(None, lambda: _check_socks("127.0.0.1", 9050))
+        ok = await asyncio.get_event_loop().run_in_executor(None, lambda: _check_socks("127.0.0.1", 9050))
         if ok:
             print(f"Tor ready after {attempt+1}s (SOCKS5 CONNECT verified)")
             break
