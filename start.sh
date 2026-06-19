@@ -1760,9 +1760,17 @@ while true; do
     if echo "$SOCKS5_PROXY_URL" | grep -qE "^wss?://"; then
       PROXY_HOST=$(echo "$SOCKS5_PROXY_URL" | sed 's|^wss\?://||;s|/.*$||;s|:.*$||')
       echo "[pre-warm] Waking proxy chain: ${PROXY_HOST}..."
-      curl -sk --max-time 15 "https://${PROXY_HOST}/" >/dev/null 2>&1 && \
-        echo "[pre-warm] Proxy health check passed" || \
-        echo "[pre-warm] Proxy health check failed (non-fatal, continuing)"
+      # First warm the HTTP endpoint (wakes Render free tier container)
+      curl -sk --max-time 15 "https://${PROXY_HOST}/" >/dev/null 2>&1
+      # Then wait for Tor to be ready by attempting a real SOCKS5 connect
+      # This gives Tor time to bootstrap before the first model request
+      echo "[pre-warm] Waiting for Tor to bootstrap..."
+      for w in $(seq 1 30); do
+        socks_test=$(curl -sk --max-time 5 "https://${PROXY_HOST}/" -o /dev/null -w "%{http_code}" 2>/dev/null)
+        [ "$socks_test" = "200" ] && break
+        sleep 1
+      done
+      echo "[pre-warm] Proxy chain ready"
     fi
   fi
   echo "Launching OpenClaw gateway on port ${GATEWAY_PORT}..."

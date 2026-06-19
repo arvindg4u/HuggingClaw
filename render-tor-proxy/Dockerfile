@@ -217,12 +217,43 @@ async def main():
         "tor", "-f", "/tmp/torrc",
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-    await asyncio.sleep(5)
+
+    # Wait for Tor to actually be ready by polling SOCKS5 port
+    # Tor cold start takes 10-30s — fixed sleep is unreliable
+    for attempt in range(30):
+        try:
+            loop = asyncio.get_event_loop()
+            s = await loop.run_in_executor(None, lambda: _check_socks("127.0.0.1", 9050))
+            if s:
+                s.close()
+                print(f"Tor ready after {attempt+1}s")
+                break
+        except:
+            pass
+        await asyncio.sleep(1)
+    else:
+        print("Warning: Tor not ready after 30s — continuing anyway")
 
     server = await asyncio.start_server(handle_conn, "0.0.0.0", HTTP_PORT)
     async with server:
-        print(f"Proxy ready — HTTP health + WebSocket via Tor")
+        print(f"Proxy ready — Tor + WebSocket")
         await server.serve_forever()
+
+def _check_socks(host, port):
+    """Return a socket if SOCKS5 responds, None otherwise."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect((host, port))
+        s.sendall(bytes([0x05, 0x01, 0x00]))
+        resp = s.recv(2)
+        if resp == bytes([0x05, 0x00]):
+            return s
+        s.close()
+    except:
+        try: s.close()
+        except: pass
+    return None
 
 if __name__ == "__main__":
     asyncio.run(main())
