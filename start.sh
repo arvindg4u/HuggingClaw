@@ -1732,6 +1732,11 @@ start_tor_once() {
   for i in $(seq 1 30); do
     if (echo > /dev/tcp/127.0.0.1/9050) 2>/dev/null; then
       echo "Tor: ready after ${i}s (SOCKS5 on :9050, meek-azure obfuscated)"
+      # If SOCKS5_PROXY_URL was set by env var to a non-local proxy, warn
+      if [ -n "${SOCKS5_PROXY_URL:-}" ] && [ "${SOCKS5_PROXY_URL#socks5://127.0.0.1}" = "${SOCKS5_PROXY_URL}" ] && [ "${SOCKS5_PROXY_URL#socks5://localhost}" = "${SOCKS5_PROXY_URL}" ]; then
+        echo "WARNING: SOCKS5_PROXY_URL is set to '$SOCKS5_PROXY_URL' — local Tor on :9050 won't be used."
+        echo "         Remove SOCKS5_PROXY_URL from HF Space env vars or set it to 'socks5://127.0.0.1:9050'"
+      fi
       break
     fi
     if ! kill -0 "$TOR_PID" 2>/dev/null; then
