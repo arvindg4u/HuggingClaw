@@ -72,10 +72,11 @@ COPY --from=meek-build /go/bin/meek-client /usr/local/bin/meek-client
 
 # Configure Tor with meek-azure stealth bridge
 # Domain-fronts through ajax.aspcdn.com (Azure CDN) — looks like normal CDN traffic
-RUN mkdir -p /tmp/tor-data && chmod 700 /tmp/tor-data && \
+# DataDirectory under /home/node so the node user (UID 1000) can write to it at runtime
+RUN mkdir -p /home/node/.tor-data && chown -R 1000:1000 /home/node/.tor-data && chmod 700 /home/node/.tor-data && \
     { \
       echo 'SOCKSPort 0.0.0.0:9050'; \
-      echo 'DataDirectory /tmp/tor-data'; \
+      echo 'DataDirectory /home/node/.tor-data'; \
       echo 'Log notice stdout'; \
       echo 'ClientOnly 1'; \
       echo 'ExitRelay 0'; \
