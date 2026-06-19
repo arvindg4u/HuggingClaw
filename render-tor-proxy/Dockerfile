@@ -1,17 +1,47 @@
-# ── WebSocket-to-Tor Proxy for Render (Free Tier) ──
-# Render + Cloudflare block raw TCP/SOCKS5. WebSocket works through both.
-# This runs a WebSocket server that tunnels connections through Tor SOCKS5.
-FROM alpine:3.19
+# ── Obfuscated Tor + WebSocket Proxy ──
+# Uses meek-azure (domain fronting via Azure CDN) + lyrebird (WebTunnel/obfs4)
+# to disguise Tor traffic as normal HTTPS/CDN requests, avoiding HF Space bans.
+FROM alpine:3.24
 
-RUN apk add --no-cache tor python3 py3-pip
+RUN apk add --no-cache tor python3 py3-pip lyrebird meek
 # No external Python packages needed — pure stdlib asyncio
 
-# WebSocket-to-Tor proxy
+# torrc template — uses meek-azure for stealth (domain fronting)
+# All Tor outbound connections go through Azure CDN, appearing as normal HTTPS
+COPY <<'TORRCEOF' /tmp/torrc
+SOCKSPort 0.0.0.0:9050
+DataDirectory /tmp/tor-data
+Log notice stdout
+ClientOnly 1
+ExitRelay 0
+
+# IP rotation every 30 seconds for rate-limit bypass
+MaxCircuitDirtiness ${MAX_CIRCUIT_DIRTINESS:-30}
+NewCircuitPeriod ${NEW_CIRCUIT_PERIOD:-30}
+
+# Enable bridges for stealth connections
+UseBridges 1
+
+# meek-azure: domain fronting through Azure CDN (ajax.aspcdn.com)
+# Traffic appears as normal CDN downloads to HF firewall
+ClientTransportPlugin meek_lite exec /usr/bin/meek-client
+
+# lyrebird: provides obfs4, Snowflake, and WebTunnel support
+ClientTransportPlugin obfs4,webtunnel,snowflake exec /usr/bin/lyrebird
+
+# meek bridge — front=ajax.aspcdn.com makes TLS SNI point to Azure CDN
+# Override via MEEK_URL and MEEK_FRONT env vars if needed
+Bridge meek 0.0.2.0:1 url=${MEEK_URL:-https://meek.azureedge.net/} front=${MEEK_FRONT:-ajax.aspcdn.com}
+TORRCEOF
+
+RUN mkdir -p /tmp/tor-data && chmod 700 /tmp/tor-data
+
+# WebSocket-to-Tor proxy (unchanged — connects to Tor SOCKS5 on :9050)
 COPY <<'PYEOF' /proxy.py
 #!/usr/bin/env python3
 """WebSocket-to-Tor proxy via asyncio — handles both HTTP health checks AND WebSocket.
    Does NOT depend on the 'websockets' library (avoids its HTTP method restrictions).
-   
+
    Render platform + cron-job.org send HEAD/GET probes → handled as HTTP 200 OK.
    HuggingClaw sends WebSocket upgrade with JSON config → tunnels through Tor SOCKS5."""
 import asyncio, os, socket, struct, json, subprocess, hashlib, base64
@@ -71,7 +101,7 @@ async def read_ws_msg(reader):
     return payload
 
 async def write_ws_msg(writer, data):
-    """Send a WebSocket binary message (unmasked server→client)."""
+    """Send a WebSocket binary message (unmasked server->client)."""
     length = len(data)
     hdr = bytearray([0x82])  # FIN + opcode binary
     if length < 126:
@@ -211,7 +241,7 @@ async def _tcp2ws(tcp, writer, loop):
 
 async def main():
     print(f"WebSocket proxy on 0.0.0.0:{HTTP_PORT}")
-    # Start Tor
+    # Start Tor with meek-azure bridge (torrc configured above)
     tor = await asyncio.create_subprocess_exec(
         "tor", "-f", "/tmp/torrc",
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -232,7 +262,7 @@ async def main():
 
     server = await asyncio.start_server(handle_conn, "0.0.0.0", HTTP_PORT)
     async with server:
-        print(f"Proxy ready — Tor + WebSocket")
+        print(f"Proxy ready — Tor + WebSocket (meek-azure obfuscated)")
         await server.serve_forever()
 
 def _check_socks(host, port):
@@ -245,8 +275,7 @@ def _check_socks(host, port):
         s.sendall(bytes([0x05, 0x01, 0x00]))
         resp = s.recv(2)
         if resp != bytes([0x05, 0x00]): s.close(); return False
-        # Try CONNECT to verify Tor can actually route — just test with
-        # a likely-fast target (opencode.ai). 5s timeout is enough.
+        # Try CONNECT to verify Tor can actually route
         hbuf = b"opencode.ai"
         req = bytes([0x05, 0x01, 0x00, 0x03, len(hbuf)]) + hbuf + (443).to_bytes(2, 'big')
         s.sendall(req)
@@ -260,12 +289,9 @@ def _check_socks(host, port):
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 PYEOF
 
-# Tor config
-RUN mkdir -p /tmp/tor-data && chmod 700 /tmp/tor-data
-RUN echo 'SOCKSPort 127.0.0.1:9050\nDataDirectory /tmp/tor-data\nLog notice stdout\nClientOnly 1\nExitRelay 0\nBridgeRelay 0' > /tmp/torrc
+RUN chmod +x /proxy.py
 
 EXPOSE 10000
 CMD ["python3", "/proxy.py"]

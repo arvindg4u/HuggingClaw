@@ -64,10 +64,11 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
       .catch(() => directConnect(targetHost, targetPort, timeout));
   }
 
-  // WebSocket proxy (for wss:// or ws:// URLs) — directly, no HTTP CONNECT attempt
+  // WebSocket proxy (for wss:// or ws:// URLs)
   if (pUrl.startsWith('wss') || pUrl.startsWith('ws://')) {
     return wsConnectProxy(targetHost, targetPort, timeout)
-      .catch(() => tlsConnectProxy(targetHost, targetPort, timeout));
+      .catch(() => tlsConnectProxy(targetHost, targetPort, timeout))
+      .catch(() => directConnect(targetHost, targetPort, timeout));
   }
 
   // For https:// URLs: try WebSocket first with quick timeout (bypasses Cloudflare TCP blocks),
