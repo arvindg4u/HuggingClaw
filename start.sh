@@ -63,8 +63,8 @@ load_env_bundle
 LLM_MODEL="$(trim_var "${LLM_MODEL:-}")"
 GATEWAY_TOKEN="$(trim_var "${GATEWAY_TOKEN:-}")"
 export GATEWAY_TOKEN
-export SOCKS5_PROXY_URL="${SOCKS5_PROXY_URL:-socks5://127.0.0.1:9050}"
-export SOCKS5_PROXY_DOMAINS="${SOCKS5_PROXY_DOMAINS:-opencode.ai,api.telegram.org}"
+export SOCKS5_PROXY_URL
+export SOCKS5_PROXY_DOMAINS
 OPENCLAW_PASSWORD="$(trim_var "${OPENCLAW_PASSWORD:-}")"
 LLM_API_KEY="$(trim_var "${LLM_API_KEY:-}")"
 
@@ -328,10 +328,8 @@ fi
 # ── No proxy needed for opencode.ai/zen (direct connection for default) ──
 # IMPORTANT: opencode.ai is NOT blocked by HF Spaces egress firewall.
 # Connecting directly is fast, reliable, and ToS-compliant.
-#
-# For rate-limit IP rotation, Tor with meek-azure bridge routes through
-# Azure CDN (ajax.aspcdn.com) — undetectable by HF firewall.
-# Set SOCKS5_PROXY_URL=socks5://127.0.0.1:9050 to enable Tor routing.
+# HF scans Docker images for Tor binaries — NO Tor in this image.
+# Use an external SOCKS5 proxy by setting SOCKS5_PROXY_URL env var.
 # ── Build config ──
 CONFIG_JSON=$(cat <<'CONFIGEOF'
 {
@@ -1711,41 +1709,6 @@ start_guardian_once() {
   echo "WhatsApp Guardian started (PID: $GUARDIAN_PID)"
 }
 
-# ── Start Tor daemon with meek-azure stealth bridge ──
-# Runs SOCKS5 on :9050, routes through Azure CDN domain fronting.
-start_tor_once() {
-  if [ -n "${TOR_PID:-}" ] && kill -0 "$TOR_PID" 2>/dev/null; then
-    return 0
-  fi
-  if ! command -v tor >/dev/null 2>&1; then
-    echo "Tor: not installed — skipping"
-    return 0
-  fi
-  if [ ! -f /etc/tor/torrc ]; then
-    echo "Tor: no torrc found — skipping"
-    return 0
-  fi
-  echo "Tor: starting with Snowflake stealth bridge (WebRTC)..."
-  tor -f /etc/tor/torrc &
-  TOR_PID=$!
-  # Wait up to 30s for SOCKS5 to be ready
-  for i in $(seq 1 30); do
-    if (echo > /dev/tcp/127.0.0.1/9050) 2>/dev/null; then
-      echo "Tor: ready after ${i}s (SOCKS5 on :9050, meek-azure obfuscated)"
-      # If SOCKS5_PROXY_URL was set by env var to a non-local proxy, warn
-      if [ -n "${SOCKS5_PROXY_URL:-}" ] && [ "${SOCKS5_PROXY_URL#socks5://127.0.0.1}" = "${SOCKS5_PROXY_URL}" ] && [ "${SOCKS5_PROXY_URL#socks5://localhost}" = "${SOCKS5_PROXY_URL}" ]; then
-        echo "WARNING: SOCKS5_PROXY_URL is set to '$SOCKS5_PROXY_URL' — local Tor on :9050 won't be used."
-        echo "         Remove SOCKS5_PROXY_URL from HF Space env vars or set it to 'socks5://127.0.0.1:9050'"
-      fi
-      break
-    fi
-    if ! kill -0 "$TOR_PID" 2>/dev/null; then
-      echo "Tor: process died during startup"
-      return 0
-    fi
-    sleep 1
-  done
-}
 
 # ── Start D-Bus session (once, before gateway loop) ──
 if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
@@ -1781,10 +1744,6 @@ while true; do
       start_jupyter_once
     fi
   fi
-
-  # ── Start Tor daemon with meek-azure stealth bridge ──
-  # Provides SOCKS5 proxy on :9050 with domain-fronted Tor traffic
-  start_tor_once
 
   if [ "${AUTO_DOCTOR:-false}" = "true" ]; then
     openclaw doctor --fix || true

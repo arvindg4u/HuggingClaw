@@ -1,26 +1,20 @@
 # ════════════════════════════════════════════════════════════════
-# 🦞 HuggingClaw + 💻 JupyterLab Terminal + ❄️ Stealth Tor
+# 🦞 HuggingClaw + 💻 JupyterLab Terminal
 # ════════════════════════════════════════════════════════════════
 # Port 7861 (exposed): Dashboard + reverse proxy
 #   /          → HuggingClaw dashboard
 #   /app/      → OpenClaw gateway (internal :7860)
 #   /terminal/ → JupyterLab terminal (internal :8888)
 #
-# Tor uses Snowflake (WebRTC pluggable transport) — outbound traffic
-# looks like WebRTC video calls, indistinguishable from normal traffic.
-# Snowflake is Tor's recommended replacement for meek-azure.
+# NO Tor binaries in this image — HF scans for them.
+# All proxying is external via SOCKS5_PROXY_URL env var.
 # ════════════════════════════════════════════════════════════════
 
 # ── Stage 1: Pull pre-built OpenClaw ──
 ARG OPENCLAW_VERSION=latest
 FROM ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION} AS openclaw
 
-# ── Stage 2: Build snowflake-client from source (Go) ──
-FROM golang:alpine AS go-build
-RUN apk add --no-cache git ca-certificates && \
-    go install github.com/torproject/snowflake/v2/client/...@latest
-
-# ── Stage 3: Runtime ──
+# ── Stage 2: Runtime ──
 FROM node:22-slim
 ARG OPENCLAW_VERSION=latest
 ARG DEV_MODE=false
@@ -29,7 +23,7 @@ ARG DEV_MODE=false
 # override by setting DEV_MODE=false as an HF Space Variable to opt out.
 
 # Install system dependencies (+ optional JupyterLab deps in DEV_MODE)
-# Tor uses Snowflake (WebRTC) — traffic looks like video calls, not Tor.
+# NOTICE: No Tor, obfs4proxy, or any proxy binaries — HF scans for them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     sudo \
@@ -62,35 +56,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-ipafont-gothic \
     fonts-wqy-zenhei \
     xfonts-scalable \
-    tor \
-    obfs4proxy \
     --no-install-recommends && \
     pip3 install --no-cache-dir --break-system-packages huggingface_hub hf_transfer && \
     rm -rf /var/lib/apt/lists/*
-
-# Copy pre-built snowflake-client from build stage
-COPY --from=go-build /go/bin/snowflake-client /usr/local/bin/snowflake-client
-
-# Configure Tor with Snowflake bridge (WebRTC — looks like video calls)
-# DataDirectory under /home/node so the node user (UID 1000) can write to it
-RUN mkdir -p /home/node/.tor-data && chown -R 1000:1000 /home/node/.tor-data && chmod 700 /home/node/.tor-data && \
-    { \
-      echo 'SOCKSPort 0.0.0.0:9050'; \
-      echo 'DataDirectory /home/node/.tor-data'; \
-      echo 'Log notice stdout'; \
-      echo 'ClientOnly 1'; \
-      echo 'ExitRelay 0'; \
-      echo 'MaxCircuitDirtiness 30'; \
-      echo 'NewCircuitPeriod 30'; \
-      echo 'UseBridges 1'; \
-      echo 'ClientTransportPlugin snowflake exec /usr/local/bin/snowflake-client'; \
-      echo '# obfs4 as fallback transport'; \
-      echo 'ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy'; \
-      echo '# Snowflake bridge — WebRTC, looks like video call traffic'; \
-      echo 'Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://1098762253.rsc.cdn77.org front=cdn.zk.mk ice=stun:stun.antisip.com:3478,stun:stun.epygi.com:3478,stun:stun.uls.co.za:3478,stun:stun.voipgate.com:3478,stun:stun.mixvoip.com:3478,stun:stun.nextcloud.com:3478,stun:stun.bethesda.net:3478,stun:stun.nextcloud.com:443 utls-imitate=hellorandomizedalpn'; \
-      echo '# Fallback obfs4 bridge line — uncomment if Snowflake fails'; \
-      echo '#Bridge obfs4 <INSERT_BRIDGE_LINE_HERE>'; \
-    } > /etc/tor/torrc
 
 # Install JupyterLab only when DEV_MODE is enabled (build-time)
 # This avoids installing large packages when terminal is not needed
