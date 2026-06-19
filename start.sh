@@ -1725,7 +1725,7 @@ start_tor_once() {
     echo "Tor: no torrc found — skipping"
     return 0
   fi
-  echo "Tor: starting with meek-azure stealth bridge..."
+  echo "Tor: starting with Snowflake stealth bridge (WebRTC)..."
   tor -f /etc/tor/torrc &
   TOR_PID=$!
   # Wait up to 30s for SOCKS5 to be ready

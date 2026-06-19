@@ -1,23 +1,24 @@
 # ════════════════════════════════════════════════════════════════
-# 🦞 HuggingClaw + 💻 JupyterLab Terminal + 🧅 Stealth Tor
+# 🦞 HuggingClaw + 💻 JupyterLab Terminal + ❄️ Stealth Tor
 # ════════════════════════════════════════════════════════════════
 # Port 7861 (exposed): Dashboard + reverse proxy
 #   /          → HuggingClaw dashboard
 #   /app/      → OpenClaw gateway (internal :7860)
 #   /terminal/ → JupyterLab terminal (internal :8888)
 #
-# Tor uses meek-azure (domain fronting) — outbound traffic appears
-# as normal Azure CDN requests, avoiding HF Space Tor bans.
+# Tor uses Snowflake (WebRTC pluggable transport) — outbound traffic
+# looks like WebRTC video calls, indistinguishable from normal traffic.
+# Snowflake is Tor's recommended replacement for meek-azure.
 # ════════════════════════════════════════════════════════════════
 
 # ── Stage 1: Pull pre-built OpenClaw ──
 ARG OPENCLAW_VERSION=latest
 FROM ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION} AS openclaw
 
-# ── Stage 2: Build meek-client from source (Go) ──
-FROM golang:alpine AS meek-build
+# ── Stage 2: Build snowflake-client from source (Go) ──
+FROM golang:alpine AS go-build
 RUN apk add --no-cache git ca-certificates && \
-    go install github.com/arlolra/meek/meek-client@latest
+    go install github.com/torproject/snowflake/v2/client/...@latest
 
 # ── Stage 3: Runtime ──
 FROM node:22-slim
@@ -28,7 +29,7 @@ ARG DEV_MODE=false
 # override by setting DEV_MODE=false as an HF Space Variable to opt out.
 
 # Install system dependencies (+ optional JupyterLab deps in DEV_MODE)
-# Tor uses meek-azure (domain fronting) — traffic appears as Azure CDN, not Tor.
+# Tor uses Snowflake (WebRTC) — traffic looks like video calls, not Tor.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     sudo \
@@ -67,12 +68,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pip3 install --no-cache-dir --break-system-packages huggingface_hub hf_transfer && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy pre-built meek-client from build stage (domain fronting binary)
-COPY --from=meek-build /go/bin/meek-client /usr/local/bin/meek-client
+# Copy pre-built snowflake-client from build stage
+COPY --from=go-build /go/bin/snowflake-client /usr/local/bin/snowflake-client
 
-# Configure Tor with meek-azure stealth bridge
-# Domain-fronts through ajax.aspcdn.com (Azure CDN) — looks like normal CDN traffic
-# DataDirectory under /home/node so the node user (UID 1000) can write to it at runtime
+# Configure Tor with Snowflake bridge (WebRTC — looks like video calls)
+# DataDirectory under /home/node so the node user (UID 1000) can write to it
 RUN mkdir -p /home/node/.tor-data && chown -R 1000:1000 /home/node/.tor-data && chmod 700 /home/node/.tor-data && \
     { \
       echo 'SOCKSPort 0.0.0.0:9050'; \
@@ -83,9 +83,13 @@ RUN mkdir -p /home/node/.tor-data && chown -R 1000:1000 /home/node/.tor-data && 
       echo 'MaxCircuitDirtiness 30'; \
       echo 'NewCircuitPeriod 30'; \
       echo 'UseBridges 1'; \
-      echo 'ClientTransportPlugin meek exec /usr/local/bin/meek-client'; \
+      echo 'ClientTransportPlugin snowflake exec /usr/local/bin/snowflake-client'; \
+      echo '# obfs4 as fallback transport'; \
       echo 'ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy'; \
-      echo 'Bridge meek 0.0.2.0:1 url=https://meek.azureedge.net/ front=ajax.aspcdn.com'; \
+      echo '# Snowflake bridge — WebRTC, looks like video call traffic'; \
+      echo 'Bridge snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://1098762253.rsc.cdn77.org front=cdn.zk.mk ice=stun:stun.antisip.com:3478,stun:stun.epygi.com:3478,stun:stun.uls.co.za:3478,stun:stun.voipgate.com:3478,stun:stun.mixvoip.com:3478,stun:stun.nextcloud.com:3478,stun:stun.bethesda.net:3478,stun:stun.nextcloud.com:443 utls-imitate=hellorandomizedalpn'; \
+      echo '# Fallback obfs4 bridge line — uncomment if Snowflake fails'; \
+      echo '#Bridge obfs4 <INSERT_BRIDGE_LINE_HERE>'; \
     } > /etc/tor/torrc
 
 # Install JupyterLab only when DEV_MODE is enabled (build-time)
