@@ -855,6 +855,12 @@ if [ -n "${ALLOWED_ORIGINS:-}" ]; then
 fi
 echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
 
+# ── Ensure gateway auth token matches GATEWAY_TOKEN env var ──
+# Restored config may have old token; always apply the current env var
+CURRENT_CONFIG=$(cat "$EXISTING_CONFIG")
+CURRENT_CONFIG=$(echo "$CURRENT_CONFIG" | jq --arg token "$GATEWAY_TOKEN" '.gateway.auth.token = $token')
+echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
+
 # ── Enable Gateway Preload Fixes ──
 # This preload script keeps iframe embedding working on HF Spaces.
 export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs"
