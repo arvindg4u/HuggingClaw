@@ -133,7 +133,7 @@ const server = http.createServer((req, res) => {
 // WebSocket upgrade
 server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url, "http://localhost");
-  if (url.pathname.startsWith("/whatsapp") || url.pathname.startsWith("/ws")) {
+  if (url.pathname === "/" || url.pathname.startsWith("/whatsapp") || url.pathname.startsWith("/ws")) {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
   } else {
     socket.destroy();
