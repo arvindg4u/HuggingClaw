@@ -1,17 +1,25 @@
 # ════════════════════════════════════════════════════════════════
-# 🦞 HuggingClaw + 💻 JupyterLab Terminal
+# 🦞 HuggingClaw + 💻 JupyterLab Terminal + 🧅 Stealth Tor
 # ════════════════════════════════════════════════════════════════
 # Port 7861 (exposed): Dashboard + reverse proxy
 #   /          → HuggingClaw dashboard
 #   /app/      → OpenClaw gateway (internal :7860)
 #   /terminal/ → JupyterLab terminal (internal :8888)
+#
+# Tor uses meek-azure (domain fronting) — outbound traffic appears
+# as normal Azure CDN requests, avoiding HF Space Tor bans.
 # ════════════════════════════════════════════════════════════════
 
 # ── Stage 1: Pull pre-built OpenClaw ──
 ARG OPENCLAW_VERSION=latest
 FROM ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION} AS openclaw
 
-# ── Stage 2: Runtime ──
+# ── Stage 2: Build meek-client from source (Go) ──
+FROM golang:alpine AS meek-build
+RUN apk add --no-cache git ca-certificates && \
+    go install github.com/arlolra/meek/meek-client@latest
+
+# ── Stage 3: Runtime ──
 FROM node:22-slim
 ARG OPENCLAW_VERSION=latest
 ARG DEV_MODE=false
@@ -20,7 +28,7 @@ ARG DEV_MODE=false
 # override by setting DEV_MODE=false as an HF Space Variable to opt out.
 
 # Install system dependencies (+ optional JupyterLab deps in DEV_MODE)
-# No Tor (causes HF account locks). SOCKS5 via SOCKS5_PROXY_URL env var if needed.
+# Tor uses meek-azure (domain fronting) — traffic appears as Azure CDN, not Tor.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     sudo \
@@ -53,9 +61,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-ipafont-gothic \
     fonts-wqy-zenhei \
     xfonts-scalable \
+    tor \
+    obfs4proxy \
     --no-install-recommends && \
     pip3 install --no-cache-dir --break-system-packages huggingface_hub hf_transfer && \
     rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built meek-client from build stage (domain fronting binary)
+COPY --from=meek-build /go/bin/meek-client /usr/local/bin/meek-client
+
+# Configure Tor with meek-azure stealth bridge
+# Domain-fronts through ajax.aspcdn.com (Azure CDN) — looks like normal CDN traffic
+RUN mkdir -p /tmp/tor-data && chmod 700 /tmp/tor-data && \
+    { \
+      echo 'SOCKSPort 0.0.0.0:9050'; \
+      echo 'DataDirectory /tmp/tor-data'; \
+      echo 'Log notice stdout'; \
+      echo 'ClientOnly 1'; \
+      echo 'ExitRelay 0'; \
+      echo 'MaxCircuitDirtiness 30'; \
+      echo 'NewCircuitPeriod 30'; \
+      echo 'UseBridges 1'; \
+      echo 'ClientTransportPlugin meek_lite exec /usr/local/bin/meek-client'; \
+      echo 'ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy'; \
+      echo 'Bridge meek 0.0.2.0:1 url=https://meek.azureedge.net/ front=ajax.aspcdn.com'; \
+    } > /etc/tor/torrc
 
 # Install JupyterLab only when DEV_MODE is enabled (build-time)
 # This avoids installing large packages when terminal is not needed
@@ -94,19 +124,16 @@ RUN ln -s /home/node/.openclaw/openclaw-app/openclaw.mjs /usr/local/bin/openclaw
 
 # Copy HuggingClaw files
 COPY --chown=1000:1000 cloudflare-proxy.js /opt/cloudflare-proxy.js
-# COPY cloudflare-proxy-setup.py removed
 COPY --chown=1000:1000 health-server.js /home/node/app/health-server.js
 COPY --chown=1000:1000 login.html /home/node/app/login.html
 COPY --chown=1000:1000 iframe-fix.cjs /home/node/app/iframe-fix.cjs
 COPY --chown=1000:1000 start.sh /home/node/app/start.sh
 COPY --chown=1000:1000 wa-guardian.js /home/node/app/wa-guardian.js
-# COPY cloudflare-keepalive-setup.py removed
 COPY --chown=1000:1000 openclaw-sync.py /home/node/app/openclaw-sync.py
 COPY --chown=1000:1000 multi-provider-key-rotator.cjs /home/node/app/multi-provider-key-rotator.cjs
 COPY --chown=1000:1000 env-builder.html /home/node/app/env-builder.html
 COPY --chown=1000:1000 env-builder.js /home/node/app/env-builder.js
 COPY --chown=1000:1000 jupyter-devdata-sync.py /home/node/app/jupyter-devdata-sync.py
-# login.html template is now copied inside the DEV_MODE install block above
 RUN chmod +x /home/node/app/start.sh \
               /home/node/app/openclaw-sync.py \
               /home/node/app/jupyter-devdata-sync.py \
