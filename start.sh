@@ -325,11 +325,13 @@ else
   echo "HF_TOKEN not set — running without dataset persistence."
 fi
 
-# ── No proxy needed for opencode.ai/zen (direct connection for default) ──
+# ── No proxy needed for opencode.ai/zen (direct connection) ──
 # IMPORTANT: opencode.ai is NOT blocked by HF Spaces egress firewall.
 # Connecting directly is fast, reliable, and ToS-compliant.
-# HF scans Docker images for Tor binaries — NO Tor in this image.
-# Use an external SOCKS5 proxy by setting SOCKS5_PROXY_URL env var.
+#
+# For IP rotation, set SOCKS5_PROXY_URL to an external SOCKS5 proxy.
+#
+# Set SOCKS5_PROXY_URL=socks5://127.0.0.1:9050 to enable Tor routing.
 # ── Build config ──
 CONFIG_JSON=$(cat <<'CONFIGEOF'
 {
@@ -1708,6 +1710,7 @@ start_guardian_once() {
   GUARDIAN_PID=$!
   echo "WhatsApp Guardian started (PID: $GUARDIAN_PID)"
 }
+
 
 
 # ── Start D-Bus session (once, before gateway loop) ──

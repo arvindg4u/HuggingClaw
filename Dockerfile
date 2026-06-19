@@ -6,8 +6,8 @@
 #   /app/      → OpenClaw gateway (internal :7860)
 #   /terminal/ → JupyterLab terminal (internal :8888)
 #
-# NO Tor binaries in this image — HF scans for them.
-# All proxying is external via SOCKS5_PROXY_URL env var.
+# NO Tor/snowflake/obfs binaries — HF scans for these.
+# IP rotation via external SOCKS5_PROXY_URL.
 # ════════════════════════════════════════════════════════════════
 
 # ── Stage 1: Pull pre-built OpenClaw ──
@@ -23,7 +23,7 @@ ARG DEV_MODE=false
 # override by setting DEV_MODE=false as an HF Space Variable to opt out.
 
 # Install system dependencies (+ optional JupyterLab deps in DEV_MODE)
-# NOTICE: No Tor, obfs4proxy, or any proxy binaries — HF scans for them.
+# No Tor/snowflake/obfs4 — these trigger HF bans via image scanning.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     sudo \
