@@ -94,11 +94,11 @@ wss.on("connection", (ws, req) => {
   const connectTarget = () => {
     if (useTls) {
       targetSocket = tls.connect(targetPort, targetHost, { rejectUnauthorized: false }, () => {
-        try { ws.send(JSON.stringify({ type: "connected" })); } catch {}
+        try { ws.send(JSON.stringify({ status: "connected" })); } catch {}
       });
     } else {
       targetSocket = net.createConnection(targetPort, targetHost, () => {
-        try { ws.send(JSON.stringify({ type: "connected" })); } catch {}
+        try { ws.send(JSON.stringify({ status: "connected" })); } catch {}
       });
     }
 

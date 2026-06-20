@@ -433,16 +433,14 @@ net.connect = function(...args) {
 
   if (opts._hc || !needsProxy(hn)) return origNetConnect.call(this, ...args);
 
-  // Create a proxy socket
+  // Use proxyConnect which handles wss:// (WebSocket), socks5://, and direct fallback
   const socks = new net.Socket();
   socks._hc_proxied = true;
 
-  socks5Connect(opts.host || "localhost", opts.port || 80)
+  proxyConnect(opts.host || "localhost", opts.port || 80)
     .then(s => {
-      // Replace the socket's underlying connection by re-emitting
       socks.emit("connect");
       socks._hc_socket = s;
-      // Forward data
       s.on("data", (d) => { socks.emit("data", d); });
       s.on("end", () => { socks.emit("end"); });
       s.on("close", () => { socks.emit("close"); });
@@ -483,8 +481,9 @@ tls.connect = function(...args) {
 
   if (opts._hc || !needsProxy(hn)) return origTlsConnect.call(this, ...args);
 
-  // Create a SOCKS5 connection and wrap TLS over it
-  const tunnelPromise = socks5Connect(opts.host || "localhost", opts.port || 443);
+  // Use proxyConnect which handles socks5://, wss://, and direct fallback
+  // Works with tls.connect({socket: tunnel}) for all proxy types
+  const tunnelPromise = proxyConnect(opts.host || "localhost", opts.port || 443);
 
   // We return a socket immediately and upgrade it when tunnel is ready
   const pending = new net.Socket();
