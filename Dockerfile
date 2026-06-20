@@ -82,6 +82,7 @@ RUN ln -s /home/node/.openclaw/openclaw-app/openclaw.mjs /usr/local/bin/openclaw
     npm install -g openclaw@${OPENCLAW_VERSION}
 
 COPY --chown=1000:1000 cloudflare-proxy.js /opt/cloudflare-proxy.js
+COPY --chown=1000:1000 dns-resolve.py /home/node/app/dns-resolve.py
 COPY --chown=1000:1000 health-server.js /home/node/app/health-server.js
 COPY --chown=1000:1000 login.html /home/node/app/login.html
 COPY --chown=1000:1000 iframe-fix.cjs /home/node/app/iframe-fix.cjs
@@ -95,7 +96,8 @@ COPY --chown=1000:1000 jupyter-devdata-sync.py /home/node/app/jupyter-devdata-sy
 RUN chmod +x /home/node/app/start.sh \
               /home/node/app/openclaw-sync.py \
               /home/node/app/jupyter-devdata-sync.py \
-              /home/node/app/multi-provider-key-rotator.cjs
+              /home/node/app/multi-provider-key-rotator.cjs \
+              /home/node/app/dns-resolve.py
 
 USER node
 

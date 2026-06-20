@@ -18,6 +18,7 @@ const dns = require("dns");
 const { URL } = require("url");
 const { Duplex } = require("stream");
 const crypto = require("crypto");
+const fs = require("fs");
 
 const log = (...args) => console.error("[hc-proxy]", ...args);
 
@@ -59,8 +60,11 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
   const pUrl = (typeof process !== 'undefined' && process.env && process.env.SOCKS5_PROXY_URL) || '';
 
   // Try SOCKS5 first (if proxy URL is socks5://)
+  // Note: if proxy is behind Cloudflare (Render), SOCKS5 raw TCP may fail.
+  // Fall back to HTTP CONNECT (which Cloudflare proxies) then direct.
   if (pUrl.startsWith('socks5')) {
     return socks5Connect(targetHost, targetPort, timeout)
+      .catch(() => httpConnectProxy(targetHost, targetPort, timeout))
       .catch(() => directConnect(targetHost, targetPort, timeout));
   }
 
@@ -143,17 +147,35 @@ function socks5Connect(targetHost, targetPort, timeout = 30000) {
   });
 }
 
-// ── DNS Override (for domains where direct IPs are not firewalled) ──
-const DNS_OVERRIDE = {
-  "web.whatsapp.com": ["157.240.3.52", "157.240.7.52"],
-  "wss.web.whatsapp.com": ["157.240.3.52", "157.240.7.52"],
+// ── DNS Override (dynamic — loaded from DoH resolver) ──
+let DNS_OVERRIDE = {};
+try {
+  const dnsFile = fs.readFileSync("/tmp/dns-resolved.json", "utf8");
+  const resolved = JSON.parse(dnsFile);
+  for (const [domain, ip] of Object.entries(resolved)) {
+    DNS_OVERRIDE[domain] = [ip];
+  }
+  if (Object.keys(DNS_OVERRIDE).length > 0)
+    log(`DNS override loaded ${Object.keys(DNS_OVERRIDE).length} entries from DoH`);
+} catch { /* no pre-resolved file yet — will use fallback */ }
+
+// Fallback if file not ready: use stale hardcoded IPs that worked before
+const FALLBACK_DNS = {
+  "web.whatsapp.com": ["157.240.221.52", "157.240.223.52"],
+  "wss.web.whatsapp.com": ["157.240.221.52", "157.240.223.52"],
 };
+
+function getDNSOverride(hostname) {
+  const d = (hostname || "").toLowerCase();
+  if (DNS_OVERRIDE[d] && DNS_OVERRIDE[d].length > 0) return DNS_OVERRIDE[d];
+  if (FALLBACK_DNS[d]) return FALLBACK_DNS[d];
+  return null;
+}
 
 const origLookup = dns.lookup;
 dns.lookup = function(h, o, cb) {
   if (typeof o === "function") { cb = o; o = {}; }
-  const d = (h || "").toString().toLowerCase();
-  const ips = DNS_OVERRIDE[d];
+  const ips = getDNSOverride(h);
   if (ips && ips.length > 0) {
     if (typeof cb === "function") cb(null, ips[0], ips[0].includes(":") ? 6 : 4);
     return { onerror: () => {} };
@@ -164,8 +186,7 @@ dns.lookup = function(h, o, cb) {
 const origResolve4 = dns.resolve4;
 dns.resolve4 = function(h, o, cb) {
   if (typeof o === "function") { cb = o; o = {}; }
-  const d = (h || "").toString().toLowerCase();
-  const ips = DNS_OVERRIDE[d];
+  const ips = getDNSOverride(h);
   if (ips && ips.length > 0) { if (typeof cb === "function") cb(null, ips); return; }
   return typeof o === "function" ? origResolve4(h, o) : origResolve4(h, o, cb);
 };

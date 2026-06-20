@@ -1774,6 +1774,12 @@ while true; do
     fi
   fi
 
+  # ── Resolve WhatsApp/Telegram domains via DNS-over-HTTPS ──
+  # HF Spaces blocks DNS for these domains; DoH bypasses the block.
+  if [ -f /home/node/app/dns-resolve.py ]; then
+    python3 /home/node/app/dns-resolve.py 2>&1 || true
+  fi
+
   echo "Launching OpenClaw gateway on port ${GATEWAY_PORT}..."
 
   GATEWAY_ARGS=(gateway run --port "${GATEWAY_PORT}" --bind lan)
