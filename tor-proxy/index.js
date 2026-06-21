@@ -250,7 +250,9 @@ function startWsRelay(clientSocket, initialData) {
 
         if (opcode === 0x1 || opcode === 0x2) { // text/binary
           try {
-            const cfg = JSON.parse(payload.toString());
+            const rawText = payload.toString();
+            console.log("[ws] received config frame: " + rawText.substring(0, 80));
+            const cfg = JSON.parse(rawText);
             const th = cfg.host || "opencode.ai";
             const tp = cfg.port || 443;
 
@@ -424,32 +426,55 @@ async function main() {
     process.exit(1);
   });
 
-  // 2. Wait for Tor SOCKS5 to be ready (up to 30s)
-  console.log("[tor-proxy] Waiting for Tor SOCKS5 to bootstrap...");
+  // 2. Wait for Tor to be CIRCUIT-ready (up to 60s — Tor needs to download
+  //    descriptors and build circuits before it can route traffic)
+  console.log("[tor-proxy] Waiting for Tor to bootstrap circuits...");
   let ready = false;
-  for (let attempt = 0; attempt < 30; attempt++) {
+  for (let attempt = 0; attempt < 60; attempt++) {
     try {
+      // Do a REAL connect through Tor, not just port check.
+      // The SOCKS5 port opens immediately but Tor can't route for ~20s.
       await new Promise((resolve, reject) => {
         const s = net.createConnection({ host: TOR_HOST, port: TOR_PORT }, () => {
+          // SOCKS5 handshake
           s.write(Buffer.from([0x05, 0x01, 0x00]));
-          s.once("data", (resp) => {
-            if (resp.length >= 2 && resp[0] === 0x05 && resp[1] === 0x00) {
-              s.end();
-              resolve();
-            } else {
-              s.end();
-              reject(new Error("bad resp"));
-            }
-          });
         });
-        s.on("error", reject);
-        s.setTimeout(3000, () => { s.destroy(); reject(new Error("timeout")); });
+        let state = 0;
+        let buf = Buffer.alloc(0);
+        const timer = setTimeout(() => { s.destroy(); reject(new Error("timeout")); }, 4000);
+
+        const onData = (data) => {
+          buf = Buffer.concat([buf, data]);
+          try {
+            if (state === 0 && buf.length >= 2) {
+              if (buf[0] !== 0x05 || buf[1] !== 0x00) { s.destroy(); clearTimeout(timer); reject(new Error("auth fail")); return; }
+              state = 1;
+              // Try connecting to a fast-responding test target through Tor
+              const hb = Buffer.from("httpbin.org");
+              s.write(Buffer.concat([
+                Buffer.from([0x05, 0x01, 0x00, 0x03, hb.length]), hb,
+                Buffer.from([0x01, 0xBB]) // port 443
+              ]));
+              buf = Buffer.alloc(0);
+            } else if (state === 1 && buf.length >= 4) {
+              clearTimeout(timer);
+              if (buf[1] === 0x00) {
+                // SUCCESS — Tor can route
+                s.end(); resolve();
+              } else {
+                s.destroy(); reject(new Error("Tor reject: " + buf[1]));
+              }
+            }
+          } catch (e) { clearTimeout(timer); reject(e); }
+        };
+        s.on("data", onData);
+        s.on("error", (e) => { clearTimeout(timer); reject(e); });
       });
       ready = true;
-      console.log(`[tor-proxy] Tor ready after ${attempt + 1}s`);
+      console.log(`[tor-proxy] Tor circuit-ready after ${attempt + 1}s`);
       break;
     } catch (e) {
-      if (attempt < 29) await new Promise((r) => setTimeout(r, 1000));
+      if (attempt < 59) await new Promise((r) => setTimeout(r, 1000));
     }
   }
 
