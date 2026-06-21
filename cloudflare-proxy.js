@@ -605,12 +605,20 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
     let wsTunnelReady = false;
     let localSocketConnected = false;
     let pendingWsData = [];
+    // Buffer for data arriving from local TCP bridge before WS is open and tunnel is ready.
+    // The TLS ClientHello can arrive before the WebSocket connects to Render (~1.2s delay).
+    // Silently dropping it causes a deadlock: both sides wait for data from the other.
+    let pendingLocalData = null;
+    let drainPendingLocal = null;
+    let sendOrBuffer = null;
 
     let ws;
     try { ws = new WebSocket(proxyUrl); } catch(e) { clearTimeout(timer); reject(e); return; }
 
     ws.on('open', () => {
       ws.send(JSON.stringify({ host: targetHost, port: targetPort }), { binary: false });
+      // Drain any local data that was buffered before WS connected
+      if (drainPendingLocal) drainPendingLocal();
     });
 
     // Buffer incoming WS messages until localSocket is ready.
@@ -623,6 +631,8 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
           if (parsed.status === 'connected') {
             wsTunnelReady = true;
             clearTimeout(timer);
+            // Drain any local data that was buffered before tunnel was ready
+            if (drainPendingLocal) drainPendingLocal();
             return;
           }
           if (parsed.error) {
@@ -647,11 +657,29 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
     // a Duplex stream, avoiding Node.js TLS bugs with post-handshake data.
     const localServer = net.createServer((localSocket) => {
       localSocketConnected = true;
+      pendingLocalData = [];
 
-      // Bridge: localSocket -> WebSocket
-      localSocket.on('data', (chunk) => {
-        try { if (ws.readyState === ws.OPEN) ws.send(chunk, { binary: true, mask: true }); } catch(e) {}
-      });
+      // Buffer data from local TCP bridge until WS is open AND tunnel is ready
+      sendOrBuffer = (chunk) => {
+        if (ws.readyState === ws.OPEN && wsTunnelReady) {
+          try { ws.send(chunk, { binary: true, mask: true }); } catch(e) {}
+        } else {
+          pendingLocalData.push(chunk);
+        }
+      };
+      drainPendingLocal = () => {
+        if (pendingLocalData && pendingLocalData.length > 0) {
+          const chunk = Buffer.concat(pendingLocalData);
+          pendingLocalData = [];
+          if (ws.readyState === ws.OPEN) {
+            try { ws.send(chunk, { binary: true, mask: true }); } catch(e) {}
+          } else {
+            // WS still not open - keep buffering
+            pendingLocalData.push(chunk);
+          }
+        }
+      };
+      localSocket.on('data', sendOrBuffer);
       localSocket.on('end', () => { try { ws.close(); } catch(e) {} });
       localSocket.on('error', () => {});
       localSocket.on('close', () => { try { localServer.close(); } catch(e) {} });
@@ -669,6 +697,7 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
             if (parsed.status === 'connected') {
               wsTunnelReady = true;
               clearTimeout(timer);
+              if (drainPendingLocal) drainPendingLocal();
               return;
             }
             if (parsed.error) {
@@ -683,7 +712,7 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
         try { localSocket.write(buf); } catch(e) {}
       });
 
-      // Drain any buffered data
+      // Drain any buffered WS->local messages
       if (pendingWsData.length > 0) {
         pendingWsData.splice(0).forEach((d) => { try { localSocket.write(d); } catch(e) {} });
       }
