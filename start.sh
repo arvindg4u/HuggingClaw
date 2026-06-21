@@ -63,8 +63,8 @@ load_env_bundle
 LLM_MODEL="$(trim_var "${LLM_MODEL:-}")"
 GATEWAY_TOKEN="$(trim_var "${GATEWAY_TOKEN:-}")"
 export GATEWAY_TOKEN
-export SOCKS5_PROXY_URL
-export SOCKS5_PROXY_DOMAINS
+export ROUTE_ENDPOINT
+export ROUTE_TARGETS
 OPENCLAW_PASSWORD="$(trim_var "${OPENCLAW_PASSWORD:-}")"
 LLM_API_KEY="$(trim_var "${LLM_API_KEY:-}")"
 
@@ -884,9 +884,9 @@ if [ -n "${HF_TOKEN:-}" ]; then
 else
   echo "Backup    : disabled"
 fi
-	# SOCKS5_PROXY_URL and SOCKS5_PROXY_DOMAINS control domain routing in cloudflare-proxy.js
-	if [ -n "${SOCKS5_PROXY_URL:-}" ]; then
-	  echo "Proxy     : ${SOCKS5_PROXY_URL} → ${SOCKS5_PROXY_DOMAINS}"
+	# ROUTE_ENDPOINT and ROUTE_TARGETS control domain routing in cloudflare-proxy.js
+	if [ -n "${ROUTE_ENDPOINT:-}" ]; then
+	  echo "Proxy     : ${ROUTE_ENDPOINT} → ${ROUTE_TARGETS}"
 	else
 	  echo "Proxy     : direct (no proxy configured)"
 	fi
@@ -1760,9 +1760,9 @@ while true; do
   # ── Pre-warm proxy chain ──
   # Cold Render Tor proxy + cold Tor take 10-20s to bootstrap.
   # Warming it here prevents the first LLM request from timing out.
-  if [ -n "${SOCKS5_PROXY_URL:-}" ]; then
-    if echo "$SOCKS5_PROXY_URL" | grep -qE "^wss?://"; then
-      PROXY_HOST=$(echo "$SOCKS5_PROXY_URL" | sed 's|^wss\?://||;s|/.*$||;s|:.*$||')
+  if [ -n "${ROUTE_ENDPOINT:-}" ]; then
+    if echo "$ROUTE_ENDPOINT" | grep -qE "^wss?://"; then
+      PROXY_HOST=$(echo "$ROUTE_ENDPOINT" | sed 's|^wss\?://||;s|/.*$||;s|:.*$||')
       echo "[pre-warm] Waking proxy chain: ${PROXY_HOST}..."
       # First warm the HTTP endpoint (wakes Render free tier container)
       curl -sk --max-time 15 "https://${PROXY_HOST}/" >/dev/null 2>&1

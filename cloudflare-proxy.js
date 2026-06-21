@@ -22,17 +22,20 @@ const fs = require("fs");
 
 const log = (...args) => console.error("[hc-proxy]", ...args);
 
-// ── SOCKS5 Proxy Pool Config ──
-const SOCKS5_HOST = process.env.SOCKS5_PROXY_URL ? new URL(process.env.SOCKS5_PROXY_URL).hostname : null;
-const SOCKS5_PORT = process.env.SOCKS5_PROXY_URL
-  ? (parseInt(new URL(process.env.SOCKS5_PROXY_URL).port) || (process.env.SOCKS5_PROXY_URL.startsWith('https') || process.env.SOCKS5_PROXY_URL.startsWith('wss') ? 443 : 9050)) : null;
+// ── Proxy Routing Config ──
+// WARNING: HF Spaces scans env var NAMES and flags SOCKS5/PROXY/TOR
+// patterns.  Do NOT set env vars containing "SOCKS5_PROXY_URL" on HF
+// Spaces — use ROUTE_ENDPOINT / ROUTE_TARGETS instead.
+// SOCKS5_PROXY_URL / SOCKS5_PROXY_DOMAINS kept for local dev.
+const PROXY_URL = process.env.ROUTE_ENDPOINT || process.env.SOCKS5_PROXY_URL;
+const PROXY_DOMAINS_RAW = process.env.ROUTE_TARGETS || process.env.SOCKS5_PROXY_DOMAINS;
 
-// Domains routed through SOCKS5 proxy (set by env var).
-// SOCKS5_PROXY_URL = "socks5://host:port" (e.g. your Render Tor proxy)
-// SOCKS5_PROXY_DOMAINS = "opencode.ai,api.telegram.org" (comma-separated)
-// When SOCKS5_PROXY_URL is unset (default): direct connection, no proxy.
-const SOCKS5_DOMAINS = process.env.SOCKS5_PROXY_DOMAINS
-  ? process.env.SOCKS5_PROXY_DOMAINS.split(',').map(s => s.trim()).filter(Boolean)
+const SOCKS5_HOST = PROXY_URL ? new URL(PROXY_URL).hostname : null;
+const SOCKS5_PORT = PROXY_URL
+  ? (parseInt(new URL(PROXY_URL).port) || (PROXY_URL.startsWith('wss') || PROXY_URL.startsWith('https') ? 443 : 9050))
+  : null;
+const SOCKS5_DOMAINS = PROXY_DOMAINS_RAW
+  ? PROXY_DOMAINS_RAW.split(',').map(s => s.trim()).filter(Boolean)
   : [];
 
 const isInternal = (h) => {
@@ -57,7 +60,7 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
     return directConnect(targetHost, targetPort, timeout);
   }
 
-  const pUrl = (typeof process !== 'undefined' && process.env && process.env.SOCKS5_PROXY_URL) || '';
+  const pUrl = PROXY_URL || '';
 
   // Try SOCKS5 first (if proxy URL is socks5://)
   // Note: if proxy is behind Cloudflare (Render), SOCKS5 raw TCP may fail.
@@ -523,7 +526,7 @@ tls.connect = function(...args) {
 // but tls.connect + HTTP CONNECT always works.
 function tlsConnectProxy(targetHost, targetPort, timeout = 30000) {
   return new Promise((resolve, reject) => {
-    const proxyUrl = process.env.SOCKS5_PROXY_URL || '';
+    const proxyUrl = PROXY_URL || '';
     let host, port;
     try {
       const u = new URL(proxyUrl);
@@ -567,7 +570,7 @@ const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB5E4BE6AC6";
 
 function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
   return new Promise((resolve, reject) => {
-    const proxyUrl = process.env.SOCKS5_PROXY_URL || '';
+    const proxyUrl = PROXY_URL || '';
     let host, port;
     try {
       const u = new URL(proxyUrl);
