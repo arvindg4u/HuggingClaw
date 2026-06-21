@@ -187,11 +187,12 @@ function startWsRelay(socket, head) {
     processBuffer();
   };
 
-  socket.on("data", onFrameData);
+  socket.on("data", (d) => {
+    console.log("[ws] data event: " + d.length + " bytes, opcode=" + (d[0] & 0x0F) + ", masked=" + ((d[1] & 0x80) !== 0));
+    onFrameData(d);
+  });
   socket.on("error", cleanup);
-  socket.on("close", cleanup);
-
-  // Process any initial data (e.g., WS frame in same TCP segment)
+  socket.on("close", () => { console.log("[ws] client socket closed"); cleanup(); });
   processBuffer();
 }
 
