@@ -754,6 +754,7 @@ function httpConnectProxy(targetHost, targetPort, timeout = 30000) {
 applyFetchPatch();
 
 log(`SOCKS5 routing: ${SOCKS5_DOMAINS.join(", ")} → ${SOCKS5_HOST}:${SOCKS5_PORT}`);
+log(`wsConnectProxy: using local TCP bridge (control msg filtered, pendingLocalData buffered)`);
 log(`Cloudflare Worker proxy available for Telegram: ${CF_PROXY_URL || 'not configured'}`);
 log(`DNS override: ${Object.keys(DNS_OVERRIDE).join(", ")}`);
 
