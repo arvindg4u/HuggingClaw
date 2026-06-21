@@ -258,8 +258,10 @@ function startWsRelay(clientSocket, initialData) {
             const th = cfg.host || "opencode.ai";
             const tp = cfg.port || 443;
 
+            console.log("[ws] connecting via Tor to " + th + ":" + tp);
             socks5ViaTor(th, tp)
               .then((ts) => {
+                console.log("[ws] Tor connected to " + th);
                 torSocket = ts;
                 expectingConfig = false;
 
@@ -272,7 +274,8 @@ function startWsRelay(clientSocket, initialData) {
                 ts.on("error", cleanup);
                 ts.on("close", cleanup);
               })
-              .catch(() => {
+              .catch((err) => {
+                console.log("[ws] Tor connect failed: " + (err.message || err));
                 const errMsg = Buffer.from(JSON.stringify({ error: "Tor connection failed" }));
                 sendWsFrame(errMsg);
                 cleanup();
@@ -351,7 +354,8 @@ function startWsRelay(clientSocket, initialData) {
 
 // ── Raw TCP server (no http.createServer — must intercept all protocols) ──
 // Using net.createServer gives full control over every byte before any internal
-// parser (C++ HTTP parser in http.Server) can consume it.
+// parser (C++ HTTP parser in http.Server) can consume it.  With net.Server,
+// the socket is already flowing — no pause/resume needed.
 function handleHttpRequest(socket, data) {
   const raw = data.toString();
   const reqLine = raw.split("\r\n")[0];
