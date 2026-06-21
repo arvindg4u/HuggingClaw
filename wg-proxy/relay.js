@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const http = require("http");
 const net = require("net");
+const dns = require("dns");
 const { spawn } = require("child_process");
 const { WebSocketServer } = require("ws");
 
@@ -9,79 +10,49 @@ const SOCKS_HOST = "127.0.0.1";
 const SOCKS_PORT = 1080;
 
 // ── WireGuard rotation config ──
-// WG_CONFIGS (JSON array) takes precedence over WG_ENDPOINTS/WG_ENDPOINT
-// Each config: {"privateKey":"...","peerPublicKey":"...","endpoint":"ip:port"}
-// Example WG_CONFIGS:
-// [{"privateKey":"key1","peerPublicKey":"peer1","endpoint":"ip1:51820"},
-//  {"privateKey":"key2","peerPublicKey":"peer2","endpoint":"ip2:51820"}]
+const WG_PRIVATE_KEY = process.env.WG_PRIVATE_KEY || "wHTOhHm7orE8evqF39HezxB8Vc+fwuVsEtDN2rl2HnA=";
+const WG_PEER_PUBLIC_KEY = process.env.WG_PEER_PUBLIC_KEY || "Y4jxn/IIoorfo/X99RZFU6HbL9WWn7ffGI5isYFU9lo=";
 const ROTATION_INTERVAL_MS = parseInt(process.env.WG_ROTATION_INTERVAL || "1800000"); // default 30 min
 
-// Parse WG_CONFIGS or fall back to single key + endpoints
-let WG_CONFIGS = [];
-const userConfigs = process.env.WG_CONFIGS;
-if (userConfigs) {
-  try {
-    WG_CONFIGS = JSON.parse(userConfigs);
-    if (!Array.isArray(WG_CONFIGS) || WG_CONFIGS.length === 0) {
-      console.error("[wg-proxy] WG_CONFIGS is not a non-empty array, falling back to env vars");
-      WG_CONFIGS = [];
-    }
-  } catch (e) {
-    console.error("[wg-proxy] Failed to parse WG_CONFIGS JSON:", e.message);
-    WG_CONFIGS = [];
-  }
-}
-
-// Fallback: build configs from WG_ENDPOINTS/WG_ENDPOINT + single key pair
-if (WG_CONFIGS.length === 0) {
-  const privateKey = process.env.WG_PRIVATE_KEY || "wHTOhHm7orE8evqF39HezxB8Vc+fwuVsEtDN2rl2HnA=";
-  const peerPublicKey = process.env.WG_PEER_PUBLIC_KEY || "Y4jxn/IIoorfo/X99RZFU6HbL9WWn7ffGI5isYFU9lo=";
-  const endpointsRaw = process.env.WG_ENDPOINTS || process.env.WG_ENDPOINT || "146.70.202.34:51820";
-  const endpoints = endpointsRaw.split(/[,;]/).map(s => s.trim()).filter(Boolean);
-  WG_CONFIGS = endpoints.map(ep => ({ privateKey, peerPublicKey, endpoint: ep }));
-}
+// Parse endpoints: WG_ENDPOINTS takes precedence over WG_ENDPOINT
+// Format: comma-separated "ip:port" or semicolon-separated (for IPv6)
+let WG_ENDPOINTS = [];
+const endpointsRaw = process.env.WG_ENDPOINTS || process.env.WG_ENDPOINT || "146.70.202.34:51820";
+// Support both comma and semicolon separation for IPv6 compatibility
+WG_ENDPOINTS = endpointsRaw.split(/[,;]/).map(s => s.trim()).filter(Boolean);
 
 let currentWireProxy = null;
-let currentConfigIdx = 0;
+let currentEndpointIdx = 0;
 let rotationTimer = null;
 
-function pickConfig() {
-  if (WG_CONFIGS.length <= 1) return WG_CONFIGS[0];
-  currentConfigIdx = (currentConfigIdx + 1) % WG_CONFIGS.length;
-  return WG_CONFIGS[currentConfigIdx];
+function pickEndpoint() {
+  if (WG_ENDPOINTS.length <= 1) return WG_ENDPOINTS[0] || "146.70.202.34:51820";
+  // Pick next endpoint in rotation
+  currentEndpointIdx = (currentEndpointIdx + 1) % WG_ENDPOINTS.length;
+  return WG_ENDPOINTS[currentEndpointIdx];
 }
 
-function getCurrentEndpoint() {
-  if (WG_CONFIGS.length === 0) return "none";
-  const idx = currentConfigIdx % WG_CONFIGS.length;
-  return WG_CONFIGS[idx].endpoint;
-}
-
-function writeWireProxyConfig(cfg) {
+function startWireProxy(endpoint) {
   const fs = require("fs");
   const config = `[Interface]
-PrivateKey = ${cfg.privateKey}
+PrivateKey = ${WG_PRIVATE_KEY}
 Address = 10.2.0.2/32
 DNS = 10.2.0.1
 
 [Peer]
-PublicKey = ${cfg.peerPublicKey}
+PublicKey = ${WG_PEER_PUBLIC_KEY}
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = ${cfg.endpoint}
+Endpoint = ${endpoint}
 PersistentKeepalive = 25
 
 [Socks5]
 BindAddress = 0.0.0.0:1080
 `;
   fs.writeFileSync("/etc/wireproxy.conf", config);
-}
-
-function startWireProxy(cfg) {
-  writeWireProxyConfig(cfg);
-  console.log(`[wg-proxy] Starting WireGuard → ${cfg.endpoint}`);
+  console.log(`[wg-proxy] Starting WireGuard → ${endpoint}`);
   const wp = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
   wp.on("exit", (code) => {
-    console.log(`[wg-proxy] wireproxy exited (code ${code}) for ${cfg.endpoint}`);
+    console.log(`[wg-proxy] wireproxy exited (code ${code}) for endpoint ${endpoint}`);
   });
   return wp;
 }
@@ -109,40 +80,44 @@ async function waitForSocks5(timeoutMs = 30000) {
   return false;
 }
 
-async function rotateConfig() {
-  if (WG_CONFIGS.length <= 1) return;
+async function rotateEndpoint() {
+  if (WG_ENDPOINTS.length <= 1) return; // no rotation needed
   
-  const newCfg = pickConfig();
-  console.log(`[wg-proxy] Rotating → ${newCfg.endpoint}`);
+  const newEndpoint = pickEndpoint();
+  console.log(`[wg-proxy] Rotating endpoint → ${newEndpoint}`);
   
+  // Kill old wireproxy
   if (currentWireProxy) {
     currentWireProxy.kill("SIGTERM");
+    // Give it a moment to release the SOCKS5 port
     await new Promise((r) => setTimeout(r, 2000));
     if (currentWireProxy && !currentWireProxy.killed) {
       currentWireProxy.kill("SIGKILL");
     }
   }
   
-  currentWireProxy = startWireProxy(newCfg);
+  // Start new wireproxy with new endpoint
+  currentWireProxy = startWireProxy(newEndpoint);
+  
+  // Wait for SOCKS5 to be ready
   const ready = await waitForSocks5(30000);
   if (ready) {
-    console.log(`[wg-proxy] Rotation complete → ${newCfg.endpoint} (SOCKS5 ready)`);
+    console.log(`[wg-proxy] Rotation complete → ${newEndpoint} (SOCKS5 ready)`);
   } else {
-    console.error(`[wg-proxy] Rotation failed — SOCKS5 not ready for ${newCfg.endpoint}`);
+    console.error(`[wg-proxy] Rotation failed — SOCKS5 not ready for ${newEndpoint}`);
   }
 }
 
 async function startRotationLoop() {
-  if (WG_CONFIGS.length <= 1) {
-    console.log(`[wg-proxy] Single config (no rotation): ${WG_CONFIGS[0]?.endpoint}`);
+  if (WG_ENDPOINTS.length <= 1) {
+    console.log(`[wg-proxy] Single endpoint (no rotation): ${WG_ENDPOINTS[0]}`);
     return;
   }
-  console.log(`[wg-proxy] IP rotation enabled: ${WG_CONFIGS.length} config(s)`);
-  WG_CONFIGS.forEach((c, i) => console.log(`  ${i}: ${c.endpoint}`));
+  console.log(`[wg-proxy] IP rotation enabled: ${WG_ENDPOINTS.join(", ")}`);
   console.log(`[wg-proxy] Rotation interval: ${ROTATION_INTERVAL_MS / 1000}s`);
   
   const rotate = async () => {
-    await rotateConfig();
+    await rotateEndpoint();
     rotationTimer = setTimeout(rotate, ROTATION_INTERVAL_MS);
   };
   rotationTimer = setTimeout(rotate, ROTATION_INTERVAL_MS);
@@ -185,8 +160,8 @@ const server = http.createServer((req, res) => {
     status: "ok",
     mode: "wg-proxy",
     socks5: `:${SOCKS_PORT}`,
-    configs: WG_CONFIGS.length,
-    currentEndpoint: getCurrentEndpoint()
+    endpoints: WG_ENDPOINTS.length,
+    currentEndpoint: WG_ENDPOINTS[currentEndpointIdx % WG_ENDPOINTS.length] || "unknown"
   };
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify(health));
@@ -195,119 +170,39 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws, req) => {
-  // Supports two modes:
-  // 1. Legacy (single-connection): first msg is {host, port} (no type field)
-  // 2. Multiplexed (multiple connections): connect/disconnect via {type, connId}
-  //
-  // Multiplexed binary frame format: [4-byte connId BE][payload]
-  // Legacy binary format: raw data (no prefix)
-
-  let isMultiplexed = false;
-  let legacySocket = null; // Single SOCKS5 socket for legacy mode
-  const connections = new Map(); // connId -> net.Socket (SOCKS5)
+  let expectingConfig = true;
+  let torSocket = null;
 
   ws.on("message", (data) => {
-    // ── Text frames: JSON control messages ──
-    if (typeof data === 'string') {
+    if (expectingConfig) {
       try {
-        const msg = JSON.parse(data);
-
-        // Detect mode on first message
-        if (msg.type) isMultiplexed = true;
-
-        // ── Legacy mode: {host, port} ──
-        if (!msg.type && msg.host) {
-          socks5Connect(msg.host, msg.port || 443)
-            .then((ts) => {
-              legacySocket = ts;
-              ws.send(JSON.stringify({ status: "connected" }));
-              ts.on("data", (td) => {
-                try { if (ws.readyState === ws.OPEN) ws.send(td); } catch (e) {}
-              });
-              ts.on("error", () => { try { legacySocket?.end(); } catch(e) {} legacySocket = null; });
-              ts.on("close", () => { legacySocket = null; });
-            })
-            .catch((err) => {
-              try { ws.send(JSON.stringify({ error: err.message })); } catch (e) {}
-            });
-          return;
-        }
-
-        // ── Multiplexed mode ──
-        if (msg.type === 'connect' && msg.connId != null && msg.host) {
-          const connId = msg.connId;
-          socks5Connect(msg.host, msg.port || 443)
-            .then((socks) => {
-              connections.set(connId, socks);
-              ws.send(JSON.stringify({ type: "connected", connId }));
-
-              socks.on("data", (socksData) => {
-                try {
-                  if (ws.readyState !== ws.OPEN) return;
-                  const header = Buffer.alloc(4);
-                  header.writeUInt32BE(connId);
-                  ws.send(Buffer.concat([header, socksData]), { binary: true });
-                } catch (e) {}
-              });
-              socks.on("error", () => cleanupConn(connId));
-              socks.on("close", () => cleanupConn(connId));
-            })
-            .catch((err) => {
-              try { ws.send(JSON.stringify({ type: "error", connId, message: err.message })); } catch (e) {}
-            });
-        }
-
-        if (msg.type === 'disconnect' && msg.connId != null) {
-          cleanupConn(msg.connId);
-        }
-      } catch (e) {}
-    } else {
-      // ── Binary frames ──
-      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-
-      if (isMultiplexed) {
-        // Multiplexed: first 4 bytes = connId, rest = payload
-        if (buf.length < 4) return;
-        const connId = buf.readUInt32BE(0);
-        const payload = buf.slice(4);
-        const socks = connections.get(connId);
-        if (socks) {
-          try { socks.write(payload); } catch (e) {}
-        }
-      } else {
-        // Legacy: raw data goes to the single SOCKS5 connection
-        if (legacySocket) {
-          try { legacySocket.write(buf); } catch (e) {}
-        }
-      }
+        const cfg = JSON.parse(data.toString());
+        socks5Connect(cfg.host || "opencode.ai", cfg.port || 443)
+          .then((ts) => {
+            torSocket = ts;
+            expectingConfig = false;
+            ws.send(JSON.stringify({ status: "connected" }));
+            ts.on("data", (td) => { try { if (ws.readyState === ws.OPEN) ws.send(td); } catch (e) {} });
+            ts.on("error", cleanup);
+            ts.on("close", cleanup);
+          })
+          .catch((err) => { try { ws.send(JSON.stringify({ error: err.message })); } catch (e) {} cleanup(); });
+      } catch (e) { cleanup(); }
+    } else if (torSocket) {
+      try { torSocket.write(typeof data === "string" ? Buffer.from(data) : data); } catch (e) {}
     }
   });
 
-  function cleanupConn(connId) {
-    const socks = connections.get(connId);
-    if (socks) {
-      connections.delete(connId);
-      try { socks.end(); } catch (e) {}
-    }
-  }
-
-  function cleanupAll() {
-    for (const [connId, socks] of connections) {
-      try { socks.end(); } catch (e) {}
-    }
-    connections.clear();
-    try { legacySocket?.end(); } catch (e) {}
-    legacySocket = null;
-  }
-
-  ws.on("close", () => cleanupAll());
-  ws.on("error", () => cleanupAll());
+  ws.on("close", () => cleanup());
+  ws.on("error", () => cleanup());
+  function cleanup() { try { ws.close(); } catch (e) {} try { torSocket?.end(); } catch (e) {} }
 });
 
 server.on("upgrade", (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
+// HTTP CONNECT (fallback when WS relay fails)
 server.on("connect", (req, socket, head) => {
   const [host, portStr] = req.url.split(":");
   const port = parseInt(portStr) || 443;
@@ -325,28 +220,27 @@ server.on("connect", (req, socket, head) => {
 
 // ── Start ──
 async function main() {
-  if (WG_CONFIGS.length === 0) {
-    console.error("[wg-proxy] No WireGuard configs available");
-    process.exit(1);
-  }
+  // Pick initial endpoint
+  const initialEndpoint = WG_ENDPOINTS[0];
+  console.log(`[wg-proxy] Starting WireGuard with ${WG_ENDPOINTS.length} endpoint(s)...`);
   
-  const initialCfg = WG_CONFIGS[0];
-  console.log(`[wg-proxy] Starting WireGuard with ${WG_CONFIGS.length} config(s)...`);
-  
-  currentWireProxy = startWireProxy(initialCfg);
+  currentWireProxy = startWireProxy(initialEndpoint);
+
+  // Wait for SOCKS5
   console.log("[wg-proxy] Waiting for SOCKS5...");
   const ready = await waitForSocks5(45000);
   if (!ready) {
     console.error("[wg-proxy] SOCKS5 failed to start");
     process.exit(1);
   }
-  console.log(`[wg-proxy] WireGuard ready (endpoint: ${initialCfg.endpoint})`);
+  console.log(`[wg-proxy] WireGuard ready (endpoint: ${initialEndpoint})`);
 
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`[wg-proxy] Proxy ready on :${PORT}`);
     console.log(`[wg-proxy]   WebSocket relay → WireGuard SOCKS5 :${SOCKS_PORT}`);
   });
 
+  // Start IP rotation
   startRotationLoop();
 }
 
