@@ -107,6 +107,22 @@ server.on("upgrade", (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
+// HTTP CONNECT (fallback when WS relay fails — used by cloudflare-proxy.js tlsConnectProxy)
+server.on("connect", (req, socket, head) => {
+  const [host, portStr] = req.url.split(":");
+  const port = parseInt(portStr) || 443;
+  socks5Connect(host, port)
+    .then((ts) => {
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      ts.pipe(socket);
+      socket.pipe(ts);
+    })
+    .catch(() => {
+      socket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      socket.end();
+    });
+});
+
 // ── Start ──
 async function main() {
   // Start WireGuard
