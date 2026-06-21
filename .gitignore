@@ -40,3 +40,4 @@ temp/
 .DS_Store
 Thumbs.db
 telegram-worker-proxy/
+tor-proxy/node_modules/

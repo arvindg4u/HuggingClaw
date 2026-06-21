@@ -884,8 +884,12 @@ if [ -n "${HF_TOKEN:-}" ]; then
 else
   echo "Backup    : disabled"
 fi
-# No proxy — opencode.ai connects directly (ToS-compliant)
-echo "Proxy     : direct (opencode.ai not blocked by HF Spaces)" 
+	# SOCKS5_PROXY_URL and SOCKS5_PROXY_DOMAINS control domain routing in cloudflare-proxy.js
+	if [ -n "${SOCKS5_PROXY_URL:-}" ]; then
+	  echo "Proxy     : ${SOCKS5_PROXY_URL} → ${SOCKS5_PROXY_DOMAINS}"
+	else
+	  echo "Proxy     : direct (no proxy configured)"
+	fi
 # HUGGINGCLAW_JUPYTER_ENABLED env var se override allow karo
 # (env-builder "Enable Jupyter terminal" toggle yahi set karta hai)
 if hc_is_true "${HUGGINGCLAW_JUPYTER_ENABLED:-false}"; then
