@@ -833,6 +833,24 @@ if [ -f "$EXISTING_CONFIG" ]; then
     echo "$PATCHED" > "$EXISTING_CONFIG.tmp" \
       && mv "$EXISTING_CONFIG.tmp" "$EXISTING_CONFIG"
     echo "Config patched successfully."
+    # Strip deprecated/incompatible fields that the current OpenClaw version rejects
+    # Old backups may have: agents.defaults.models (empty {} objects),
+    # gateway.controlUi.dangerouslyDisableDeviceAuth (removed),
+    # models.providers.*.api (renamed to apiType), old MCP command format
+    CLEANED=$(jq '
+      del(.agents.defaults.models)
+      | del(.gateway.controlUi.dangerouslyDisableDeviceAuth)
+      | if .mcp.servers then
+          .mcp.servers |= with_entries(
+            select(.value.command == null and .value.url != null)
+          )
+        else . end
+      | if .mcp.servers then
+          .mcp.servers |= with_entries(
+            if .value.command then del(.) else . end
+          )
+        else . end
+    ' "$EXISTING_CONFIG" 2>/dev/null) && echo "$CLEANED" > "$EXISTING_CONFIG" && echo "Config cleaned."
   else
     echo "Patch failed — writing fresh config."
     echo "$CONFIG_JSON" > "$EXISTING_CONFIG"
@@ -1831,6 +1849,12 @@ while true; do
     tail -30 /home/node/.openclaw/gateway.log
     if [ "$DEV_MODE_ENABLED" = "true" ]; then
       echo "Gateway failed — DEV_MODE active, retrying in 10s..."
+      # If config is invalid, regenerate from template
+      if grep -q "Invalid config" /home/node/.openclaw/gateway.log 2>/dev/null; then
+        echo "Invalid config detected — regenerating from template..."
+        echo "$CONFIG_JSON" > "$EXISTING_CONFIG"
+        chmod 600 "$EXISTING_CONFIG"
+      fi
       sleep 10
       continue
     else
