@@ -4,5 +4,8 @@
   "private": true,
   "scripts": {
     "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
   }
 }

@@ -1,13 +1,12 @@
 # ── HuggingClaw Tor Proxy for Render (Free Tier) ──
 # Routes traffic through Tor SOCKS5 for IP rotation
 # Purpose: avoid IP-based rate limiting on opencode.ai
-# Base: ~45MB (Alpine 5MB + Tor 15MB + Node.js 25MB)
-FROM alpine:3.19
+# ~60MB (Node.js 40MB + Tor 15MB + ws lib 5MB)
+FROM node:22-alpine
 
-RUN apk add --no-cache tor nodejs
+RUN apk add --no-cache tor
 
 # Tor config — ClientOnly means no relay/exit (privacy-safe)
-# Use /app/tor-data so path survives Docker layers
 RUN mkdir -p /app/tor-data && chmod 700 /app/tor-data
 RUN printf '%s\n' \
   'SOCKSPort 127.0.0.1:9150' \
@@ -19,7 +18,9 @@ RUN printf '%s\n' \
   > /app/torrc
 
 WORKDIR /app
-COPY package.json index.js ./
+COPY package.json package-lock.json ./
+RUN npm install --omit=dev
+COPY index.js ./
 
 EXPOSE 10000
 
