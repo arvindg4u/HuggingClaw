@@ -1,10 +1,24 @@
 # ── HuggingClaw WireGuard (Proton VPN) Proxy for Render ──
-# Wraps samuelmoraesf/protonvpn-proxy with fixed WireGuard credentials.
-# Builds on Render — no kernel module or NET_ADMIN needed.
-FROM samuelmoraesf/protonvpn-proxy:latest
+# SOCKS5 + HTTP health check on same port
+FROM samuelmoraesf/protonvpn-proxy:latest AS base
 
+FROM alpine:3.19
+RUN apk add --no-cache nodejs bash
+
+# Copy wireproxy binary from base image
+COPY --from=base /usr/bin/wireproxy /usr/bin/wireproxy
+
+# Copy entrypoint script to generate wireproxy config
+COPY --from=base /entrypoint.sh /entrypoint.sh
+
+# WireGuard config via env vars (same as base image)
 ENV WG_PRIVATE_KEY=wHTOhHm7orE8evqF39HezxB8Vc+fwuVsEtDN2rl2HnA=
 ENV WG_PEER_PUBLIC_KEY=Y4jxn/IIoorfo/X99RZFU6HbL9WWn7ffGI5isYFU9lo=
 ENV WG_ENDPOINT=146.70.202.34:51820
 
-EXPOSE 1080
+COPY run.sh /run.sh
+RUN chmod +x /run.sh
+
+EXPOSE 10000
+
+CMD ["/run.sh"]
