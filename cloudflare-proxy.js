@@ -452,7 +452,7 @@ net.connect = function(...args) {
         socks._hc_writeBuf = [];
         buf.forEach(([d, a]) => { try { s.write(d, ...a); } catch (e) {} });
       }
-      s.on("data", (d) => { socks.emit("data", d); });
+      s.on("data", (d) => { socks.push(d); });
       s.on("end", () => { socks.emit("end"); });
       s.on("close", () => { socks.emit("close"); });
       s.on("error", (e) => { socks.emit("error", e); });
@@ -525,10 +525,11 @@ tls.connect = function(...args) {
 
     tlsSocket.on("secureConnect", () => {
       // Replace the pending socket by forwarding events
+      pending.emit("secureConnect");
       pending.emit("connect");
       // Call the TLS connect callback if provided
       if (typeof cb === "function") cb();
-      tlsSocket.on("data", (d) => pending.emit("data", d));
+      tlsSocket.on("data", (d) => pending.push(d));
       tlsSocket.on("end", () => pending.emit("end"));
       tlsSocket.on("close", () => pending.emit("close"));
       tlsSocket.on("error", (e) => pending.emit("error", e));
