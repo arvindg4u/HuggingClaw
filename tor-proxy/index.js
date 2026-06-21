@@ -12,7 +12,6 @@
  *   - Health check   GET /health      → { status:"ok", tor:true, ... }
  */
 
-const http = require("http");
 const net = require("net");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
@@ -350,31 +349,38 @@ function startWsRelay(clientSocket, initialData) {
   clientSocket.on("close", cleanup);
 }
 
-// ── HTTP server (health check) ──
-const server = http.createServer((req, res) => {
-  // Health check — only reached for non-Upgrade HTTP requests
-  res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({
-    status: "ok",
-    tor: true,
-    torPort: TOR_PORT,
-    port: PORT,
-  }));
-});
+// ── Raw TCP server (no http.createServer — must intercept all protocols) ──
+// Using net.createServer gives full control over every byte before any internal
+// parser (C++ HTTP parser in http.Server) can consume it.
+function handleHttpRequest(socket, data) {
+  const raw = data.toString();
+  const reqLine = raw.split("\r\n")[0];
 
-// Handle WebSocket upgrades through the HTTP server's upgrade event.
-// Render's reverse proxy forwards WS upgrades as normal HTTP/1.1
-// Upgrade requests — Node's http parser handles them and emits 'upgrade'.
-server.on("upgrade", (req, socket, head) => {
-  handleWsUpgrade(req, socket, head);
-});
+  // Health check
+  if (reqLine.startsWith("GET ") || reqLine.startsWith("HEAD ")) {
+    const body = JSON.stringify({
+      status: "ok",
+      tor: true,
+      torPort: TOR_PORT,
+      port: PORT,
+    });
+    socket.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n" + body);
+    socket.end();
+    return;
+  }
 
-// Detect non-HTTP protocols (SOCKS5, HTTP CONNECT) on raw TCP
-server.on("connection", (socket) => {
-  // Pause to prevent Node's internal HTTP parser from stealing data
-  // before we determine the protocol. We'll resume for HTTP traffic.
-  socket.pause();
+  // WebSocket upgrade
+  if (raw.includes("Upgrade: websocket") || raw.includes("upgrade: websocket")) {
+    handleWsFromRaw(socket, data);
+    return;
+  }
 
+  // Unknown — close
+  socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nBad Request");
+  socket.end();
+}
+
+const server = net.createServer((socket) => {
   socket.once("data", (data) => {
     if (data.length === 0) return;
     const firstByte = data[0];
@@ -386,13 +392,9 @@ server.on("connection", (socket) => {
     } else if (firstByte === 0x43) {
       // 'C' — HTTP CONNECT
       handleHttpConnect(socket, data);
-    } else if (str.includes("Upgrade: websocket") || str.includes("upgrade: websocket")) {
-      // WebSocket upgrade from raw connection (non-Render proxy path)
-      handleWsFromRaw(socket, data);
     } else {
-      // Regular HTTP — re-emit and resume
-      socket.unshift(data);
-      socket.resume();
+      // HTTP request or WebSocket upgrade
+      handleHttpRequest(socket, data);
     }
   });
 });
