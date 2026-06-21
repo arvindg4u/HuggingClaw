@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 const http = require("http");
 const net = require("net");
-const dns = require("dns");
 const { spawn } = require("child_process");
 const { WebSocketServer } = require("ws");
 
@@ -10,49 +9,79 @@ const SOCKS_HOST = "127.0.0.1";
 const SOCKS_PORT = 1080;
 
 // ── WireGuard rotation config ──
-const WG_PRIVATE_KEY = process.env.WG_PRIVATE_KEY || "wHTOhHm7orE8evqF39HezxB8Vc+fwuVsEtDN2rl2HnA=";
-const WG_PEER_PUBLIC_KEY = process.env.WG_PEER_PUBLIC_KEY || "Y4jxn/IIoorfo/X99RZFU6HbL9WWn7ffGI5isYFU9lo=";
+// WG_CONFIGS (JSON array) takes precedence over WG_ENDPOINTS/WG_ENDPOINT
+// Each config: {"privateKey":"...","peerPublicKey":"...","endpoint":"ip:port"}
+// Example WG_CONFIGS:
+// [{"privateKey":"key1","peerPublicKey":"peer1","endpoint":"ip1:51820"},
+//  {"privateKey":"key2","peerPublicKey":"peer2","endpoint":"ip2:51820"}]
 const ROTATION_INTERVAL_MS = parseInt(process.env.WG_ROTATION_INTERVAL || "1800000"); // default 30 min
 
-// Parse endpoints: WG_ENDPOINTS takes precedence over WG_ENDPOINT
-// Format: comma-separated "ip:port" or semicolon-separated (for IPv6)
-let WG_ENDPOINTS = [];
-const endpointsRaw = process.env.WG_ENDPOINTS || process.env.WG_ENDPOINT || "146.70.202.34:51820";
-// Support both comma and semicolon separation for IPv6 compatibility
-WG_ENDPOINTS = endpointsRaw.split(/[,;]/).map(s => s.trim()).filter(Boolean);
-
-let currentWireProxy = null;
-let currentEndpointIdx = 0;
-let rotationTimer = null;
-
-function pickEndpoint() {
-  if (WG_ENDPOINTS.length <= 1) return WG_ENDPOINTS[0] || "146.70.202.34:51820";
-  // Pick next endpoint in rotation
-  currentEndpointIdx = (currentEndpointIdx + 1) % WG_ENDPOINTS.length;
-  return WG_ENDPOINTS[currentEndpointIdx];
+// Parse WG_CONFIGS or fall back to single key + endpoints
+let WG_CONFIGS = [];
+const userConfigs = process.env.WG_CONFIGS;
+if (userConfigs) {
+  try {
+    WG_CONFIGS = JSON.parse(userConfigs);
+    if (!Array.isArray(WG_CONFIGS) || WG_CONFIGS.length === 0) {
+      console.error("[wg-proxy] WG_CONFIGS is not a non-empty array, falling back to env vars");
+      WG_CONFIGS = [];
+    }
+  } catch (e) {
+    console.error("[wg-proxy] Failed to parse WG_CONFIGS JSON:", e.message);
+    WG_CONFIGS = [];
+  }
 }
 
-function startWireProxy(endpoint) {
+// Fallback: build configs from WG_ENDPOINTS/WG_ENDPOINT + single key pair
+if (WG_CONFIGS.length === 0) {
+  const privateKey = process.env.WG_PRIVATE_KEY || "wHTOhHm7orE8evqF39HezxB8Vc+fwuVsEtDN2rl2HnA=";
+  const peerPublicKey = process.env.WG_PEER_PUBLIC_KEY || "Y4jxn/IIoorfo/X99RZFU6HbL9WWn7ffGI5isYFU9lo=";
+  const endpointsRaw = process.env.WG_ENDPOINTS || process.env.WG_ENDPOINT || "146.70.202.34:51820";
+  const endpoints = endpointsRaw.split(/[,;]/).map(s => s.trim()).filter(Boolean);
+  WG_CONFIGS = endpoints.map(ep => ({ privateKey, peerPublicKey, endpoint: ep }));
+}
+
+let currentWireProxy = null;
+let currentConfigIdx = 0;
+let rotationTimer = null;
+
+function pickConfig() {
+  if (WG_CONFIGS.length <= 1) return WG_CONFIGS[0];
+  currentConfigIdx = (currentConfigIdx + 1) % WG_CONFIGS.length;
+  return WG_CONFIGS[currentConfigIdx];
+}
+
+function getCurrentEndpoint() {
+  if (WG_CONFIGS.length === 0) return "none";
+  const idx = currentConfigIdx % WG_CONFIGS.length;
+  return WG_CONFIGS[idx].endpoint;
+}
+
+function writeWireProxyConfig(cfg) {
   const fs = require("fs");
   const config = `[Interface]
-PrivateKey = ${WG_PRIVATE_KEY}
+PrivateKey = ${cfg.privateKey}
 Address = 10.2.0.2/32
 DNS = 10.2.0.1
 
 [Peer]
-PublicKey = ${WG_PEER_PUBLIC_KEY}
+PublicKey = ${cfg.peerPublicKey}
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = ${endpoint}
+Endpoint = ${cfg.endpoint}
 PersistentKeepalive = 25
 
 [Socks5]
 BindAddress = 0.0.0.0:1080
 `;
   fs.writeFileSync("/etc/wireproxy.conf", config);
-  console.log(`[wg-proxy] Starting WireGuard → ${endpoint}`);
+}
+
+function startWireProxy(cfg) {
+  writeWireProxyConfig(cfg);
+  console.log(`[wg-proxy] Starting WireGuard → ${cfg.endpoint}`);
   const wp = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
   wp.on("exit", (code) => {
-    console.log(`[wg-proxy] wireproxy exited (code ${code}) for endpoint ${endpoint}`);
+    console.log(`[wg-proxy] wireproxy exited (code ${code}) for ${cfg.endpoint}`);
   });
   return wp;
 }
@@ -80,44 +109,40 @@ async function waitForSocks5(timeoutMs = 30000) {
   return false;
 }
 
-async function rotateEndpoint() {
-  if (WG_ENDPOINTS.length <= 1) return; // no rotation needed
+async function rotateConfig() {
+  if (WG_CONFIGS.length <= 1) return;
   
-  const newEndpoint = pickEndpoint();
-  console.log(`[wg-proxy] Rotating endpoint → ${newEndpoint}`);
+  const newCfg = pickConfig();
+  console.log(`[wg-proxy] Rotating → ${newCfg.endpoint}`);
   
-  // Kill old wireproxy
   if (currentWireProxy) {
     currentWireProxy.kill("SIGTERM");
-    // Give it a moment to release the SOCKS5 port
     await new Promise((r) => setTimeout(r, 2000));
     if (currentWireProxy && !currentWireProxy.killed) {
       currentWireProxy.kill("SIGKILL");
     }
   }
   
-  // Start new wireproxy with new endpoint
-  currentWireProxy = startWireProxy(newEndpoint);
-  
-  // Wait for SOCKS5 to be ready
+  currentWireProxy = startWireProxy(newCfg);
   const ready = await waitForSocks5(30000);
   if (ready) {
-    console.log(`[wg-proxy] Rotation complete → ${newEndpoint} (SOCKS5 ready)`);
+    console.log(`[wg-proxy] Rotation complete → ${newCfg.endpoint} (SOCKS5 ready)`);
   } else {
-    console.error(`[wg-proxy] Rotation failed — SOCKS5 not ready for ${newEndpoint}`);
+    console.error(`[wg-proxy] Rotation failed — SOCKS5 not ready for ${newCfg.endpoint}`);
   }
 }
 
 async function startRotationLoop() {
-  if (WG_ENDPOINTS.length <= 1) {
-    console.log(`[wg-proxy] Single endpoint (no rotation): ${WG_ENDPOINTS[0]}`);
+  if (WG_CONFIGS.length <= 1) {
+    console.log(`[wg-proxy] Single config (no rotation): ${WG_CONFIGS[0]?.endpoint}`);
     return;
   }
-  console.log(`[wg-proxy] IP rotation enabled: ${WG_ENDPOINTS.join(", ")}`);
+  console.log(`[wg-proxy] IP rotation enabled: ${WG_CONFIGS.length} config(s)`);
+  WG_CONFIGS.forEach((c, i) => console.log(`  ${i}: ${c.endpoint}`));
   console.log(`[wg-proxy] Rotation interval: ${ROTATION_INTERVAL_MS / 1000}s`);
   
   const rotate = async () => {
-    await rotateEndpoint();
+    await rotateConfig();
     rotationTimer = setTimeout(rotate, ROTATION_INTERVAL_MS);
   };
   rotationTimer = setTimeout(rotate, ROTATION_INTERVAL_MS);
@@ -160,8 +185,8 @@ const server = http.createServer((req, res) => {
     status: "ok",
     mode: "wg-proxy",
     socks5: `:${SOCKS_PORT}`,
-    endpoints: WG_ENDPOINTS.length,
-    currentEndpoint: WG_ENDPOINTS[currentEndpointIdx % WG_ENDPOINTS.length] || "unknown"
+    configs: WG_CONFIGS.length,
+    currentEndpoint: getCurrentEndpoint()
   };
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify(health));
@@ -202,7 +227,6 @@ server.on("upgrade", (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
-// HTTP CONNECT (fallback when WS relay fails)
 server.on("connect", (req, socket, head) => {
   const [host, portStr] = req.url.split(":");
   const port = parseInt(portStr) || 443;
@@ -220,27 +244,28 @@ server.on("connect", (req, socket, head) => {
 
 // ── Start ──
 async function main() {
-  // Pick initial endpoint
-  const initialEndpoint = WG_ENDPOINTS[0];
-  console.log(`[wg-proxy] Starting WireGuard with ${WG_ENDPOINTS.length} endpoint(s)...`);
+  if (WG_CONFIGS.length === 0) {
+    console.error("[wg-proxy] No WireGuard configs available");
+    process.exit(1);
+  }
   
-  currentWireProxy = startWireProxy(initialEndpoint);
-
-  // Wait for SOCKS5
+  const initialCfg = WG_CONFIGS[0];
+  console.log(`[wg-proxy] Starting WireGuard with ${WG_CONFIGS.length} config(s)...`);
+  
+  currentWireProxy = startWireProxy(initialCfg);
   console.log("[wg-proxy] Waiting for SOCKS5...");
   const ready = await waitForSocks5(45000);
   if (!ready) {
     console.error("[wg-proxy] SOCKS5 failed to start");
     process.exit(1);
   }
-  console.log(`[wg-proxy] WireGuard ready (endpoint: ${initialEndpoint})`);
+  console.log(`[wg-proxy] WireGuard ready (endpoint: ${initialCfg.endpoint})`);
 
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`[wg-proxy] Proxy ready on :${PORT}`);
     console.log(`[wg-proxy]   WebSocket relay → WireGuard SOCKS5 :${SOCKS_PORT}`);
   });
 
-  // Start IP rotation
   startRotationLoop();
 }
 
