@@ -209,9 +209,8 @@ function startWsRelay(clientSocket, initialData) {
   let expectingConfig = true;
   let torSocket = null;
 
-  const onFrameData = (d) => {
-    frameBuf = Buffer.concat([frameBuf, d]);
-
+  // Process whatever is in frameBuf (called on initial data AND on each 'data' event)
+  function processWsBuffer() {
     if (expectingConfig) {
       // Try to parse WS frame
       while (frameBuf.length >= 2) {
@@ -246,10 +245,7 @@ function startWsRelay(clientSocket, initialData) {
 
         frameBuf = frameBuf.slice(offset + len);
 
-        if (opcode === 0x8) { // close
-          cleanup();
-          return;
-        }
+        if (opcode === 0x8) { cleanup(); return; }
         if (opcode === 0x9) continue; // ping
 
         if (opcode === 0x1 || opcode === 0x2) { // text/binary
@@ -281,6 +277,7 @@ function startWsRelay(clientSocket, initialData) {
                 cleanup();
               });
           } catch (e) {
+            console.log("[ws] JSON parse error: " + e.message);
             cleanup();
           }
         }
@@ -324,7 +321,7 @@ function startWsRelay(clientSocket, initialData) {
         try { torSocket.write(payload); } catch (e) {}
       }
     }
-  };
+  }
 
   function sendWsFrame(data) {
     if (clientSocket.destroyed) return;
@@ -347,9 +344,18 @@ function startWsRelay(clientSocket, initialData) {
     try { torSocket?.end(); } catch (e) {}
   }
 
+  const onFrameData = (d) => {
+    frameBuf = Buffer.concat([frameBuf, d]);
+    processWsBuffer();
+  };
+
   clientSocket.on("data", onFrameData);
   clientSocket.on("error", cleanup);
   clientSocket.on("close", cleanup);
+
+  // Process any initial data that was already buffered before the listener
+  // was registered (e.g., WS frame in same TCP segment as HTTP headers)
+  processWsBuffer();
 }
 
 // ── Raw TCP server (no http.createServer — must intercept all protocols) ──
