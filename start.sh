@@ -862,8 +862,9 @@ CURRENT_CONFIG=$(echo "$CURRENT_CONFIG" | jq --arg token "$GATEWAY_TOKEN" '.gate
 echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
 
 # ── Enable Gateway Preload Fixes ──
-# This preload script keeps iframe embedding working on HF Spaces.
-export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs"
+# These preload scripts patch iframe embedding, API key rotation, and
+# proxy routing (ROUTE_ENDPOINT/ROUTE_TARGETS for SOCKS5/WS proxy).
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs --require /home/node/app/cloudflare-proxy.js"
 
 # ── Startup Summary ──
 echo ""
@@ -1008,21 +1009,6 @@ export LLM_MODEL="$LLM_MODEL"
 export HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-${HF_TOKEN:-}}"
 
 # 10. Start Health Server & Dashboard
-# Also start a lightweight health responder on port 7860 — HF Spaces health
-# checker uses the default Docker port (7860) even when app_port is 7861.
-# Without this, the space stays stuck on "Starting" forever.
-(python3 -c "
-import http.server, json, threading
-class H(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(json.dumps({'status':'ok'}).encode())
-    def log_message(self,*a): pass
-s = http.server.HTTPServer(('0.0.0.0', 7860), H)
-s.serve_forever()
-" &) 2>/dev/null
-echo "Health responder: port 7860 (for HF Spaces health check)"
 node /home/node/app/health-server.js &
 HEALTH_PID=$!
 
