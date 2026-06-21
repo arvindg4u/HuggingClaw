@@ -440,6 +440,7 @@ net.connect = function(...args) {
 
   // Use proxyConnect which handles wss:// (WebSocket), socks5://, and direct fallback
   const socks = new net.Socket();
+  socks.setMaxListeners(0);
   socks._hc_proxied = true;
   socks._hc_writeBuf = [];
 
@@ -503,6 +504,7 @@ tls.connect = function(...args) {
 
   // We return a socket immediately and upgrade it when tunnel is ready
   const pending = new net.Socket();
+  pending.setMaxListeners(0);
   pending._hc_tunnel_pending = true;
   pending._hc_writeBuf = [];
   // Override write immediately so early writes are buffered, not lost

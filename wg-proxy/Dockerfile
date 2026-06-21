@@ -1,4 +1,8 @@
 # ── HuggingClaw WireGuard (Proton VPN) Proxy for Render ──
+# IP rotation: set WG_ENDPOINTS with comma-separated endpoint IP:port pairs
+#   WG_ENDPOINTS=ip1:51820,ip2:51820,ip3:51820
+#   WG_ROTATION_INTERVAL=1800000  (ms, default 30 min)
+# Falls back to WG_ENDPOINT for single-endpoint mode.
 FROM node:22-alpine
 
 RUN apk add --no-cache wget ca-certificates
