@@ -170,15 +170,7 @@ const FALLBACK_DNS = {
   "wss.web.whatsapp.com": ["157.240.221.52", "157.240.223.52"],
 };
 
-// Pre-resolve proxy endpoint hostname (DNS cache avoids lookup on every WebSocket connection)
-if (SOCKS5_HOST && !getDNSOverride(SOCKS5_HOST)) {
-  dns.resolve4(SOCKS5_HOST, (err, ips) => {
-    if (!err && ips && ips.length > 0) {
-      DNS_OVERRIDE[SOCKS5_HOST] = ips;
-      log(`DNS cached ${SOCKS5_HOST} → ${ips.join(", ")}`);
-    }
-  });
-}
+// // DNS caching for proxy hostname removed — OS resolver handles it
 
 function getDNSOverride(hostname) {
   const d = (hostname || "").toLowerCase();
@@ -634,10 +626,12 @@ class TunnelPool {
     if (!proxyUrl) throw new Error('no proxy URL');
     if (!WebSocket) throw new Error('ws library not available');
 
-    this.ws = new WebSocket(proxyUrl);
+    // Normalize URL: https:// → wss:// for WebSocket constructor
+    const wsUrl = proxyUrl.replace(/^https:/i, 'wss:');
+    this.ws = new WebSocket(wsUrl);
     this.pendingOpen = new Promise((resolve, reject) => {
       const onopen = () => resolve(this.ws);
-      const onerror = (e) => { this._invalidateAll(e); reject(e); };
+      const onerror = (e) => { const err = e instanceof Error ? e : new Error(e?.message || 'WebSocket error'); this._invalidateAll(err); reject(err); };
       this.ws.once('open', onopen);
       this.ws.once('error', onerror);
       // Timeout for WebSocket connection
@@ -738,6 +732,7 @@ class TunnelPool {
       conn.reject = reject;
       conn.timer = setTimeout(() => {
         this.connections.delete(connId);
+        log(`tunnel pool: connect timeout for connId=${connId} (${host}:${port})`);
         reject(new Error('tunnel connect timeout'));
       }, timeout);
     });
@@ -773,8 +768,10 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
           if (!settled) { settled = true; reject(new Error('ws timeout')); }
         }, timeout);
 
+        // Normalize URL: https:// → wss:// for WebSocket constructor
+        const wsUrl = proxyUrl.replace(/^https:/i, 'wss:');
         let ws;
-        try { ws = new WebSocket(proxyUrl); } catch(e) { clearTimeout(timer); reject(e); return; }
+        try { ws = new WebSocket(wsUrl); } catch(e) { clearTimeout(timer); reject(e); return; }
 
         let pendingWriteBuffer = [];
         let tunnelReady = false;
