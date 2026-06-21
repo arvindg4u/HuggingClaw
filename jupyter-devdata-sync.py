@@ -9,7 +9,7 @@ HF_USERNAME = os.environ.get("HF_USERNAME", "").strip() or os.environ.get("SPACE
 DATASET_NAME = os.environ.get("DEVDATA_DATASET_NAME", "").strip() or "huggingclaw-devdata"
 BACKUP_DATASET_NAME = os.environ.get("BACKUP_DATASET_NAME", "").strip() or os.environ.get("BACKUP_DATASET", "").strip() or "huggingclaw-backup"
 JUPYTER_ROOT = Path(os.environ.get("JUPYTER_ROOT_DIR", "/home/node")).resolve()
-INTERVAL = int((os.environ.get("DEVDATA_SYNC_INTERVAL", "").strip() or "180"))
+INTERVAL = int((os.environ.get("DEVDATA_SYNC_INTERVAL", "").strip() or "600"))
 # BUG FIX #5: Respect max file size so giant files don't stall uploads.
 # Matches the 50 MB ceiling in openclaw-sync.py; override with DEVDATA_MAX_FILE_BYTES.
 MAX_FILE_SIZE_BYTES = int(

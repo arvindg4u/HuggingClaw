@@ -22,7 +22,7 @@ const GATEWAY_URL = `ws://127.0.0.1:${GATEWAY_PORT}`;
 const GATEWAY_TOKEN = process.env.GATEWAY_TOKEN || "huggingclaw";
 const WHATSAPP_ENABLED = /^true$/i.test(process.env.WHATSAPP_ENABLED || "");
 const CHECK_INTERVAL = 30000;
-const WAIT_TIMEOUT = 120000;
+const WAIT_TIMEOUT = 240000; // 4 min — increased for proxy chain latency
 const POST_515_NO_LOGOUT_MS = 90 * 1000;
 const SUCCESS_COOLDOWN_MS = 60 * 1000;
 const RESET_MARKER_PATH = path.join(
@@ -254,7 +254,7 @@ async function checkStatus() {
     // Normal timeout or gateway starting up; retry on the next interval.
   } finally {
     isWaiting = false;
-    if (ws) ws.close();
+    if (ws) { try { ws.close(); } catch (_) {} }
   }
 }
 

@@ -761,6 +761,13 @@ fi
 if [ "$WHATSAPP_ENABLED_NORMALIZED" = "true" ]; then
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.plugins.entries.whatsapp = {"enabled": true}')
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.channels.whatsapp = {"dmPolicy": "pairing"}')
+  # Baileys socket timing overrides — prevents 408 timeout behind proxy
+  # OpenClaw docs: https://docs.openclaw.ai/channels/whatsapp#runtime-model
+  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '. + {"web.whatsapp": {
+    "keepAliveIntervalMs": 30000,
+    "connectTimeoutMs": 60000,
+    "defaultQueryTimeoutMs": 60000
+  }}')
 fi
 
 # Write config
@@ -800,6 +807,7 @@ if [ -f "$EXISTING_CONFIG" ]; then
      | .plugins.deny = (((.plugins.deny // []) + ($desired.plugins.deny // [])) | unique)
      | .plugins.entries = ((.plugins.entries // {}) * ($desired.plugins.entries // {}))
      | .models = ((.models // {}) * ($desired.models // {}))
+     | if $desired["web.whatsapp"] then .["web.whatsapp"] = $desired["web.whatsapp"] else . end
      | if $whatsappEnabled then
          ($desired.channels.whatsapp // {"dmPolicy": "pairing"}) as $desiredWhatsapp
          | .plugins.entries.whatsapp.enabled = true
@@ -882,7 +890,7 @@ else
   echo "WhatsApp  : disabled"
 fi
 if [ -n "${HF_TOKEN:-}" ]; then
-  echo "Backup    : ${BACKUP_DATASET:-huggingclaw-backup} (every ${SYNC_INTERVAL:-180}s)"
+  echo "Backup    : ${BACKUP_DATASET:-huggingclaw-backup} (every ${SYNC_INTERVAL:-600}s / debounce:60s)"
 else
   echo "Backup    : disabled"
 fi
@@ -954,11 +962,10 @@ graceful_shutdown() {
       # Give Python a moment to flush and release the lock file.
       sleep 0.5
     fi
-    timeout 8s python3 /home/node/app/openclaw-sync.py sync-once-settled || \
-      echo "Warning: could not complete settled shutdown sync"
-    sleep 1
-    python3 /home/node/app/openclaw-sync.py sync-once || \
-      echo "Warning: could not complete final shutdown sync"
+    # Single shutdown sync — the sync loop already debounces changes,
+    # and the settled wait is redundant when the process is exiting.
+    timeout 15s python3 /home/node/app/openclaw-sync.py sync-once || \
+      echo "Warning: could not complete shutdown sync"
   elif [ -f "/home/node/app/openclaw-sync.py" ]; then
     echo "HF_TOKEN not set; skipping shutdown backup sync."
   fi
@@ -1657,8 +1664,8 @@ sync_before_gateway_restart() {
   [ -f "/home/node/app/openclaw-sync.py" ] || return 0
 
   echo "Gateway stopped; saving latest OpenClaw state before restart..."
-  python3 /home/node/app/openclaw-sync.py sync-once-settled || \
-    echo "Warning: could not sync settled state before gateway restart"
+  python3 /home/node/app/openclaw-sync.py sync-once || \
+    echo "Warning: could not sync before gateway restart"
 }
 
 start_background_devdata_sync() {

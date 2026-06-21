@@ -40,7 +40,7 @@ OPENCLAW_CONFIG_FILE = OPENCLAW_HOME / "openclaw.json"
 WORKSPACE = OPENCLAW_HOME / "workspace"
 STATUS_FILE = Path("/tmp/sync-status.json")
 SYNC_LOCK_FILE = Path("/tmp/huggingclaw-sync.lock")
-INTERVAL = int(os.environ.get("SYNC_INTERVAL", "180"))
+INTERVAL = int(os.environ.get("SYNC_INTERVAL", "600"))
 INITIAL_DELAY = int(os.environ.get("SYNC_START_DELAY", "10"))
 CONFIG_WATCH_INTERVAL = max(
     0.5,
@@ -50,6 +50,12 @@ CONFIG_SETTLE_SECONDS = max(
     0.0,
     float(os.environ.get("OPENCLAW_CONFIG_SETTLE_SECONDS", "3")),
 )
+# Debounce window: rapid changes (e.g. gateway restart + config patch)
+# are batched into a single sync within this window.
+DEBOUNCE_SECONDS = int(os.environ.get("SYNC_DEBOUNCE_SECONDS", "60"))
+# 429 rate limit retry: exponential backoff 60s/120s/240s/480s
+UPLOAD_RETRIES = int(os.environ.get("SYNC_UPLOAD_RETRIES", "5"))
+BASE_RETRY_DELAY = int(os.environ.get("SYNC_RETRY_BASE_DELAY", "60"))
 SESSIONS_MIN_SYNC_GAP = int(os.environ.get("SESSIONS_MIN_SYNC_GAP", "30"))
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 HF_USERNAME = os.environ.get("HF_USERNAME", "").strip()
@@ -507,6 +513,62 @@ def restore_workspace() -> bool:
         return False
 
 
+# Track last sync time for debounce
+_last_sync_time: float = 0.0
+
+
+def upload_with_retry(repo_id: str, folder_path: str) -> None:
+    """Upload folder with exponential backoff on 429 rate limits.
+
+    Retries up to UPLOAD_RETRIES times with BASE_RETRY_DELAY doubling.
+    Sleeps 60s on first 429, 120s on second, etc. Caps at ~31 min total.
+    """
+    import time as _time
+
+    last_exc = None
+    for attempt in range(UPLOAD_RETRIES + 1):
+        try:
+            try:
+                HF_API.upload_large_folder(
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    folder_path=folder_path,
+                    num_workers=2,
+                    print_report=False,
+                )
+            except AttributeError:
+                upload_folder(
+                    folder_path=folder_path,
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    token=HF_TOKEN,
+                    commit_message=(
+                        f"HuggingClaw sync "
+                        f"{_time.strftime('%Y-%m-%dT%H:%M:%SZ', _time.gmtime())}"
+                    ),
+                    ignore_patterns=[".git/*", ".git"],
+                )
+            return  # success
+        except HfHubHTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 429:
+                last_exc = exc
+                if attempt < UPLOAD_RETRIES:
+                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    print(
+                        f"Rate limited (429). "
+                        f"Retrying in {delay}s "
+                        f"(attempt {attempt + 1}/{UPLOAD_RETRIES})..."
+                    )
+                    _time.sleep(delay)
+                    continue
+            raise  # non-429 or out of retries
+        except Exception:
+            raise
+
+    # All retries exhausted
+    raise last_exc or RuntimeError("Upload failed after max retries")
+
+
 def _sync_once_unlocked(
     last_fingerprint: str | None = None,
     last_marker: WorkspaceMarker | None = None,
@@ -530,23 +592,7 @@ def _sync_once_unlocked(
     write_status("syncing", f"Uploading workspace to {repo_id}")
     snapshot_dir = create_snapshot_dir(WORKSPACE)
     try:
-        try:
-            HF_API.upload_large_folder(
-                repo_id=repo_id,
-                repo_type="dataset",
-                folder_path=str(snapshot_dir),
-                num_workers=2,
-                print_report=False,
-            )
-        except AttributeError:
-            upload_folder(
-                folder_path=str(snapshot_dir),
-                repo_id=repo_id,
-                repo_type="dataset",
-                token=HF_TOKEN,
-                commit_message=f"HuggingClaw sync {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
-                ignore_patterns=[".git/*", ".git"],
-            )
+        upload_with_retry(repo_id, str(snapshot_dir))
         try:
             prune_remote_deleted_files(repo_id, snapshot_dir)
         except Exception as prune_exc:
@@ -554,6 +600,8 @@ def _sync_once_unlocked(
     finally:
         shutil.rmtree(snapshot_dir, ignore_errors=True)
 
+    global _last_sync_time
+    _last_sync_time = time.monotonic()
     write_status("success", f"Uploaded workspace to {repo_id}")
     return (current_fingerprint, current_marker)
 
@@ -688,28 +736,34 @@ def wait_for_config_settle(config_marker: tuple[int, int, int]) -> tuple[str, tu
     return ("stopped", current_marker)
 
 
+def _debounce_remaining() -> float:
+    """Return seconds remaining in the debounce window, or 0 if expired."""
+    global _last_sync_time
+    elapsed = time.monotonic() - _last_sync_time
+    return max(0.0, DEBOUNCE_SECONDS - elapsed)
+
+
 def wait_for_sync_trigger(
     config_marker: tuple[int, int, int],
     last_sessions_sync_time: float = 0.0,
 ) -> tuple[str, tuple[int, int, int]]:
     deadline = time.monotonic() + max(0, INTERVAL)
-    # BUG FIX: also watch sessions directory so new/updated sessions
-    # trigger an immediate sync instead of waiting the full interval.
-    # Without this, sessions created between 180-second intervals were
-    # lost when the container restarted (e.g. HF Space going to sleep).
     last_sessions_marker = sessions_marker()
+    # Prevent immediate re-trigger after a just-finished sync
+    _debounce_remaining()  # primes _last_sync_time reference
 
     while not STOP_EVENT.is_set():
+        # Debounce check: skip config/session triggers if we just synced
+        db_remain = _debounce_remaining()
+
         current_config_marker = file_marker(OPENCLAW_CONFIG_FILE)
-        if current_config_marker != config_marker:
+        if current_config_marker != config_marker and db_remain <= 0:
             return wait_for_config_settle(current_config_marker)
 
         sessions_gap_elapsed = (
             time.monotonic() - last_sessions_sync_time >= SESSIONS_MIN_SYNC_GAP
         )
-        if sessions_gap_elapsed:
-            # Sessions changed -> trigger sync immediately (no settle needed;
-            # session files are written atomically by OpenClaw).
+        if sessions_gap_elapsed and db_remain <= 0:
             current_sessions_marker = sessions_marker()
             if current_sessions_marker != last_sessions_marker:
                 return ("sessions", current_config_marker)
@@ -718,7 +772,10 @@ def wait_for_sync_trigger(
         if remaining <= 0:
             return ("interval", current_config_marker)
 
+        # If debounce is active, wait for it to expire before checking again
         wait_seconds = min(CONFIG_WATCH_INTERVAL, remaining)
+        if db_remain > 0:
+            wait_seconds = min(wait_seconds, db_remain)
         if STOP_EVENT.wait(wait_seconds):
             return ("stopped", current_config_marker)
 
@@ -729,11 +786,14 @@ def loop() -> int:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
+    global _last_sync_time
+    _last_sync_time = time.monotonic()
+
     previous_status = read_status().get("status", "")
 
     try:
         repo_id = resolve_backup_namespace()
-        write_status("configured", f"Backup loop active for {repo_id} with {INTERVAL}s interval.")
+        write_status("configured", f"Backup loop active for {repo_id} with {INTERVAL}s interval (debounce: {DEBOUNCE_SECONDS}s).")
     except Exception as exc:
         write_status("error", str(exc))
         print(f"Workspace sync error: {exc}")

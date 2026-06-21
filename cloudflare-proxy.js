@@ -41,6 +41,17 @@ const SOCKS5_DOMAINS = PROXY_DOMAINS_RAW
   ? PROXY_DOMAINS_RAW.split(',').map(s => s.trim()).filter(Boolean)
   : [];
 
+// WhatsApp domains that need routing through Cloudflare Worker
+// (HF Spaces blocks direct connections to WhatsApp servers)
+const WHATSAPP_DOMAINS = [
+  'web.whatsapp.com', 'wss.web.whatsapp.com',
+  'g.whatsapp.net', 'mmg.whatsapp.net',
+  'pps.whatsapp.net', 'static.whatsapp.net'
+];
+function isWhatsAppDomain(hn) {
+  return hn && WHATSAPP_DOMAINS.includes(hn.toLowerCase());
+}
+
 const isInternal = (h) => {
   const hc = typeof h === "string" ? h.toLowerCase() : "";
   return /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|::1|localhost)/.test(hc);
@@ -168,6 +179,10 @@ try {
 const FALLBACK_DNS = {
   "web.whatsapp.com": ["157.240.221.52", "157.240.223.52"],
   "wss.web.whatsapp.com": ["157.240.221.52", "157.240.223.52"],
+  "g.whatsapp.net": ["31.13.66.51", "57.145.3.33"],
+  "mmg.whatsapp.net": ["31.13.66.56", "57.145.3.32"],
+  "pps.whatsapp.net": ["57.145.3.32", "31.13.66.56"],
+  "static.whatsapp.net": ["57.144.75.32", "31.13.66.56"],
 };
 
 // // DNS caching for proxy hostname removed — OS resolver handles it
@@ -254,26 +269,27 @@ http.request = function(...args) {
     return isHttps ? origHttps.call(this, nopts, cb) : origHttp.call(this, nopts, cb);
   }
 
-  // ── WhatsApp WebSocket: route WebSocket upgrade through Cloudflare Worker ──
-  // Baileys ws library sends HTTP request with Upgrade: websocket header
-  if ((hn === 'web.whatsapp.com' || hn === 'wss.web.whatsapp.com') && CF_PROXY_URL) {
+  // ── WhatsApp: route all HTTP/WS through Cloudflare Worker ──
+  // Covers web.whatsapp.com, g.whatsapp.net, mmg.whatsapp.net, pps.whatsapp.net, static.whatsapp.net
+  if (isWhatsAppDomain(hn) && CF_PROXY_URL) {
     const cfUrl = new URL(CF_PROXY_URL);
     const origPath = opts.path || '/';
     const isHttps = String(opts.protocol || '').startsWith('https') || cfUrl.protocol === 'https:';
-    // Set x-target-host so CF Worker knows to proxy to WhatsApp
     const headers = { ...(opts.headers || {}), 'x-target-host': hn, 'x-hc': 'true' };
-    // Preserve Host header for WhatsApp
     headers['Host'] = hn;
+    // web.whatsapp.com (primary WhatsApp Web domain) uses /whatsapp prefix
+    // Other WA domains (g.whatsapp.net, mmg.whatsapp.net) use x-target-host with original path
+    const isPrimaryWA = hn === 'web.whatsapp.com' || hn === 'wss.web.whatsapp.com';
     const nopts = { ...opts, _hc: true,
       hostname: cfUrl.hostname,
       host: cfUrl.hostname,
       port: cfUrl.port || (isHttps ? 443 : 80),
-      path: '/whatsapp' + origPath,
+      path: isPrimaryWA ? '/whatsapp' + origPath : origPath,
       headers: headers,
       createConnection: undefined,
       socket: undefined,
     };
-    log(`WhatsApp http.request via Worker: ${hn}${origPath}`);
+    log(`WhatsApp http.request via Worker: ${hn}${origPath} ${isPrimaryWA ? '(primary)' : '(via x-target-host)'}`);
     return isHttps ? origHttps.call(this, nopts, cb) : origHttp.call(this, nopts, cb);
   }
 
@@ -372,6 +388,34 @@ function applyFetchPatch() {
       });
     }
 
+    // ── WhatsApp: route through Cloudflare Worker ──
+    if (isWhatsAppDomain(url.hostname) && CF_PROXY_URL) {
+      log(`WhatsApp fetch via Worker: ${url.hostname}${url.pathname}`);
+      const cfUrl = new URL(CF_PROXY_URL);
+      const isPrimaryWA = url.hostname === 'web.whatsapp.com' || url.hostname === 'wss.web.whatsapp.com';
+      const proxyUrl = isPrimaryWA
+        ? `${cfUrl.origin}/whatsapp${url.pathname}${url.search}`
+        : `${cfUrl.origin}${url.pathname}${url.search}`;
+      const headers = new Headers(req.headers);
+      headers.set('x-target-host', url.hostname);
+      headers.set('x-hc', 'true');
+      const waReq = new Request(proxyUrl, {
+        method: req.method,
+        headers: headers,
+        body: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : undefined,
+        redirect: 'follow',
+      });
+      try {
+        const resp = await origFetch.call(this, waReq);
+        if (resp.ok || resp.status < 500) {
+          log(`WhatsApp fetch via Worker SUCCESS (status=${resp.status})`);
+          return resp;
+        }
+      } catch (e) {
+        log(`WhatsApp fetch via Worker failed: ${e.message}`);
+      }
+    }
+
     // ── SOCKS5 domains (opencode.ai): use proxy pool ──
     if (!needsProxy(url.hostname)) return origFetch.call(this, input, init);
 
@@ -438,6 +482,17 @@ net.connect = function(...args) {
     return origNetConnect.call(this, nopts);
   }
 
+  // ── WhatsApp: route through Cloudflare Worker ──
+  if (isWhatsAppDomain(hn) && CF_PROXY_URL) {
+    const cfUrl = new URL(CF_PROXY_URL);
+    log(`WhatsApp net.connect via Worker: ${hn}`);
+    const nopts = { ...opts, _hc: true,
+      host: cfUrl.hostname,
+      port: parseInt(cfUrl.port) || (opts.port || 443),
+    };
+    return origNetConnect.call(this, nopts);
+  }
+
   if (opts._hc || !needsProxy(hn)) return origNetConnect.call(this, ...args);
 
   // Use proxyConnect which handles wss:// (WebSocket), socks5://, and direct fallback
@@ -495,6 +550,19 @@ tls.connect = function(...args) {
       servername: cfUrl.hostname,
       port: parseInt(cfUrl.port) || 443,
     };
+    return origTlsConnect.call(this, nopts, cb);
+  }
+
+  // ── WhatsApp: route through Cloudflare Worker ──
+  if (isWhatsAppDomain(hn) && CF_PROXY_URL) {
+    const cfUrl = new URL(CF_PROXY_URL);
+    log(`WhatsApp tls.connect via Worker: ${hn}`);
+    const nopts = { ...opts, _hc: true,
+      host: cfUrl.hostname,
+      servername: cfUrl.hostname,
+      port: parseInt(cfUrl.port) || 443,
+    };
+    // Preserve the original servername for logging but use CF worker for routing
     return origTlsConnect.call(this, nopts, cb);
   }
 
