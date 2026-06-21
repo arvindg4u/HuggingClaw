@@ -76,7 +76,7 @@ COPY --from=openclaw --chown=1000:1000 /app /home/node/.openclaw/openclaw-app
 RUN mkdir -p /home/node/browser-deps && \
     cd /home/node/browser-deps && \
     npm init -y && \
-    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --omit=dev playwright@1.59.1
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install --omit=dev playwright@1.59.1 ws@8.18.3
 
 RUN ln -s /home/node/.openclaw/openclaw-app/openclaw.mjs /usr/local/bin/openclaw 2>/dev/null || \
     npm install -g openclaw@${OPENCLAW_VERSION}

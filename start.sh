@@ -864,6 +864,7 @@ echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
 # ── Enable Gateway Preload Fixes ──
 # These preload scripts patch iframe embedding, API key rotation, and
 # proxy routing (ROUTE_ENDPOINT/ROUTE_TARGETS for SOCKS5/WS proxy).
+export NODE_PATH="${NODE_PATH:-/home/node/browser-deps/node_modules}"
 export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs --require /opt/cloudflare-proxy.js"
 
 # ── Startup Summary ──
