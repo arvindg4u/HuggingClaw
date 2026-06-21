@@ -359,7 +359,7 @@ async function main() {
   console.log(`[tor-proxy] Starting Tor proxy on 0.0.0.0:${PORT}`);
 
   // 1. Start Tor daemon
-  const tor = spawn("tor", ["-f", "/tmp/torrc"], {
+  const tor = spawn("tor", ["-f", "/app/torrc"], {
     stdio: ["ignore", "pipe", "pipe"],
   });
   tor.stdout.on("data", (d) => process.stdout.write(`[tor] ${d}`));

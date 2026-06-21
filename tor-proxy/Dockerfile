@@ -7,8 +7,16 @@ FROM alpine:3.19
 RUN apk add --no-cache tor nodejs
 
 # Tor config — ClientOnly means no relay/exit (privacy-safe)
-RUN mkdir -p /tmp/tor-data && chmod 700 /tmp/tor-data
-RUN echo 'SOCKSPort 127.0.0.1:9150\nDataDirectory /tmp/tor-data\nLog notice stdout\nClientOnly 1\nExitRelay 0\nBridgeRelay 0' > /tmp/torrc
+# Use /app/tor-data so path survives Docker layers
+RUN mkdir -p /app/tor-data && chmod 700 /app/tor-data
+RUN printf '%s\n' \
+  'SOCKSPort 127.0.0.1:9150' \
+  'DataDirectory /app/tor-data' \
+  'Log notice stdout' \
+  'ClientOnly 1' \
+  'ExitRelay 0' \
+  'BridgeRelay 0' \
+  > /app/torrc
 
 WORKDIR /app
 COPY package.json index.js ./
