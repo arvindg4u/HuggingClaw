@@ -195,32 +195,113 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", (ws, req) => {
-  let expectingConfig = true;
-  let torSocket = null;
+  // Supports two modes:
+  // 1. Legacy (single-connection): first msg is {host, port} (no type field)
+  // 2. Multiplexed (multiple connections): connect/disconnect via {type, connId}
+  //
+  // Multiplexed binary frame format: [4-byte connId BE][payload]
+  // Legacy binary format: raw data (no prefix)
+
+  let isMultiplexed = false;
+  let legacySocket = null; // Single SOCKS5 socket for legacy mode
+  const connections = new Map(); // connId -> net.Socket (SOCKS5)
 
   ws.on("message", (data) => {
-    if (expectingConfig) {
+    // ── Text frames: JSON control messages ──
+    if (typeof data === 'string') {
       try {
-        const cfg = JSON.parse(data.toString());
-        socks5Connect(cfg.host || "opencode.ai", cfg.port || 443)
-          .then((ts) => {
-            torSocket = ts;
-            expectingConfig = false;
-            ws.send(JSON.stringify({ status: "connected" }));
-            ts.on("data", (td) => { try { if (ws.readyState === ws.OPEN) ws.send(td); } catch (e) {} });
-            ts.on("error", cleanup);
-            ts.on("close", cleanup);
-          })
-          .catch((err) => { try { ws.send(JSON.stringify({ error: err.message })); } catch (e) {} cleanup(); });
-      } catch (e) { cleanup(); }
-    } else if (torSocket) {
-      try { torSocket.write(typeof data === "string" ? Buffer.from(data) : data); } catch (e) {}
+        const msg = JSON.parse(data);
+
+        // Detect mode on first message
+        if (msg.type) isMultiplexed = true;
+
+        // ── Legacy mode: {host, port} ──
+        if (!msg.type && msg.host) {
+          socks5Connect(msg.host, msg.port || 443)
+            .then((ts) => {
+              legacySocket = ts;
+              ws.send(JSON.stringify({ status: "connected" }));
+              ts.on("data", (td) => {
+                try { if (ws.readyState === ws.OPEN) ws.send(td); } catch (e) {}
+              });
+              ts.on("error", () => { try { legacySocket?.end(); } catch(e) {} legacySocket = null; });
+              ts.on("close", () => { legacySocket = null; });
+            })
+            .catch((err) => {
+              try { ws.send(JSON.stringify({ error: err.message })); } catch (e) {}
+            });
+          return;
+        }
+
+        // ── Multiplexed mode ──
+        if (msg.type === 'connect' && msg.connId != null && msg.host) {
+          const connId = msg.connId;
+          socks5Connect(msg.host, msg.port || 443)
+            .then((socks) => {
+              connections.set(connId, socks);
+              ws.send(JSON.stringify({ type: "connected", connId }));
+
+              socks.on("data", (socksData) => {
+                try {
+                  if (ws.readyState !== ws.OPEN) return;
+                  const header = Buffer.alloc(4);
+                  header.writeUInt32BE(connId);
+                  ws.send(Buffer.concat([header, socksData]), { binary: true });
+                } catch (e) {}
+              });
+              socks.on("error", () => cleanupConn(connId));
+              socks.on("close", () => cleanupConn(connId));
+            })
+            .catch((err) => {
+              try { ws.send(JSON.stringify({ type: "error", connId, message: err.message })); } catch (e) {}
+            });
+        }
+
+        if (msg.type === 'disconnect' && msg.connId != null) {
+          cleanupConn(msg.connId);
+        }
+      } catch (e) {}
+    } else {
+      // ── Binary frames ──
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+
+      if (isMultiplexed) {
+        // Multiplexed: first 4 bytes = connId, rest = payload
+        if (buf.length < 4) return;
+        const connId = buf.readUInt32BE(0);
+        const payload = buf.slice(4);
+        const socks = connections.get(connId);
+        if (socks) {
+          try { socks.write(payload); } catch (e) {}
+        }
+      } else {
+        // Legacy: raw data goes to the single SOCKS5 connection
+        if (legacySocket) {
+          try { legacySocket.write(buf); } catch (e) {}
+        }
+      }
     }
   });
 
-  ws.on("close", () => cleanup());
-  ws.on("error", () => cleanup());
-  function cleanup() { try { ws.close(); } catch (e) {} try { torSocket?.end(); } catch (e) {} }
+  function cleanupConn(connId) {
+    const socks = connections.get(connId);
+    if (socks) {
+      connections.delete(connId);
+      try { socks.end(); } catch (e) {}
+    }
+  }
+
+  function cleanupAll() {
+    for (const [connId, socks] of connections) {
+      try { socks.end(); } catch (e) {}
+    }
+    connections.clear();
+    try { legacySocket?.end(); } catch (e) {}
+    legacySocket = null;
+  }
+
+  ws.on("close", () => cleanupAll());
+  ws.on("error", () => cleanupAll());
 });
 
 server.on("upgrade", (req, socket, head) => {

@@ -608,111 +608,238 @@ function tlsConnectProxy(targetHost, targetPort, timeout = 30000) {
 // Raw tls.connect() + manual WebSocket upgrade always works.
 const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB5E4BE6AC6";
 
-function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
-  // Duplex-based WebSocket proxy: bridges TLS ↔ WebSocket without a local TCP bridge.
-  // Node.js 22+ tls.connect({socket: Duplex}) works with paused-stream semantics.
-  return new Promise((resolve, reject) => {
+// ── Persistent Tunnel Pool ──
+// Keeps WebSocket connections alive and multiplexes multiple SOCKS5 tunnels
+// over a single WebSocket, eliminating the ~2s WS connect time on subsequent requests.
+// Protocol:
+//   Control: JSON text frames {type, connId, host, port}
+//   Data:    Binary frames  [4-byte connId BE][payload]
+class TunnelPool {
+  constructor() {
+    this.ws = null;
+    this.connections = new Map(); // connId -> { duplex, resolve, reject, timer }
+    this.nextId = 1;
+    this.pendingOpen = null;
+  }
+
+  async _ensureWebSocket() {
+    if (this.ws) {
+      if (this.ws.readyState === WebSocket.OPEN) return this.ws;
+      if (this.ws.readyState === WebSocket.CONNECTING && this.pendingOpen) {
+        return this.pendingOpen;
+      }
+    }
+
     const proxyUrl = PROXY_URL || '';
-    if (!proxyUrl) return reject(new Error('no proxy URL'));
-    if (!WebSocket) return reject(new Error('ws library not available'));
+    if (!proxyUrl) throw new Error('no proxy URL');
+    if (!WebSocket) throw new Error('ws library not available');
 
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (!settled) { settled = true; reject(new Error('ws timeout')); }
-    }, timeout);
+    this.ws = new WebSocket(proxyUrl);
+    this.pendingOpen = new Promise((resolve, reject) => {
+      const onopen = () => resolve(this.ws);
+      const onerror = (e) => { this._invalidateAll(e); reject(e); };
+      this.ws.once('open', onopen);
+      this.ws.once('error', onerror);
+      // Timeout for WebSocket connection
+      setTimeout(() => {
+        if (this.ws && this.ws.readyState !== WebSocket.OPEN) {
+          this.ws.close();
+          const err = new Error('pool WS connect timeout');
+          this._invalidateAll(err);
+          reject(err);
+        }
+      }, 30000);
+    });
 
-    let ws;
-    try { ws = new WebSocket(proxyUrl); } catch(e) { clearTimeout(timer); reject(e); return; }
+    // Message router: dispatches incoming frames to the correct tunnel
+    this.ws.on('message', (data) => {
+      if (typeof data === 'string') {
+        // Text frame — JSON control message
+        try {
+          const msg = JSON.parse(data);
+          const conn = msg.connId != null ? this.connections.get(msg.connId) : null;
+          if (!conn) return;
 
-    // Buffer for data written before tunnel is ready (TLS ClientHello can arrive early)
-    let pendingWriteBuffer = [];
-    let tunnelReady = false;
+          if (msg.type === 'connected') {
+            clearTimeout(conn.timer);
+            conn.resolve(conn.duplex);
+          } else if (msg.type === 'error') {
+            clearTimeout(conn.timer);
+            this.connections.delete(msg.connId);
+            conn.reject(new Error(msg.message || 'tunnel error'));
+          }
+        } catch (e) {}
+      } else {
+        // Binary frame — [4-byte connId BE][payload]
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        if (buf.length < 4) return;
+        const connId = buf.readUInt32BE(0);
+        const payload = buf.slice(4);
+        const conn = this.connections.get(connId);
+        if (conn) {
+          if (!conn.duplex.push(payload)) {
+            // Backpressure: WebSocket layer will buffer
+          }
+        }
+      }
+    });
 
-    // Create Duplex that bridges WebSocket ↔ stream
-    // This replaces the local TCP bridge (net.Server + net.Socket loopback),
-    // eliminating the localhost TCP overhead and simplifying the data path.
+    this.ws.on('close', () => this._invalidateAll(new Error('pool WebSocket closed')));
+    this.ws.on('error', () => {}); // handled by _invalidateAll on close
+
+    try {
+      return await this.pendingOpen;
+    } finally {
+      this.pendingOpen = null;
+    }
+  }
+
+  _invalidateAll(err) {
+    for (const [connId, conn] of this.connections) {
+      clearTimeout(conn.timer);
+      try { conn.duplex.destroy(err); } catch (e) {}
+    }
+    this.connections.clear();
+    this.ws = null;
+    this.pendingOpen = null;
+  }
+
+  async createTunnel(host, port, timeout = 30000) {
+    const ws = await this._ensureWebSocket();
+    const connId = this.nextId++;
+
     const duplex = new Duplex({
-      write(data, encoding, callback) {
-        if (!tunnelReady) {
-          pendingWriteBuffer.push(Buffer.from(data));
-          callback();
+      write: (data, encoding, callback) => {
+        if (ws.readyState !== WebSocket.OPEN) {
+          callback(new Error('pool WebSocket not open'));
           return;
         }
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(data, { binary: true }, callback);
-        } else {
-          callback(new Error('WebSocket closed'));
-        }
+        const header = Buffer.alloc(4);
+        header.writeUInt32BE(connId);
+        ws.send(Buffer.concat([header, data]), { binary: true }, callback);
       },
-      read(size) {
-        // Data pushed from ws.on('message')
-      },
-      destroy(err, callback) {
-        try { ws.close(); } catch(e) {}
+      read: () => {},
+      destroy: (err, callback) => {
+        this.connections.delete(connId);
+        try { ws.send(JSON.stringify({ type: "disconnect", connId })); } catch (e) {}
         callback(err);
       }
     });
     duplex.setMaxListeners(0);
 
-    // Forward WebSocket messages to Duplex readable
-    ws.on('message', (data) => {
-      if (settled) return;
+    const conn = { duplex, resolve: null, reject: null, timer: null };
+    this.connections.set(connId, conn);
 
-      // Check for JSON control messages from relay
-      const str = typeof data === 'string' ? data : (Buffer.isBuffer(data) ? data.toString() : '');
-      if (str.length > 0 && str[0] === '{') {
-        try {
-          const parsed = JSON.parse(str);
-          if (parsed.status === 'connected') {
-            tunnelReady = true;
-            clearTimeout(timer);
-            // Drain buffered writes
-            if (pendingWriteBuffer.length > 0) {
-              const buf = Buffer.concat(pendingWriteBuffer);
-              pendingWriteBuffer = [];
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(buf, { binary: true }, () => {});
-              }
-            }
-            // Resolve with the Duplex stream that TLS will wrap
-            if (!settled) { settled = true; resolve(duplex); }
-            return;
-          }
-          if (parsed.error) {
-            clearTimeout(timer);
-            if (!settled) { settled = true; reject(new Error(parsed.error)); }
-            return;
-          }
-        } catch(e) {}
-      }
+    // Send connect request to relay
+    ws.send(JSON.stringify({ type: "connect", connId, host, port }));
 
-      // Binary data from relay → Duplex readable
-      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-      if (!duplex.push(buf)) {
-        // Backpressure: relay will buffer in WebSocket layer
-      }
+    return new Promise((resolve, reject) => {
+      conn.resolve = resolve;
+      conn.reject = reject;
+      conn.timer = setTimeout(() => {
+        this.connections.delete(connId);
+        reject(new Error('tunnel connect timeout'));
+      }, timeout);
     });
-
-    ws.on('open', () => {
-      ws.send(JSON.stringify({ host: targetHost, port: targetPort }), { binary: false });
-    });
-
-    ws.on('error', (e) => {
-      clearTimeout(timer);
-      if (!settled) { settled = true; reject(e); }
-    });
-
-    ws.on('close', () => {
-      clearTimeout(timer);
-      if (!tunnelReady && !settled) {
-        settled = true;
-        reject(new Error('WebSocket closed before tunnel ready'));
-      }
-      duplex.push(null);
-    });
-  });
+  }
 }
 
+// Singleton tunnel pool instance
+let _tunnelPool = null;
+function getTunnelPool() {
+  if (!_tunnelPool) _tunnelPool = new TunnelPool();
+  return _tunnelPool;
+}
+
+// ── WebSocket proxy connection (via persistent tunnel pool) ──
+// Uses TunnelPool to reuse WebSocket connections across multiple TLS tunnels.
+// This saves ~250-2000ms per request (varies by geographic distance to Render).
+// Falls back to direct WebSocket connection if pool is unavailable.
+function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
+  // Try the persistent pool first
+  const pool = getTunnelPool();
+  return pool.createTunnel(targetHost, targetPort, timeout)
+    .catch((poolErr) => {
+      // Pool failed (WS disconnected, timeout, etc.) — fall back to one-shot WebSocket
+      log(`tunnel pool failed (${poolErr.message}), falling back to one-shot WS`);
+
+      return new Promise((resolve, reject) => {
+        const proxyUrl = PROXY_URL || '';
+        if (!proxyUrl) return reject(new Error('no proxy URL'));
+        if (!WebSocket) return reject(new Error('ws library not available'));
+
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (!settled) { settled = true; reject(new Error('ws timeout')); }
+        }, timeout);
+
+        let ws;
+        try { ws = new WebSocket(proxyUrl); } catch(e) { clearTimeout(timer); reject(e); return; }
+
+        let pendingWriteBuffer = [];
+        let tunnelReady = false;
+
+        const duplex = new Duplex({
+          write(data, encoding, callback) {
+            if (!tunnelReady) {
+              pendingWriteBuffer.push(Buffer.from(data));
+              callback();
+              return;
+            }
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(data, { binary: true }, callback);
+            } else {
+              callback(new Error('WebSocket closed'));
+            }
+          },
+          read(size) {},
+          destroy(err, callback) {
+            try { ws.close(); } catch(e) {}
+            callback(err);
+          }
+        });
+        duplex.setMaxListeners(0);
+
+        ws.on('message', (data) => {
+          if (settled) return;
+          const str = typeof data === 'string' ? data : (Buffer.isBuffer(data) ? data.toString() : '');
+          if (str.length > 0 && str[0] === '{') {
+            try {
+              const parsed = JSON.parse(str);
+              if (parsed.status === 'connected' || parsed.type === 'connected') {
+                tunnelReady = true;
+                clearTimeout(timer);
+                if (pendingWriteBuffer.length > 0) {
+                  const buf = Buffer.concat(pendingWriteBuffer);
+                  pendingWriteBuffer = [];
+                  if (ws.readyState === WebSocket.OPEN) ws.send(buf, { binary: true }, () => {});
+                }
+                if (!settled) { settled = true; resolve(duplex); }
+                return;
+              }
+              if (parsed.error) {
+                clearTimeout(timer);
+                if (!settled) { settled = true; reject(new Error(parsed.error)); }
+                return;
+              }
+            } catch(e) {}
+          }
+          const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+          if (!duplex.push(buf)) {}
+        });
+
+        ws.on('open', () => {
+          ws.send(JSON.stringify({ host: targetHost, port: targetPort }), { binary: false });
+        });
+        ws.on('error', (e) => { clearTimeout(timer); if (!settled) { settled = true; reject(e); } });
+        ws.on('close', () => {
+          clearTimeout(timer);
+          if (!tunnelReady && !settled) { settled = true; reject(new Error('WebSocket closed before tunnel ready')); }
+          duplex.push(null);
+        });
+      });
+    });
+}
 // HTTP CONNECT proxy fallback
 function httpConnectProxy(targetHost, targetPort, timeout = 30000) {
   return new Promise((resolve, reject) => {
