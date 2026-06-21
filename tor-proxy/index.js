@@ -356,6 +356,12 @@ function handleHttpRequest(socket, data) {
   const raw = data.toString();
   const reqLine = raw.split("\r\n")[0];
 
+  // WebSocket upgrade (must check before GET/HEAD — both are GET /)
+  if (raw.includes("Upgrade: websocket") || raw.includes("upgrade: websocket")) {
+    handleWsFromRaw(socket, data);
+    return;
+  }
+
   // Health check
   if (reqLine.startsWith("GET ") || reqLine.startsWith("HEAD ")) {
     const body = JSON.stringify({
@@ -366,12 +372,6 @@ function handleHttpRequest(socket, data) {
     });
     socket.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n" + body);
     socket.end();
-    return;
-  }
-
-  // WebSocket upgrade
-  if (raw.includes("Upgrade: websocket") || raw.includes("upgrade: websocket")) {
-    handleWsFromRaw(socket, data);
     return;
   }
 
