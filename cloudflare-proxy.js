@@ -617,8 +617,9 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
 
     ws.on('open', () => {
       ws.send(JSON.stringify({ host: targetHost, port: targetPort }), { binary: false });
-      // Drain any local data that was buffered before WS connected
-      if (drainPendingLocal) drainPendingLocal();
+      // Don't drain local data yet - wait for {status:"connected"} first.
+      // Sending TLS ClientHello before the relay finishes SOCKS5 connect
+      // causes JSON.parse() to fail on binary data, triggering cleanup() on the relay.
     });
 
     // Buffer incoming WS messages until localSocket is ready.
