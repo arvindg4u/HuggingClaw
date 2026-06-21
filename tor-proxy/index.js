@@ -152,22 +152,18 @@ function handleHttpConnect(clientSocket, firstData) {
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB5E4BE6AC6";
 
-// ── WebSocket upgrade handler ──
-function handleWebSocket(clientSocket, firstData) {
-  const req = firstData.toString() + "\r\n"; // the "\r\n\r\n" was split — restore
-  const keyMatch = req.match(/Sec-WebSocket-Key:\s*(\S+)/i);
-  if (!keyMatch) {
-    clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
-    clientSocket.destroy();
-    return;
-  }
+// ── WebSocket upgrade handler (from HTTP server 'upgrade' event) ──
+// Node's http parser has already parsed the request headers.
+function handleWsUpgrade(req, socket, head) {
+  const key = req.headers["sec-websocket-key"];
+  if (!key) { socket.destroy(); return; }
 
   const accept = crypto
     .createHash("sha1")
-    .update(keyMatch[1] + WS_GUID)
+    .update(key + WS_GUID)
     .digest("base64");
 
-  clientSocket.write(
+  socket.write(
     "HTTP/1.1 101 Switching Protocols\r\n" +
     "Upgrade: websocket\r\n" +
     "Connection: Upgrade\r\n" +
@@ -175,8 +171,42 @@ function handleWebSocket(clientSocket, firstData) {
     "\r\n"
   );
 
-  // Read the initial JSON config from the client (masked WS frame)
-  let frameBuf = Buffer.alloc(0);
+  // Start frame relay — head may contain first frame data
+  startWsRelay(socket, head);
+}
+
+// ── WebSocket handler (from raw connection sniff) ──
+// We have raw HTTP text — extract key, send 101, start relay.
+function handleWsFromRaw(socket, rawData) {
+  const raw = rawData.toString();
+  const m = raw.match(/Sec-WebSocket-Key:\s*(\S+)/i);
+  if (!m) { socket.destroy(); return; }
+
+  const accept = crypto
+    .createHash("sha1")
+    .update(m[1] + WS_GUID)
+    .digest("base64");
+
+  socket.write(
+    "HTTP/1.1 101 Switching Protocols\r\n" +
+    "Upgrade: websocket\r\n" +
+    "Connection: Upgrade\r\n" +
+    "Sec-WebSocket-Accept: " + accept + "\r\n" +
+    "\r\n"
+  );
+
+  // The rawData still has the HTTP headers read already — parse past them
+  const idx = rawData.indexOf("\r\n\r\n");
+  const bodyStart = idx >= 0 ? idx + 4 : rawData.length;
+  const initialData = rawData.slice(bodyStart);
+  startWsRelay(socket, initialData);
+}
+
+// ── WebSocket frame relay → Tor SOCKS5 ──
+// Reads masked WS frames, extracts config JSON, connects to Tor,
+// then relays bidirectionally (WS frames ↔ Tor TCP).
+function startWsRelay(clientSocket, initialData) {
+  let frameBuf = Buffer.isBuffer(initialData) ? initialData : Buffer.alloc(0);
   let expectingConfig = true;
   let torSocket = null;
 
@@ -320,9 +350,9 @@ function handleWebSocket(clientSocket, firstData) {
   clientSocket.on("close", cleanup);
 }
 
-// ── HTTP server (health check + protocol detection) ──
+// ── HTTP server (health check) ──
 const server = http.createServer((req, res) => {
-  // Health check
+  // Health check — only reached for non-Upgrade HTTP requests
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({
     status: "ok",
@@ -332,11 +362,23 @@ const server = http.createServer((req, res) => {
   }));
 });
 
-// Detect protocol on raw TCP connection
+// Handle WebSocket upgrades through the HTTP server's upgrade event.
+// Render's reverse proxy forwards WS upgrades as normal HTTP/1.1
+// Upgrade requests — Node's http parser handles them and emits 'upgrade'.
+server.on("upgrade", (req, socket, head) => {
+  handleWsUpgrade(req, socket, head);
+});
+
+// Detect non-HTTP protocols (SOCKS5, HTTP CONNECT) on raw TCP
 server.on("connection", (socket) => {
+  // Pause to prevent Node's internal HTTP parser from stealing data
+  // before we determine the protocol. We'll resume for HTTP traffic.
+  socket.pause();
+
   socket.once("data", (data) => {
     if (data.length === 0) return;
     const firstByte = data[0];
+    const str = data.toString();
 
     if (firstByte === 0x05) {
       // SOCKS5
@@ -344,12 +386,13 @@ server.on("connection", (socket) => {
     } else if (firstByte === 0x43) {
       // 'C' — HTTP CONNECT
       handleHttpConnect(socket, data);
-    } else if (data.toString().includes("Upgrade: websocket") || data.toString().includes("upgrade: websocket")) {
-      // WebSocket upgrade
-      handleWebSocket(socket, data);
+    } else if (str.includes("Upgrade: websocket") || str.includes("upgrade: websocket")) {
+      // WebSocket upgrade from raw connection (non-Render proxy path)
+      handleWsFromRaw(socket, data);
     } else {
-      // Regular HTTP — re-emit to HTTP server
+      // Regular HTTP — re-emit and resume
       socket.unshift(data);
+      socket.resume();
     }
   });
 });
