@@ -5,8 +5,8 @@ FROM samuelmoraesf/protonvpn-proxy:latest AS base
 FROM alpine:3.19
 RUN apk add --no-cache nodejs bash
 
-# Copy wireproxy binary from base image
-COPY --from=base /usr/bin/wireproxy /usr/bin/wireproxy
+# Copy wireproxy binary from base image (see Dockerfile: it's /usr/local/bin/)
+COPY --from=base /usr/local/bin/wireproxy /usr/local/bin/wireproxy
 
 # Copy entrypoint script to generate wireproxy config
 COPY --from=base /entrypoint.sh /entrypoint.sh
