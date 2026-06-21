@@ -442,11 +442,17 @@ net.connect = function(...args) {
   // Use proxyConnect which handles wss:// (WebSocket), socks5://, and direct fallback
   const socks = new net.Socket();
   socks._hc_proxied = true;
+  socks._hc_writeBuf = [];
 
   proxyConnect(opts.host || "localhost", opts.port || 80)
     .then(s => {
       socks.emit("connect");
       socks._hc_socket = s;
+      if (socks._hc_writeBuf && socks._hc_writeBuf.length) {
+        const buf = socks._hc_writeBuf;
+        socks._hc_writeBuf = [];
+        buf.forEach(([d, a]) => { try { s.write(d, ...a); } catch (e) {} });
+      }
       s.on("data", (d) => { socks.emit("data", d); });
       s.on("end", () => { socks.emit("end"); });
       s.on("close", () => { socks.emit("close"); });
@@ -457,7 +463,12 @@ net.connect = function(...args) {
   socks._hc_write = socks.write;
   socks.write = function(data, ...args) {
     if (this._hc_socket) return this._hc_socket.write(data, ...args);
-    return this._hc_write.call(this, data, ...args);
+    // Buffer writes until tunnel is ready (fixes race condition)
+    if (this._hc_writeBuf) {
+      this._hc_writeBuf.push([Buffer.from(data), args]);
+      return true;
+    }
+    return net.Socket.prototype.write.call(this, data, ...args);
   };
 
   return socks;
@@ -494,6 +505,16 @@ tls.connect = function(...args) {
   // We return a socket immediately and upgrade it when tunnel is ready
   const pending = new net.Socket();
   pending._hc_tunnel_pending = true;
+  pending._hc_writeBuf = [];
+  // Override write immediately so early writes are buffered, not lost
+  pending.write = function(data, ...args) {
+    if (this._hc_tlsSocket) return this._hc_tlsSocket.write(data, ...args);
+    if (this._hc_writeBuf) {
+      this._hc_writeBuf.push([Buffer.from(data), args]);
+      return true;
+    }
+    return net.Socket.prototype.write.call(this, data, ...args);
+  };
 
   tunnelPromise.then((socks) => {
     const tlsSocket = origTlsConnect({
@@ -506,6 +527,8 @@ tls.connect = function(...args) {
     tlsSocket.on("secureConnect", () => {
       // Replace the pending socket by forwarding events
       pending.emit("connect");
+      // Call the TLS connect callback if provided
+      if (typeof cb === "function") cb();
       tlsSocket.on("data", (d) => pending.emit("data", d));
       tlsSocket.on("end", () => pending.emit("end"));
       tlsSocket.on("close", () => pending.emit("close"));
@@ -513,10 +536,12 @@ tls.connect = function(...args) {
     });
 
     pending._hc_tlsSocket = tlsSocket;
-    pending.write = function(data, ...args) {
-      if (this._hc_tlsSocket) return this._hc_tlsSocket.write(data, ...args);
-      return net.Socket.prototype.write.call(this, data, ...args);
-    };
+    // Drain buffered writes now that TLS socket is ready (even before secureConnect)
+    if (pending._hc_writeBuf && pending._hc_writeBuf.length) {
+      const buf = pending._hc_writeBuf;
+      pending._hc_writeBuf = [];
+      buf.forEach(([d, a]) => { try { tlsSocket.write(d, ...a); } catch (e) {} });
+    }
   }).catch(e => {
     pending.emit("error", e);
   });
