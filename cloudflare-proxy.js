@@ -652,8 +652,8 @@ class TunnelPool {
     });
 
     // Message router: dispatches incoming frames to the correct tunnel
-    this.ws.on('message', (data) => {
-      if (typeof data === 'string') {
+    this.ws.on('message', (data, isBinary) => {
+      if (!isBinary) {
         // Text frame — JSON control message
         try {
           const msg = JSON.parse(data);
