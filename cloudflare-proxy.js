@@ -170,6 +170,16 @@ const FALLBACK_DNS = {
   "wss.web.whatsapp.com": ["157.240.221.52", "157.240.223.52"],
 };
 
+// Pre-resolve proxy endpoint hostname (DNS cache avoids lookup on every WebSocket connection)
+if (SOCKS5_HOST && !getDNSOverride(SOCKS5_HOST)) {
+  dns.resolve4(SOCKS5_HOST, (err, ips) => {
+    if (!err && ips && ips.length > 0) {
+      DNS_OVERRIDE[SOCKS5_HOST] = ips;
+      log(`DNS cached ${SOCKS5_HOST} → ${ips.join(", ")}`);
+    }
+  });
+}
+
 function getDNSOverride(hostname) {
   const d = (hostname || "").toLowerCase();
   if (DNS_OVERRIDE[d] && DNS_OVERRIDE[d].length > 0) return DNS_OVERRIDE[d];
@@ -599,135 +609,106 @@ function tlsConnectProxy(targetHost, targetPort, timeout = 30000) {
 const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB5E4BE6AC6";
 
 function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
+  // Duplex-based WebSocket proxy: bridges TLS ↔ WebSocket without a local TCP bridge.
+  // Node.js 22+ tls.connect({socket: Duplex}) works with paused-stream semantics.
   return new Promise((resolve, reject) => {
     const proxyUrl = PROXY_URL || '';
     if (!proxyUrl) return reject(new Error('no proxy URL'));
     if (!WebSocket) return reject(new Error('ws library not available'));
 
-    const timer = setTimeout(() => reject(new Error('ws timeout')), timeout);
-    let wsTunnelReady = false;
-    let localSocketConnected = false;
-    let pendingWsData = [];
-    // Buffer for data arriving from local TCP bridge before WS is open and tunnel is ready.
-    // The TLS ClientHello can arrive before the WebSocket connects to Render (~1.2s delay).
-    // Silently dropping it causes a deadlock: both sides wait for data from the other.
-    let pendingLocalData = null;
-    let drainPendingLocal = null;
-    let sendOrBuffer = null;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) { settled = true; reject(new Error('ws timeout')); }
+    }, timeout);
 
     let ws;
     try { ws = new WebSocket(proxyUrl); } catch(e) { clearTimeout(timer); reject(e); return; }
 
-    ws.on('open', () => {
-      ws.send(JSON.stringify({ host: targetHost, port: targetPort }), { binary: false });
-      // Don't drain local data yet - wait for {status:"connected"} first.
-      // Sending TLS ClientHello before the relay finishes SOCKS5 connect
-      // causes JSON.parse() to fail on binary data, triggering cleanup() on the relay.
-    });
+    // Buffer for data written before tunnel is ready (TLS ClientHello can arrive early)
+    let pendingWriteBuffer = [];
+    let tunnelReady = false;
 
-    // Buffer incoming WS messages until localSocket is ready.
-    // After localSocket connects, stop buffering and forward directly via onWsMsg.
-    const onWsBuffer = (data) => {
-      if (!wsTunnelReady) {
-        const str = typeof data === 'string' ? data : data.toString();
+    // Create Duplex that bridges WebSocket ↔ stream
+    // This replaces the local TCP bridge (net.Server + net.Socket loopback),
+    // eliminating the localhost TCP overhead and simplifying the data path.
+    const duplex = new Duplex({
+      write(data, encoding, callback) {
+        if (!tunnelReady) {
+          pendingWriteBuffer.push(Buffer.from(data));
+          callback();
+          return;
+        }
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(data, { binary: true }, callback);
+        } else {
+          callback(new Error('WebSocket closed'));
+        }
+      },
+      read(size) {
+        // Data pushed from ws.on('message')
+      },
+      destroy(err, callback) {
+        try { ws.close(); } catch(e) {}
+        callback(err);
+      }
+    });
+    duplex.setMaxListeners(0);
+
+    // Forward WebSocket messages to Duplex readable
+    ws.on('message', (data) => {
+      if (settled) return;
+
+      // Check for JSON control messages from relay
+      const str = typeof data === 'string' ? data : (Buffer.isBuffer(data) ? data.toString() : '');
+      if (str.length > 0 && str[0] === '{') {
         try {
           const parsed = JSON.parse(str);
           if (parsed.status === 'connected') {
-            wsTunnelReady = true;
+            tunnelReady = true;
             clearTimeout(timer);
-            // Drain any local data that was buffered before tunnel was ready
-            if (drainPendingLocal) drainPendingLocal();
+            // Drain buffered writes
+            if (pendingWriteBuffer.length > 0) {
+              const buf = Buffer.concat(pendingWriteBuffer);
+              pendingWriteBuffer = [];
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(buf, { binary: true }, () => {});
+              }
+            }
+            // Resolve with the Duplex stream that TLS will wrap
+            if (!settled) { settled = true; resolve(duplex); }
             return;
           }
           if (parsed.error) {
             clearTimeout(timer);
-            reject(new Error(parsed.error));
+            if (!settled) { settled = true; reject(new Error(parsed.error)); }
             return;
           }
         } catch(e) {}
       }
-      if (localSocketConnected) {
-        // Forward directly - the bridge listener handles it
-      } else {
-        pendingWsData.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
-      }
-    };
-    ws.on('message', onWsBuffer);
 
-    ws.on('error', (e) => { clearTimeout(timer); reject(e); });
-    ws.on('close', () => { clearTimeout(timer); try { localServer.close(); } catch(e) {} });
-
-    // Local TCP bridge: gives tls.connect() a real net.Socket instead of
-    // a Duplex stream, avoiding Node.js TLS bugs with post-handshake data.
-    const localServer = net.createServer((localSocket) => {
-      localSocketConnected = true;
-      pendingLocalData = [];
-
-      // Buffer data from local TCP bridge until WS is open AND tunnel is ready
-      sendOrBuffer = (chunk) => {
-        if (ws.readyState === ws.OPEN && wsTunnelReady) {
-          try { ws.send(chunk, { binary: true, mask: true }); } catch(e) {}
-        } else {
-          pendingLocalData.push(chunk);
-        }
-      };
-      drainPendingLocal = () => {
-        if (pendingLocalData && pendingLocalData.length > 0) {
-          const chunk = Buffer.concat(pendingLocalData);
-          pendingLocalData = [];
-          if (ws.readyState === ws.OPEN) {
-            try { ws.send(chunk, { binary: true, mask: true }); } catch(e) {}
-          } else {
-            // WS still not open - keep buffering
-            pendingLocalData.push(chunk);
-          }
-        }
-      };
-      localSocket.on('data', sendOrBuffer);
-      localSocket.on('end', () => { try { ws.close(); } catch(e) {} });
-      localSocket.on('error', () => {});
-      localSocket.on('close', () => { try { localServer.close(); } catch(e) {} });
-
-      // Bridge: WebSocket -> localSocket (replaces the buffer handler)
-      ws.removeListener('message', onWsBuffer);
-      ws.on('message', (data) => {
-        // Filter out relay control messages that arrive before the bridge is set up.
-        // The relay sends {status:"connected"} as the first text frame, then binary frames.
-        // If bridge was set up before WS connected, the control frame hasn't been consumed.
-        const str = typeof data === 'string' ? data : (Buffer.isBuffer(data) ? data.toString() : '');
-        if (str.length > 0 && str[0] === '{') {
-          try {
-            const parsed = JSON.parse(str);
-            if (parsed.status === 'connected') {
-              wsTunnelReady = true;
-              clearTimeout(timer);
-              if (drainPendingLocal) drainPendingLocal();
-              return;
-            }
-            if (parsed.error) {
-              clearTimeout(timer);
-              reject(new Error(parsed.error));
-              return;
-            }
-          } catch(e) {}
-        }
-        // Forward binary data to local TCP bridge
-        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-        try { localSocket.write(buf); } catch(e) {}
-      });
-
-      // Drain any buffered WS->local messages
-      if (pendingWsData.length > 0) {
-        pendingWsData.splice(0).forEach((d) => { try { localSocket.write(d); } catch(e) {} });
+      // Binary data from relay → Duplex readable
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      if (!duplex.push(buf)) {
+        // Backpressure: relay will buffer in WebSocket layer
       }
     });
 
-    localServer.listen(0, '127.0.0.1', () => {
-      const localPort = localServer.address().port;
-      const tunnelSocket = net.createConnection({ port: localPort, host: '127.0.0.1' }, () => {
-        resolve(tunnelSocket);
-      });
-      tunnelSocket.on('error', (e) => { clearTimeout(timer); reject(e); });
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ host: targetHost, port: targetPort }), { binary: false });
+    });
+
+    ws.on('error', (e) => {
+      clearTimeout(timer);
+      if (!settled) { settled = true; reject(e); }
+    });
+
+    ws.on('close', () => {
+      clearTimeout(timer);
+      if (!tunnelReady && !settled) {
+        settled = true;
+        reject(new Error('WebSocket closed before tunnel ready'));
+      }
+      duplex.push(null);
     });
   });
 }
@@ -757,7 +738,7 @@ function httpConnectProxy(targetHost, targetPort, timeout = 30000) {
 applyFetchPatch();
 
 log(`SOCKS5 routing: ${SOCKS5_DOMAINS.join(", ")} → ${SOCKS5_HOST}:${SOCKS5_PORT}`);
-log(`wsConnectProxy: using local TCP bridge (control msg filtered, pendingLocalData buffered)`);
+log(`wsConnectProxy: using Duplex stream bridge`);
 log(`Cloudflare Worker proxy available for Telegram: ${CF_PROXY_URL || 'not configured'}`);
 log(`DNS override: ${Object.keys(DNS_OVERRIDE).join(", ")}`);
 
