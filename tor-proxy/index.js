@@ -102,12 +102,21 @@ wss.on("connection", (ws, req) => {
       }
     } else if (torSocket) {
       // Relay data to Tor
-      try { torSocket.write(data); } catch (e) {}
+      try {
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        torSocket.write(buf);
+      } catch (e) {
+        console.log("[ws] relay write error: " + e.message);
+        cleanup();
+      }
     }
   });
 
-  ws.on("close", () => cleanup());
-  ws.on("error", () => cleanup());
+  ws.on("close", (code, reason) => {
+    console.log("[ws] client closed: code=" + code + " reason=" + (reason ? reason.toString() : "none"));
+    cleanup();
+  });
+  ws.on("error", (e) => { console.log("[ws] client error: " + e.message); cleanup(); });
 
   function cleanup() {
     try { ws.close(); } catch (e) {}
