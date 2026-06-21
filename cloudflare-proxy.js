@@ -81,14 +81,13 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
       .catch(() => directConnect(targetHost, targetPort, timeout));
   }
 
-  // For https:// URLs: try WebSocket first with quick timeout (bypasses Cloudflare TCP blocks),
-  // then HTTP CONNECT, then direct
-  // Allow 30s for WebSocket proxy — cold Tor + cold Render free tier
-  // can take 10-20s to bootstrap. 8s was too short and caused fallback to
-  // direct TCP, which bypassed Tor and lost IP rotation.
+  // For https:// URLs: try WebSocket first (bypasses Cloudflare TCP blocks),
+  // then TLS+HTTP CONNECT (works through Cloudflare to Render),
+  // then HTTP CONNECT, then direct.
   return wsConnectProxy(targetHost, targetPort, Math.min(timeout, 30000))
-    .catch(() => httpConnectProxy(targetHost, targetPort, timeout)
-      .catch(() => directConnect(targetHost, targetPort, timeout)));
+    .catch(() => tlsConnectProxy(targetHost, targetPort, timeout)
+      .catch(() => httpConnectProxy(targetHost, targetPort, timeout)
+        .catch(() => directConnect(targetHost, targetPort, timeout))));
 }
 
 // Direct TCP connection (no proxy)
@@ -603,8 +602,9 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
     if (!WebSocket) return reject(new Error('ws library not available'));
 
     const timer = setTimeout(() => reject(new Error('ws timeout')), timeout);
-    let tunnel = null;
-    let connected = false;
+    let wsTunnelReady = false;
+    let localSocketConnected = false;
+    let pendingWsData = [];
 
     let ws;
     try { ws = new WebSocket(proxyUrl); } catch(e) { clearTimeout(timer); reject(e); return; }
@@ -613,42 +613,88 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
       ws.send(JSON.stringify({ host: targetHost, port: targetPort }), { binary: false });
     });
 
-    ws.on('message', (data) => {
-      if (!connected) {
-        let msg;
-        try { msg = JSON.parse(data.toString()); } catch(e) { return; }
-        if (msg.status === 'connected') {
-          connected = true;
-          clearTimeout(timer);
-          tunnel = new Duplex({
-            write(chunk, encoding, callback) {
-              if (ws.readyState === ws.OPEN) {
-                ws.send(chunk, { binary: true, mask: true }, callback);
-              } else {
-                callback(new Error('ws closed'));
-              }
-            },
-            final(callback) { try { ws.close(); } catch(e) {} callback(); },
-            read(size) {},
-            destroy(err, callback) { try { ws.close(); } catch(e) {} callback(err); },
-          });
-          tunnel._ended = false;
-          tunnel.setKeepAlive = tunnel.setTimeout = () => {};
-          resolve(tunnel);
-        } else if (msg.error) {
-          clearTimeout(timer);
-          reject(new Error(msg.error));
+    // Buffer incoming WS messages until localSocket is ready.
+    // After localSocket connects, stop buffering and forward directly via onWsMsg.
+    const onWsBuffer = (data) => {
+      if (!wsTunnelReady) {
+        const str = typeof data === 'string' ? data : data.toString();
+        try {
+          const parsed = JSON.parse(str);
+          if (parsed.status === 'connected') {
+            wsTunnelReady = true;
+            clearTimeout(timer);
+            return;
+          }
+          if (parsed.error) {
+            clearTimeout(timer);
+            reject(new Error(parsed.error));
+            return;
+          }
+        } catch(e) {}
+      }
+      if (localSocketConnected) {
+        // Forward directly - the bridge listener handles it
+      } else {
+        pendingWsData.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
+      }
+    };
+    ws.on('message', onWsBuffer);
+
+    ws.on('error', (e) => { clearTimeout(timer); reject(e); });
+    ws.on('close', () => { clearTimeout(timer); try { localServer.close(); } catch(e) {} });
+
+    // Local TCP bridge: gives tls.connect() a real net.Socket instead of
+    // a Duplex stream, avoiding Node.js TLS bugs with post-handshake data.
+    const localServer = net.createServer((localSocket) => {
+      localSocketConnected = true;
+
+      // Bridge: localSocket -> WebSocket
+      localSocket.on('data', (chunk) => {
+        try { if (ws.readyState === ws.OPEN) ws.send(chunk, { binary: true, mask: true }); } catch(e) {}
+      });
+      localSocket.on('end', () => { try { ws.close(); } catch(e) {} });
+      localSocket.on('error', () => {});
+      localSocket.on('close', () => { try { localServer.close(); } catch(e) {} });
+
+      // Bridge: WebSocket -> localSocket (replaces the buffer handler)
+      ws.removeListener('message', onWsBuffer);
+      ws.on('message', (data) => {
+        // Filter out relay control messages that arrive before the bridge is set up.
+        // The relay sends {status:"connected"} as the first text frame, then binary frames.
+        // If bridge was set up before WS connected, the control frame hasn't been consumed.
+        const str = typeof data === 'string' ? data : (Buffer.isBuffer(data) ? data.toString() : '');
+        if (str.length > 0 && str[0] === '{') {
+          try {
+            const parsed = JSON.parse(str);
+            if (parsed.status === 'connected') {
+              wsTunnelReady = true;
+              clearTimeout(timer);
+              return;
+            }
+            if (parsed.error) {
+              clearTimeout(timer);
+              reject(new Error(parsed.error));
+              return;
+            }
+          } catch(e) {}
         }
-      } else if (tunnel && !tunnel.destroyed) {
+        // Forward binary data to local TCP bridge
         const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-        tunnel.push(buf);
+        try { localSocket.write(buf); } catch(e) {}
+      });
+
+      // Drain any buffered data
+      if (pendingWsData.length > 0) {
+        pendingWsData.splice(0).forEach((d) => { try { localSocket.write(d); } catch(e) {} });
       }
     });
 
-    ws.on('error', (e) => { clearTimeout(timer); reject(e); });
-    ws.on('close', () => {
-      clearTimeout(timer);
-      if (tunnel && !tunnel._ended) { tunnel._ended = true; tunnel.push(null); }
+    localServer.listen(0, '127.0.0.1', () => {
+      const localPort = localServer.address().port;
+      const tunnelSocket = net.createConnection({ port: localPort, host: '127.0.0.1' }, () => {
+        resolve(tunnelSocket);
+      });
+      tunnelSocket.on('error', (e) => { clearTimeout(timer); reject(e); });
     });
   });
 }
