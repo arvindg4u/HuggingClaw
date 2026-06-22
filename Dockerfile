@@ -124,11 +124,15 @@ RUN chmod +x /home/node/app/start.sh \
               /home/node/app/multi-provider-key-rotator.cjs \
               /home/node/app/dns-resolve.py
 
+# ── Fix /tmp ownership (Docker build as root leaves root-owned files) ──
+RUN chown -R 1000:1000 /tmp/
+
 USER node
 
 ENV HOME=/home/node \
     OPENCLAW_VERSION=${OPENCLAW_VERSION} \
     PATH=/home/node/.local/bin:/usr/local/bin:$PATH \
+    OPENCLAW_TEMP_DIR=/home/node/.openclaw/tmp \
     NODE_PATH=/home/node/browser-deps/node_modules \
     NODE_OPTIONS="--require /home/node/app/dns-fix.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs --require /home/node/app/whatsapp-proxy.cjs"
 
