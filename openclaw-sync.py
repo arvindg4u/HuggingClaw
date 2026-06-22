@@ -108,6 +108,8 @@ def write_status(status: str, message: str) -> None:
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     tmp_path = STATUS_FILE.with_suffix(".tmp")
+    # Remove stale temp file if it exists (wrong permissions from previous run)
+    tmp_path.unlink(missing_ok=True)
     tmp_path.write_text(json.dumps(payload), encoding="utf-8")
     tmp_path.replace(STATUS_FILE)
 
