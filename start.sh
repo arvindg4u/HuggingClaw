@@ -695,12 +695,36 @@ if [ -n "${ALLOWED_ORIGINS:-}" ]; then
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq ".gateway.controlUi.allowedOrigins += $ORIGINS_JSON | .gateway.controlUi.allowedOrigins |= unique")
 fi
 
-# Telegram API root — DNS override in cloudflare-proxy.js handles resolution
-# to hardcoded IPs, so we just use the standard API endpoint directly.
-# If CLOUDFLARE_PROXY_URL is set, route Telegram through Cloudflare Worker proxy
-# This bypasses HF Spaces DNS blocks for api.telegram.org
+# Telegram API root — auto-probe at startup
+# HF Spaces blocks DNS for api.telegram.org.  We probe multiple endpoints
+# and set TELEGRAM_API_BASE to the first reachable one.  This env var is
+# consumed by telegram-proxy.cjs (fetch interception) AND exposed as
+# channels.telegram.apiRoot in the OpenClaw config so grammY uses it
+# directly.
+#
+# If CLOUDFLARE_PROXY_URL is set (Cloudflare Worker), it takes priority.
 TELEGRAM_API_ROOT="${CLOUDFLARE_PROXY_URL:+${CLOUDFLARE_PROXY_URL}/telegram}"
+
+# Probe for a working Telegram API endpoint
+if [ -z "$TELEGRAM_API_ROOT" ] && [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+  echo "[telegram] Probing API endpoints..."
+  for tg_url in "https://api.telegram.org" "https://telegram-api.mykdigi.com" "https://telegram-api-proxy-anonymous.pages.dev/api"; do
+    tg_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$tg_url" 2>/dev/null || echo "000")
+    if [ "$tg_status" != "000" ]; then
+      echo "[telegram] ✓ Reachable: $tg_url (HTTP $tg_status)"
+      TELEGRAM_API_ROOT="$tg_url"
+      break
+    else
+      echo "[telegram] ✗ Unreachable: $tg_url"
+    fi
+  done
+fi
+
+# Fall back to official if none worked
 TELEGRAM_API_ROOT="${TELEGRAM_API_ROOT:-https://api.telegram.org}"
+
+# Export for telegram-proxy.cjs to use at the fetch level
+export TELEGRAM_API_BASE="$TELEGRAM_API_ROOT"
 
 
 # Telegram (supports multiple user IDs, comma-separated)
@@ -860,7 +884,7 @@ echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
 # These preload scripts patch iframe embedding, API key rotation, and
 # proxy routing (ROUTE_ENDPOINT/ROUTE_TARGETS for SOCKS5/WS proxy).
 export NODE_PATH="${NODE_PATH:-/home/node/browser-deps/node_modules}"
-export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs --require /opt/cloudflare-proxy.js"
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/dns-fix.cjs --require /home/node/app/telegram-proxy.cjs --require /home/node/app/multi-provider-key-rotator.cjs --require /opt/cloudflare-proxy.js"
 
 # ── Startup Summary ──
 echo ""

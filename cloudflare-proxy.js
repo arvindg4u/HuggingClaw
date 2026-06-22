@@ -366,26 +366,22 @@ function applyFetchPatch() {
     if (req.headers.get("x-hc") === "true") return origFetch.call(this, input, init);
 
     // ── Telegram: use Cloudflare Worker proxy directly (fast path, no SOCKS5) ──
+    // Falls through to origFetch (telegram-proxy.cjs mirror rewrite) if both
+    // Worker + direct IPs fail, so we never block Telegram traffic entirely.
     if (url.hostname === 'api.telegram.org') {
       log(`Telegram fetch intercepted, CF_PROXY_URL=${CF_PROXY_URL ? 'set' : 'not set'}`);
-      return new Promise((resolve, reject) => {
-        telegramViaWorker(url, { method: req.method, headers: Object.fromEntries(req.headers.entries()) })
-          .then(r => {
-            if (r) {
-              log(`Telegram via Worker SUCCESS (status=${r.status})`);
-              resolve(r);
-              return;
-            }
-            log('Telegram Worker returned null, trying direct IPs...');
-            telegramDirectIpFallback(url, { method: req.method, headers: Object.fromEntries(req.headers.entries()) })
-              .then(r2 => {
-                if (r2) { log(`Telegram via direct IP SUCCESS`); resolve(r2); }
-                else reject(new Error('Telegram unreachable'));
-              })
-              .catch(reject);
-          })
-          .catch(reject);
-      });
+      return (async () => {
+        try {
+          const r = await telegramViaWorker(url, { method: req.method, headers: Object.fromEntries(req.headers.entries()) });
+          if (r) { log(`Telegram via Worker SUCCESS (status=${r.status})`); return r; }
+        } catch (_) {}
+        try {
+          const r2 = await telegramDirectIpFallback(url, { method: req.method, headers: Object.fromEntries(req.headers.entries()) });
+          if (r2) { log(`Telegram via direct IP SUCCESS`); return r2; }
+        } catch (_) {}
+        log('Telegram Worker + direct IPs failed, falling through to telegram-proxy.cjs mirror...');
+        return origFetch.call(this, input, init);
+      })();
     }
 
     // ── WhatsApp: route through Cloudflare Worker ──
