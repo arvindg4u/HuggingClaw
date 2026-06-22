@@ -780,12 +780,16 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   TELEGRAM_CONFIG_ENABLED=true
 fi
 if [ -f "$EXISTING_CONFIG" ]; then
-  echo "Restored config found — patching gateway.auth.token only..."
+  echo "Restored config found — patching token + apiRoot..."
   PATCHED=$(jq \
     --arg token "$GATEWAY_TOKEN" \
+    --arg tg_api_root "${TELEGRAM_API_ROOT:-}" \
+    --arg tg_bot_token "${TELEGRAM_BOT_TOKEN:-}" \
     '.gateway.auth.token = $token
      | del(.["web.whatsapp"])
-     | del(.gateway.controlUi.dangerouslyDisableDeviceAuth)' \
+     | del(.gateway.controlUi.dangerouslyDisableDeviceAuth)
+     | if $tg_api_root != "" then .channels.telegram.apiRoot = $tg_api_root else . end
+     | if $tg_bot_token != "" then .channels.telegram.botToken = $tg_bot_token else . end' \
     "$EXISTING_CONFIG" 2>/dev/null)
 
   if [ -n "$PATCHED" ]; then
