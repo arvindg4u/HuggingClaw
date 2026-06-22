@@ -241,7 +241,7 @@ wss.on("connection", (clientWs, req) => {
 
 // ── Self-ping every 10min to prevent Render free tier sleep ─────────────
 setInterval(() => {
-  http.get(\`http://127.0.0.1:\${PORT}/health\`, (r) => r.resume());
+  http.get(`http://127.0.0.1:${PORT}/health`, (r) => r.resume());
 }, 10 * 60 * 1000);
 
 // ── Start server ────────────────────────────────────────────────────────
