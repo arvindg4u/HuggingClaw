@@ -107,11 +107,17 @@ def write_status(status: str, message: str) -> None:
         "message": message,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    tmp_path = STATUS_FILE.with_suffix(".tmp")
-    # Remove stale temp file if it exists (wrong permissions from previous run)
-    tmp_path.unlink(missing_ok=True)
+    # Write to a unique temp path each time to avoid permission issues
+    # with stale temp files owned by a different user (root in Docker build).
+    tmp_path = Path(tempfile.mkstemp(prefix="huggingclaw-status-", suffix=".json", dir="/tmp")[1])
     tmp_path.write_text(json.dumps(payload), encoding="utf-8")
-    tmp_path.replace(STATUS_FILE)
+    try:
+        tmp_path.replace(STATUS_FILE)
+    except PermissionError:
+        # If STATUS_FILE is owned by another user, write directly instead
+        STATUS_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def read_status() -> dict[str, str]:
