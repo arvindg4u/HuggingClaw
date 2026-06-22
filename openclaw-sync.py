@@ -36,6 +36,10 @@ from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 OPENCLAW_HOME = Path("/home/node/.openclaw")
+# Additional paths to include in backup (e.g., Jupyter-visible directories)
+EXTRA_BACKUP_PATHS = [
+    Path("/OpenClaw-Home"),
+]
 OPENCLAW_CONFIG_FILE = OPENCLAW_HOME / "openclaw.json"
 WORKSPACE = OPENCLAW_HOME / "workspace"
 STATUS_FILE = Path("/tmp/sync-status.json")
@@ -196,6 +200,28 @@ def snapshot_state_into_workspace() -> None:
             print(
                 "Warning: OpenClaw state snapshot had copy failures; updated remaining state entries."
             )
+        # Also copy extra backup paths (e.g., /OpenClaw-Home/extensions/)
+        for extra_path in EXTRA_BACKUP_PATHS:
+            if not extra_path.exists():
+                continue
+            for item in extra_path.iterdir():
+                name = item.name
+                if name in EXCLUDED_STATE_NAMES:
+                    continue
+                backup_target = staging_dir / name
+                try:
+                    if backup_target.exists():
+                        if backup_target.is_dir():
+                            shutil.rmtree(backup_target, ignore_errors=True)
+                        else:
+                            backup_target.unlink(missing_ok=True)
+                    if item.is_dir():
+                        shutil.copytree(item, backup_target)
+                    elif item.is_file():
+                        shutil.copy2(item, backup_target)
+                except Exception as exc:
+                    print(f"Warning: could not back up extra path {item}: {exc}")
+
         # Atomically swap staging → real backup dir
         if OPENCLAW_STATE_BACKUP_DIR.exists():
             shutil.rmtree(OPENCLAW_STATE_BACKUP_DIR, ignore_errors=True)
