@@ -819,7 +819,7 @@ if [ -f "$EXISTING_CONFIG" ]; then
          | del(.channels.whatsapp)
          | del(.web.whatsapp)
        else
-         del(.web.whatsapp)
+         .
        end
      | if $telegramConfigured then
          .channels.telegram = (($desired.channels.telegram // {}) * (.channels.telegram // {}))
