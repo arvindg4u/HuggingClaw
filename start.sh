@@ -763,11 +763,11 @@ if [ "$WHATSAPP_ENABLED_NORMALIZED" = "true" ]; then
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.channels.whatsapp = {"dmPolicy": "pairing"}')
   # Baileys socket timing overrides — prevents 408 timeout behind proxy
   # OpenClaw docs: https://docs.openclaw.ai/channels/whatsapp#runtime-model
-  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '. + {"web.whatsapp": {
+  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.web.whatsapp = {
     "keepAliveIntervalMs": 30000,
     "connectTimeoutMs": 60000,
     "defaultQueryTimeoutMs": 60000
-  }}')
+  }')
 fi
 
 # Write config
@@ -807,7 +807,7 @@ if [ -f "$EXISTING_CONFIG" ]; then
      | .plugins.deny = (((.plugins.deny // []) + ($desired.plugins.deny // [])) | unique)
      | .plugins.entries = ((.plugins.entries // {}) * ($desired.plugins.entries // {}))
      | .models = ((.models // {}) * ($desired.models // {}))
-     | if $desired["web.whatsapp"] then .["web.whatsapp"] = $desired["web.whatsapp"] else . end
+     | if $desired.web then .web = ((.web // {}) * $desired.web) else . end
      | if $whatsappEnabled then
          ($desired.channels.whatsapp // {"dmPolicy": "pairing"}) as $desiredWhatsapp
          | .plugins.entries.whatsapp.enabled = true
@@ -817,8 +817,9 @@ if [ -f "$EXISTING_CONFIG" ]; then
        elif $whatsappConfigured then
          .plugins.entries.whatsapp.enabled = false
          | del(.channels.whatsapp)
+         | del(.web.whatsapp)
        else
-         .
+         del(.web.whatsapp)
        end
      | if $telegramConfigured then
          .channels.telegram = (($desired.channels.telegram // {}) * (.channels.telegram // {}))
@@ -850,6 +851,8 @@ if [ -f "$EXISTING_CONFIG" ]; then
             if .value.command then del(.) else . end
           )
         else . end
+    
+      | del(.["web.whatsapp"])  # remove invalid root-level key from old configs
     ' "$EXISTING_CONFIG" 2>/dev/null) && echo "$CLEANED" > "$EXISTING_CONFIG" && echo "Config cleaned."
   else
     echo "Patch failed — writing fresh config."
