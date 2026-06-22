@@ -781,79 +781,18 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   TELEGRAM_CONFIG_ENABLED=true
 fi
 if [ -f "$EXISTING_CONFIG" ]; then
-  echo "Restored config found — patching required fields and runtime channel/plugin toggles..."
+  echo "Restored config found — patching gateway.auth.token only..."
   PATCHED=$(jq \
     --arg token "$GATEWAY_TOKEN" \
-    --arg model "$LLM_MODEL" \
-    --arg fileLevel "$OPENCLAW_FILE_LOG_LEVEL" \
-    --arg consoleLevel "$OPENCLAW_CONSOLE_LOG_LEVEL" \
-    --arg consoleStyle "$OPENCLAW_CONSOLE_LOG_STYLE" \
-    --argjson desired "$CONFIG_JSON" \
-    --argjson fileLogConfigured "$OPENCLAW_FILE_LOG_LEVEL_CONFIGURED" \
-    --argjson consoleLogConfigured "$OPENCLAW_CONSOLE_LOG_LEVEL_CONFIGURED" \
-    --argjson consoleStyleConfigured "$OPENCLAW_CONSOLE_LOG_STYLE_CONFIGURED" \
-    --argjson whatsappConfigured "$WHATSAPP_ENABLED_CONFIGURED" \
-    --argjson whatsappEnabled "$WHATSAPP_CONFIG_ENABLED" \
-    --argjson telegramConfigured "$TELEGRAM_CONFIG_ENABLED" \
-    '(.channels.whatsapp // {}) as $existingWhatsapp
-     | .gateway.auth.token = $token
-     | .agents.defaults.model = $model
-     | .gateway.port = ($desired.gateway.port // .gateway.port)
-     | if $fileLogConfigured then .logging.level = $fileLevel else . end
-     | if $consoleLogConfigured then .logging.consoleLevel = $consoleLevel else . end
-     | if $consoleStyleConfigured then .logging.consoleStyle = $consoleStyle else . end
-     | .channels = ((.channels // {}) * ($desired.channels // {}))
-     | .plugins.allow = (((.plugins.allow // []) + ($desired.plugins.allow // [])) | unique)
-     | .plugins.deny = (((.plugins.deny // []) + ($desired.plugins.deny // [])) | unique)
-     | .plugins.entries = ((.plugins.entries // {}) * ($desired.plugins.entries // {}))
-     | .models = ((.models // {}) * ($desired.models // {}))
-     | if $desired.web then .web = ((.web // {}) * $desired.web) else . end
-     | if $whatsappEnabled then
-         ($desired.channels.whatsapp // {"dmPolicy": "pairing"}) as $desiredWhatsapp
-         | .plugins.entries.whatsapp.enabled = true
-         | .channels.whatsapp = (($existingWhatsapp * $desiredWhatsapp)
-             | if ($existingWhatsapp | has("dmPolicy")) then .dmPolicy = $existingWhatsapp.dmPolicy else . end
-             | if ($existingWhatsapp | has("allowFrom")) then .allowFrom = $existingWhatsapp.allowFrom else . end)
-       elif $whatsappConfigured then
-         .plugins.entries.whatsapp.enabled = false
-         | del(.channels.whatsapp)
-         | del(.web.whatsapp)
-       else
-         .
-       end
-     | if $telegramConfigured then
-         .channels.telegram = (($desired.channels.telegram // {}) * (.channels.telegram // {}))
-         | .channels.telegram.botToken = $desired.channels.telegram.botToken
-       else
-         del(.channels.telegram)
-         | .plugins.entries.telegram.enabled = false
-       end' \
+    '.gateway.auth.token = $token
+     | del(.["web.whatsapp"])
+     | del(.gateway.controlUi.dangerouslyDisableDeviceAuth)' \
     "$EXISTING_CONFIG" 2>/dev/null)
 
   if [ -n "$PATCHED" ]; then
     echo "$PATCHED" > "$EXISTING_CONFIG.tmp" \
       && mv "$EXISTING_CONFIG.tmp" "$EXISTING_CONFIG"
-    echo "Config patched successfully."
-    # Strip deprecated/incompatible fields that the current OpenClaw version rejects
-    # Old backups may have: agents.defaults.models (empty {} objects),
-    # gateway.controlUi.dangerouslyDisableDeviceAuth (removed),
-    # models.providers.*.api (renamed to apiType), old MCP command format
-    CLEANED=$(jq '
-      del(.agents.defaults.models)
-      | del(.gateway.controlUi.dangerouslyDisableDeviceAuth)
-      | if .mcp.servers then
-          .mcp.servers |= with_entries(
-            select(.value.command == null and .value.url != null)
-          )
-        else . end
-      | if .mcp.servers then
-          .mcp.servers |= with_entries(
-            if .value.command then del(.) else . end
-          )
-        else . end
-    
-      | del(.["web.whatsapp"])  # remove invalid root-level key from old configs
-    ' "$EXISTING_CONFIG" 2>/dev/null) && echo "$CLEANED" > "$EXISTING_CONFIG" && echo "Config cleaned."
+    echo "Token patched."
   else
     echo "Patch failed — writing fresh config."
     echo "$CONFIG_JSON" > "$EXISTING_CONFIG"
@@ -883,6 +822,33 @@ if [ -n "${ALLOWED_ORIGINS:-}" ]; then
   CURRENT_CONFIG=$(echo "$CURRENT_CONFIG" | jq ".gateway.controlUi.allowedOrigins += $ORIGINS_JSON | .gateway.controlUi.allowedOrigins |= unique")
 fi
 echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
+
+# ── Restore CLI tools from package manifest ──
+# The package manifest is saved via package-manifest.sh save and
+# auto-backed up to HF Dataset as part of ~/.openclaw/ state.
+if [ -f "/home/node/app/package-manifest.sh" ] && [ -f "/home/node/.openclaw/package-manifest.json" ]; then
+  echo "Packages : restoring CLI tools from manifest..."
+  bash /home/node/app/package-manifest.sh restore
+fi
+
+# ── Auto-save package manifest on first boot (if no manifest exists) ──
+# Subsequent saves are manual: package-manifest.sh save
+if [ -f "/home/node/app/package-manifest.sh" ] && [ ! -f "/home/node/.openclaw/package-manifest.json" ]; then
+  echo "Packages : saving initial manifest..."
+  bash /home/node/app/package-manifest.sh save
+fi
+
+# ── Background: periodic package manifest auto-save ──
+# Every 6 hours, save current package state so newly installed tools
+# are automatically captured for the next restart.
+if [ -f "/home/node/app/package-manifest.sh" ]; then
+  (
+    while true; do
+      sleep 21600  # 6 hours
+      bash /home/node/app/package-manifest.sh save 2>/dev/null || true
+    done
+  ) &
+fi
 
 # ── Ensure gateway auth token matches GATEWAY_TOKEN env var ──
 # Restored config may have old token; always apply the current env var
