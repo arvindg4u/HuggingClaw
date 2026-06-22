@@ -36,6 +36,10 @@ from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 OPENCLAW_HOME = Path("/home/node/.openclaw")
+# Additional paths to include in backup (explicit overrides)
+EXTRA_BACKUP_PATHS = [
+    OPENCLAW_HOME / "extensions",  # Plugin binaries
+]
 # Additional paths to include in backup (e.g., Jupyter-visible directories)
 EXTRA_BACKUP_PATHS = [
     Path("/OpenClaw-Home"),
@@ -221,6 +225,27 @@ def snapshot_state_into_workspace() -> None:
                         shutil.copy2(item, backup_target)
                 except Exception as exc:
                     print(f"Warning: could not back up extra path {item}: {exc}")
+
+        # Also copy explicitly listed extra paths
+        for extra_path in EXTRA_BACKUP_PATHS:
+            if not extra_path.exists():
+                continue
+            name = extra_path.name
+            if name in EXCLUDED_STATE_NAMES:
+                continue
+            backup_target = staging_dir / name
+            try:
+                if backup_target.exists():
+                    if backup_target.is_dir():
+                        shutil.rmtree(backup_target, ignore_errors=True)
+                    else:
+                        backup_target.unlink(missing_ok=True)
+                if extra_path.is_dir():
+                    shutil.copytree(extra_path, backup_target)
+                elif extra_path.is_file():
+                    shutil.copy2(extra_path, backup_target)
+            except Exception as exc:
+                print(f"Warning: could not back up extra path {extra_path}: {exc}")
 
         # Atomically swap staging → real backup dir
         if OPENCLAW_STATE_BACKUP_DIR.exists():
