@@ -96,6 +96,7 @@ COPY --chown=1000:1000 env-builder.js /home/node/app/env-builder.js
 COPY --chown=1000:1000 jupyter-devdata-sync.py /home/node/app/jupyter-devdata-sync.py
 COPY --chown=1000:1000 dns-fix.cjs /home/node/app/dns-fix.cjs
 COPY --chown=1000:1000 telegram-proxy.cjs /home/node/app/telegram-proxy.cjs
+COPY --chown=1000:1000 whatsapp-proxy.cjs /home/node/app/whatsapp-proxy.cjs
 RUN chmod +x /home/node/app/start.sh \
               /home/node/app/package-manifest.sh \
               /home/node/app/openclaw-sync.py \
@@ -109,7 +110,7 @@ ENV HOME=/home/node \
     OPENCLAW_VERSION=${OPENCLAW_VERSION} \
     PATH=/home/node/.local/bin:/usr/local/bin:$PATH \
     NODE_PATH=/home/node/browser-deps/node_modules \
-    NODE_OPTIONS="--require /home/node/app/dns-fix.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs"
+    NODE_OPTIONS="--require /home/node/app/dns-fix.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs --require /home/node/app/whatsapp-proxy.cjs"
 
 WORKDIR /home/node/app
 

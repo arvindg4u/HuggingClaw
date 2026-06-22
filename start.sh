@@ -701,6 +701,11 @@ TELEGRAM_API_ROOT="${TELEGRAM_API_BASE:-https://render-proxy-ukjd.onrender.com/t
 export TELEGRAM_API_BASE="$TELEGRAM_API_ROOT"
 echo "[telegram] Proxy: api.telegram.org → ${TELEGRAM_API_BASE}" 
 
+# WhatsApp API root — whatsapp-proxy.cjs rewrites fetch calls to this endpoint.
+# HF Spaces blocks WhatsApp domains. Override via WHATSAPP_PROXY_BASE env var.
+WHATSAPP_PROXY_BASE="${WHATSAPP_PROXY_BASE:-https://render-proxy-ukjd.onrender.com}"
+export WHATSAPP_PROXY_BASE
+echo "[whatsapp] Proxy: WhatsApp domains → ${WHATSAPP_PROXY_BASE}"
 
 # Telegram (supports multiple user IDs, comma-separated)
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
@@ -863,7 +868,7 @@ echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
 # These preload scripts patch iframe embedding, API key rotation, and
 # proxy routing (ROUTE_ENDPOINT/ROUTE_TARGETS for SOCKS5/WS proxy).
 export NODE_PATH="${NODE_PATH:-/home/node/browser-deps/node_modules}"
-export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/dns-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs"
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/dns-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs --require /home/node/app/whatsapp-proxy.cjs"
 
 # ── Startup Summary ──
 echo ""

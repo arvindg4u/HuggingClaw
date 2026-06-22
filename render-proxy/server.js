@@ -96,14 +96,17 @@ function handleTelegram(req, res, path) {
 }
 
 // ── HTTP proxy for WhatsApp Web endpoints ────────────────────────────────
+// Supports all WhatsApp domains via x-target-host header:
+//   web.whatsapp.com, g.whatsapp.net, mmg.whatsapp.net,
+//   pps.whatsapp.net, static.whatsapp.net
 function handleWhatsAppHttp(req, res, path) {
   const waPath = path.replace(/^\/whatsapp/, "") || "/";
-  // Default to web.whatsapp.com for primary WhatsApp Web traffic
-  const targetHost = "web.whatsapp.com";
+  // Use x-target-host header to determine the actual WhatsApp domain
+  const targetHost = req.headers["x-target-host"] || "web.whatsapp.com";
   const waUrl = `https://${targetHost}${waPath}${url.parse(req.url).search || ""}`;
   const waParsed = new URL(waUrl);
 
-  log("whatsapp-http", `${req.method} ${waPath}`);
+  log("whatsapp-http", `${req.method} ${waPath} → ${targetHost}`);
 
   const options = {
     hostname: waParsed.hostname,
@@ -147,7 +150,7 @@ function handleHealth(res) {
 // ── Status / landing page ───────────────────────────────────────────────
 function handleStatus(res) {
   res.writeHead(200, { "Content-Type": "text/plain", "Cache-Control": "no-cache" });
-  res.end(`HuggingClaw Render Proxy\nUptime: ${Math.floor(process.uptime())}s\n\nEndpoints:\n  /telegram/*     → Telegram Bot API proxy\n  /whatsapp/*     → WhatsApp Web HTTP proxy\n  /whatsapp-ws/   → WhatsApp WebSocket relay\n  /health         → Health check\n`);
+  res.end(`HuggingClaw Render Proxy\nUptime: ${Math.floor(process.uptime())}s\n\nEndpoints:\n  /telegram/*     → Telegram Bot API proxy\n  /whatsapp/*     → WhatsApp Multi-domain HTTP proxy (x-target-host)\n  /whatsapp-ws    → WhatsApp WebSocket relay (query: ?host=&path=)\n  /health         → Health check\n`);
 }
 
 // ── HTTP Server ──────────────────────────────────────────────────────────
@@ -168,64 +171,83 @@ const server = http.createServer((req, res) => {
   res.end("Not Found");
 });
 
-// ── WebSocket relay for WhatsApp Web ────────────────────────────────────
+// ── WebSocket relay for WhatsApp Web (any domain, any path) ─────────────
+// Baileys connects to wss.web.whatsapp.com with dynamic paths.
+// The client sends the target as a query param: /whatsapp-ws?path=/ws&host=g.whatsapp.net
+// Or uses x-target-host + x-target-path headers for non-primary domains.
 const wss = new WebSocketServer({ server, path: "/whatsapp-ws" });
 
-wss.on("connection", (clientWs, req) => {
-  const targetHost = req.headers["x-target-host"] || "wss.web.whatsapp.com";
-  log("whatsapp-ws", `New connection → ${targetHost}`);
+function parseWsTarget(req) {
+  const query = url.parse(req.url, true).query;
+  const host = req.headers["x-target-host"] || query.host || "wss.web.whatsapp.com";
+  const path = query.path || req.headers["x-target-path"] || "/";
+  return { host: host.replace(/^wss:\/\//, "").replace(/\/.*$/, ""), path };
+}
 
-  // Extract target path from query or default to /
-  const targetPath = url.parse(req.url).query || "/";
-  const targetUrl = `wss://${targetHost}/${targetPath}`;
+wss.on("connection", (clientWs, req) => {
+  const target = parseWsTarget(req);
+  const targetUrl = `wss://${target.host}${target.path}`;
+  log("whatsapp-ws", `New → ${target.host}${target.path}`);
 
   let targetWs;
   try {
     targetWs = new (require("ws"))(targetUrl, {
-      headers: { host: targetHost },
-      handshakeTimeout: 15000,
+      headers: { host: target.host, origin: "https://web.whatsapp.com" },
+      handshakeTimeout: 20000,
+      rejectUnauthorized: false,
     });
   } catch (e) {
-    log("whatsapp-ws", `Connection error: ${e.message}`);
-    clientWs.close();
+    log("whatsapp-ws", `Connection failed: ${e.message}`);
+    clientWs.close(1011, e.message);
     return;
   }
 
-  // Bidirectional relay
+  let errLogged = false;
+
   targetWs.on("open", () => {
-    log("whatsapp-ws", `Connected to ${targetHost}`);
+    log("whatsapp-ws", `Connected to ${target.host}`);
   });
 
-  targetWs.on("message", (data) => {
-    if (clientWs.readyState === clientWs.OPEN) clientWs.send(data);
+  targetWs.on("message", (data, isBinary) => {
+    if (clientWs.readyState === clientWs.OPEN) {
+      clientWs.send(data, { binary: isBinary });
+    }
   });
 
   targetWs.on("error", (e) => {
-    log("whatsapp-ws", `Target error: ${e.message}`);
-    clientWs.close();
+    if (!errLogged) { errLogged = true; log("whatsapp-ws", `Target err: ${e.message}`); }
+    try { clientWs.close(); } catch (_) {}
   });
 
-  targetWs.on("close", () => {
-    clientWs.close();
+  targetWs.on("close", (code, reason) => {
+    try { clientWs.close(code, reason); } catch (_) {}
   });
 
-  clientWs.on("message", (data) => {
-    if (targetWs.readyState === targetWs.OPEN) targetWs.send(data);
+  clientWs.on("message", (data, isBinary) => {
+    if (targetWs.readyState === targetWs.OPEN) {
+      targetWs.send(data, { binary: isBinary });
+    }
   });
 
   clientWs.on("error", (e) => {
-    log("whatsapp-ws", `Client error: ${e.message}`);
-    targetWs.close();
+    if (!errLogged) { errLogged = true; log("whatsapp-ws", `Client err: ${e.message}`); }
+    try { targetWs.close(); } catch (_) {}
   });
 
-  clientWs.on("close", () => {
-    targetWs.close();
+  clientWs.on("close", (code, reason) => {
+    try { targetWs.close(code, reason); } catch (_) {}
   });
 });
+
+// ── Self-ping every 10min to prevent Render free tier sleep ─────────────
+setInterval(() => {
+  http.get(\`http://127.0.0.1:\${PORT}/health\`, (r) => r.resume());
+}, 10 * 60 * 1000);
 
 // ── Start server ────────────────────────────────────────────────────────
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`[hc-render-proxy] Listening on port ${PORT}`);
   console.log(`[hc-render-proxy] Telegram → https://api.telegram.org`);
-  console.log(`[hc-render-proxy] WhatsApp → web.whatsapp.com`);
+  console.log(`[hc-render-proxy] WhatsApp → web.whatsapp.com / g.whatsapp.net / mmg.whatsapp.net / pps.whatsapp.net / static.whatsapp.net`);
+  console.log(`[hc-render-proxy] Cron ping → /health every 10min to keep awake`);
 });

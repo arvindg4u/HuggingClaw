@@ -449,7 +449,7 @@ function renderDashboard(data) {
     <a class="hero-action env" data-space-link="env-builder" href="/env-builder">⚙️ Env Builder →</a>
   </div>
   <section class="overview">${tilesHtml}</section>
-  <footer>Built by <a href="https://github.com/somratpro" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:none">@somratpro</a>${JUPYTER_ENABLED ? " · Terminal by JupyterLab" : ""} · Contributions by <a href="https://github.com/anurag008w" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:none">@anurag008w</a></footer>
+  <footer>✨ <span style="background:linear-gradient(135deg,#f093fb,#f5576c,#4facfe);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-weight:700">Designed by Arvind</span> ✨${JUPYTER_ENABLED ? " · <span style=color:var(--soft)>💻 Terminal by JupyterLab</span>" : ""}</footer>
   </main>
   <script>
   document.querySelectorAll('.local-time').forEach(el=>{const d=new Date(el.getAttribute('data-iso'));if(!isNaN(d))el.textContent='At '+d.toLocaleTimeString()});
