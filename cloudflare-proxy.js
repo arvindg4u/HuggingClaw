@@ -597,10 +597,10 @@ tls.connect = function(...args) {
       pending.emit("connect");
       // Call the TLS connect callback if provided
       if (typeof cb === "function") cb();
-      tlsSocket.on("data", (d) => pending.push(d));
-      tlsSocket.on("end", () => pending.emit("end"));
-      tlsSocket.on("close", () => pending.emit("close"));
-      tlsSocket.on("error", (e) => pending.emit("error", e));
+      tlsSocket.on("data", (d) => { if (pending && !pending.destroyed) { try { pending.push(d); } catch (_) {} } });
+      tlsSocket.on("end", () => { if (pending && !pending.destroyed) pending.emit("end"); });
+      tlsSocket.on("close", () => { if (pending && !pending.destroyed) pending.emit("close"); });
+      tlsSocket.on("error", (e) => { if (pending && !pending.destroyed) pending.emit("error", e); });
     });
 
     pending._hc_tlsSocket = tlsSocket;

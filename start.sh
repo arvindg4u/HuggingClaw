@@ -702,13 +702,29 @@ fi
 # channels.telegram.apiRoot in the OpenClaw config so grammY uses it
 # directly.
 #
-# If CLOUDFLARE_PROXY_URL is set (Cloudflare Worker), it takes priority.
-TELEGRAM_API_ROOT="${CLOUDFLARE_PROXY_URL:+${CLOUDFLARE_PROXY_URL}/telegram}"
+# Priority order:
+#   1. CLOUDFLARE_PROXY_URL (Worker) — verified reachable before use
+#   2. Auto-probed mirror from the probe list
+#   3. Official api.telegram.org (last resort)
+PROBE_URLS="https://api.telegram.org https://telegram-api.mykdigi.com https://telegram-api-proxy-anonymous.pages.dev/api"
 
-# Probe for a working Telegram API endpoint
+# If CLOUDFLARE_PROXY_URL is set, verify it first
+TELEGRAM_API_ROOT=""
+if [ -n "${CLOUDFLARE_PROXY_URL:-}" ]; then
+  tg_worker="${CLOUDFLARE_PROXY_URL}/telegram"
+  tg_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$tg_worker" 2>/dev/null || echo "000")
+  if [ "$tg_status" != "000" ]; then
+    echo "[telegram] ✓ Cloudflare Worker reachable: $tg_worker (HTTP $tg_status)"
+    TELEGRAM_API_ROOT="$tg_worker"
+  else
+    echo "[telegram] ✗ Cloudflare Worker unreachable: $tg_worker — falling back to mirrors"
+  fi
+fi
+
+# Probe mirrors if Worker is unavailable or not configured
 if [ -z "$TELEGRAM_API_ROOT" ] && [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   echo "[telegram] Probing API endpoints..."
-  for tg_url in "https://api.telegram.org" "https://telegram-api.mykdigi.com" "https://telegram-api-proxy-anonymous.pages.dev/api"; do
+  for tg_url in $PROBE_URLS; do
     tg_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$tg_url" 2>/dev/null || echo "000")
     if [ "$tg_status" != "000" ]; then
       echo "[telegram] ✓ Reachable: $tg_url (HTTP $tg_status)"
