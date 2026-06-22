@@ -695,32 +695,14 @@ if [ -n "${ALLOWED_ORIGINS:-}" ]; then
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq ".gateway.controlUi.allowedOrigins += $ORIGINS_JSON | .gateway.controlUi.allowedOrigins |= unique")
 fi
 
-# Telegram API root — auto-probe at startup
-# HF Spaces blocks DNS for api.telegram.org.  We probe multiple endpoints
-# and set TELEGRAM_API_BASE to the first reachable one.  This env var is
-# consumed by telegram-proxy.cjs (fetch interception) AND exposed as
-# channels.telegram.apiRoot in the OpenClaw config so grammY uses it
-# directly.
-PROBE_URLS="https://api.telegram.org https://telegram-api.mykdigi.com https://telegram-api-proxy-anonymous.pages.dev/api"
-
-TELEGRAM_API_ROOT=""
-if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-  echo "[telegram] Probing API endpoints..."
-  for tg_url in $PROBE_URLS; do
-    tg_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$tg_url" 2>/dev/null)
-    case "$tg_status" in
-      [1-9][0-9][0-9])
-        echo "[telegram] ✓ Reachable: $tg_url (HTTP $tg_status)"
-        TELEGRAM_API_ROOT="$tg_url"
-        break ;;
-      *)
-        echo "[telegram] ✗ Unreachable: $tg_url" ;;
-    esac
-  done
+# Telegram API root — use Cloudflare Pages proxy by default (no account needed).
+# HF Spaces blocks DNS/IPs for api.telegram.org.  This proxy runs on
+# Cloudflare infrastructure and is reliably reachable from HF Spaces.
+# Override via TELEGRAM_API_BASE env var if needed.
+TELEGRAM_API_ROOT="https://telegram-api-proxy-anonymous.pages.dev/api"
+if [ -n "${TELEGRAM_API_BASE:-}" ]; then
+  TELEGRAM_API_ROOT="$TELEGRAM_API_BASE"
 fi
-
-# Fall back to official if none worked
-TELEGRAM_API_ROOT="${TELEGRAM_API_ROOT:-https://api.telegram.org}"
 
 # Export for telegram-proxy.cjs to use at the fetch level
 export TELEGRAM_API_BASE="$TELEGRAM_API_ROOT"
