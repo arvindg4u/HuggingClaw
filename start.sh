@@ -695,32 +695,11 @@ if [ -n "${ALLOWED_ORIGINS:-}" ]; then
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq ".gateway.controlUi.allowedOrigins += $ORIGINS_JSON | .gateway.controlUi.allowedOrigins |= unique")
 fi
 
-# Telegram API root — routing strategy:
-#   1. If ROUTE_ENDPOINT (Render/WS proxy) is configured → route api.telegram.org
-#      through it at the socket level (no fetch rewrite needed).
-#   2. Otherwise → use mykdigi mirror as fetch-level fallback.
-#   3. TELEGRAM_API_BASE env var always takes priority if set manually.
-TELEGRAM_API_ROOT="https://api.telegram.org"
-
-if [ -n "${TELEGRAM_API_BASE:-}" ]; then
-  # Manual override — use user-specified endpoint
-  TELEGRAM_API_ROOT="$TELEGRAM_API_BASE"
-elif [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${ROUTE_ENDPOINT:-}" ]; then
-  # Proxy available — route through it at socket level, no fetch rewrite needed
-  case ",${ROUTE_TARGETS}," in
-    *,api.telegram.org,*) ;;
-    *) ROUTE_TARGETS="${ROUTE_TARGETS:+${ROUTE_TARGETS},}api.telegram.org"
-       export ROUTE_TARGETS ;;
-  esac
-  echo "[telegram] Routing api.telegram.org through proxy: ${ROUTE_ENDPOINT}"
-else
-  # No proxy — use mykdigi mirror via fetch-level rewrite
-  TELEGRAM_API_ROOT="https://telegram-api.mykdigi.com"
-  echo "[telegram] No proxy available — using mykdigi mirror for fetch rewriting"
-fi
-
-# Export for telegram-proxy.cjs to use at the fetch level
-export TELEGRAM_API_BASE="$TELEGRAM_API_ROOT" 
+# Telegram API root — telegram-proxy.cjs rewrites fetch calls to this endpoint.
+# HF Spaces blocks api.telegram.org. Override via TELEGRAM_API_BASE env var.
+TELEGRAM_API_ROOT="${TELEGRAM_API_BASE:-https://telegram-api.mykdigi.com}"
+export TELEGRAM_API_BASE="$TELEGRAM_API_ROOT"
+echo "[telegram] Proxy: api.telegram.org → ${TELEGRAM_API_BASE}" 
 
 
 # Telegram (supports multiple user IDs, comma-separated)
