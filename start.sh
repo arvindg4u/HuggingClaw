@@ -695,11 +695,11 @@ if [ -n "${ALLOWED_ORIGINS:-}" ]; then
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq ".gateway.controlUi.allowedOrigins += $ORIGINS_JSON | .gateway.controlUi.allowedOrigins |= unique")
 fi
 
-# Telegram API root — use Cloudflare Pages proxy by default (no account needed).
-# HF Spaces blocks DNS/IPs for api.telegram.org.  This proxy runs on
-# Cloudflare infrastructure and is reliably reachable from HF Spaces.
+# Telegram API root — use mykdigi mirror by default (confirmed working).
+# HF Spaces blocks DNS/IPs for api.telegram.org.  This public proxy
+# relays requests to the official Telegram Bot API.
 # Override via TELEGRAM_API_BASE env var if needed.
-TELEGRAM_API_ROOT="https://telegram-api-proxy-anonymous.pages.dev/api"
+TELEGRAM_API_ROOT="https://telegram-api.mykdigi.com"
 if [ -n "${TELEGRAM_API_BASE:-}" ]; then
   TELEGRAM_API_ROOT="$TELEGRAM_API_BASE"
 fi
