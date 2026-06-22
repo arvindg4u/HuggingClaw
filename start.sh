@@ -1623,12 +1623,6 @@ fi
 hc_finish_startup_commands
 sync_installed_plugins_into_allow
 
-# ── Auto-install WhatsApp plugin if missing ──
-if [ "$WHATSAPP_ENABLED_NORMALIZED" = "true" ] && ! [ -d "/home/node/.openclaw/extensions/whatsapp" ]; then
-  echo "WhatsApp plugin missing — installing..."
-  openclaw plugins install "clawhub:@openclaw/whatsapp" 2>/dev/null && echo "  WhatsApp plugin installed." || echo "  Warning: install failed"
-fi
-
 # ── Launch gateway ──
 GATEWAY_RESTART_DELAY="${GATEWAY_RESTART_DELAY:-2}"
 GATEWAY_MAX_RESTARTS="${GATEWAY_MAX_RESTARTS:-0}"

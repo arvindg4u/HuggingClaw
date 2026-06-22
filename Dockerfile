@@ -81,6 +81,26 @@ RUN mkdir -p /home/node/browser-deps && \
 RUN ln -s /home/node/.openclaw/openclaw-app/openclaw.mjs /usr/local/bin/openclaw 2>/dev/null || \
     npm install -g openclaw@${OPENCLAW_VERSION}
 
+# ── Extensions symlink (democra-ai pattern — survives backup restores) ──
+RUN mkdir -p /home/node/.openclaw && \
+    if [ ! -L /home/node/.openclaw/extensions ] && [ -d /home/node/.openclaw/openclaw-app/extensions ]; then \
+      rm -rf /home/node/.openclaw/extensions 2>/dev/null || true; \
+      ln -s /home/node/.openclaw/openclaw-app/extensions /home/node/.openclaw/extensions; \
+      echo "[build] Extensions symlinked from OpenClaw image"; \
+    else \
+      echo "[build] Extensions directory: standalone (WhatsApp pre-bundled)"; \
+    fi
+
+# ── Pre-bundle WhatsApp plugin (build time, like democra-ai pattern) ──
+RUN mkdir -p /home/node/.openclaw/extensions && \
+    if openclaw plugins install clawhub:@openclaw/whatsapp 2>/dev/null; then \
+      echo "[build] WhatsApp plugin pre-bundled from ClawHub."; \
+    elif openclaw plugins install @openclaw/whatsapp 2>/dev/null; then \
+      echo "[build] WhatsApp plugin pre-bundled from npm."; \
+    else \
+      echo "[build] Warning: could not pre-bundle WhatsApp plugin (will install at runtime)"; \
+    fi
+
 COPY --chown=1000:1000 cloudflare-proxy.js /opt/cloudflare-proxy.js
 COPY --chown=1000:1000 dns-resolve.py /home/node/app/dns-resolve.py
 COPY --chown=1000:1000 health-server.js /home/node/app/health-server.js
