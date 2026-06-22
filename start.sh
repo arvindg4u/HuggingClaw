@@ -697,15 +697,7 @@ fi
 # HF Spaces blocks api.telegram.org. Override via TELEGRAM_API_BASE env var.
 TELEGRAM_API_ROOT="${TELEGRAM_API_BASE:-https://render-proxy-ukjd.onrender.com/telegram}"
 export TELEGRAM_API_BASE="$TELEGRAM_API_ROOT"
-echo "[telegram] Proxy: api.telegram.org → ${TELEGRAM_API_BASE}"
-
-# ── Fix /tmp permissions (Docker build may leave root-owned files) ──
-# OpenClaw, JupyterLab, and scripts create files in /tmp at runtime.
-# If a previous build (as root) left stale files, the node user can't
-# access them. Clean up known problematic paths.
-for _p in /tmp/sync-status.tmp /tmp/sync-status.json /tmp/jupyterlab.log /tmp/dns-resolved.json /tmp/openclaw-*; do
-  [ -e "$_p" ] && rm -f "$_p" 2>/dev/null || true
-done 
+echo "[telegram] Proxy: api.telegram.org → ${TELEGRAM_API_BASE}" 
 
 
 # WhatsApp API root — whatsapp-proxy.cjs rewrites WhatsApp domains to this proxy.
