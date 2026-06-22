@@ -38,7 +38,16 @@ function log(prefix, msg) {
 // We proxy to:     GET/POST https://api.telegram.org/botXXX/method
 function handleTelegram(req, res, path) {
   const tgPath = path.replace(/^\/telegram/, "") || "/";
-  const tgUrl = `https://${TELEGRAM_API}${tgPath}${url.parse(req.url).search || ""}`;
+  // For getUpdates (long-poll), cap timeout at 25s so Render's
+  // infrastructure doesn't kill the long connection.
+  let queryStr = url.parse(req.url).search || "";
+  if (tgPath.includes("getUpdates")) {
+    // Remove any existing timeout parameter
+    queryStr = queryStr.replace(/(^|&)timeout=[^&]*/g, "");
+    // Add our capped timeout
+    queryStr = queryStr ? queryStr + "&timeout=25" : "?timeout=25";
+  }
+  const tgUrl = `https://${TELEGRAM_API}${tgPath}${queryStr}`;
   const tgParsed = new URL(tgUrl);
 
   log("telegram", `${req.method} ${tgPath}`);
