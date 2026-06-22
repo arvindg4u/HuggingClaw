@@ -697,7 +697,7 @@ fi
 
 # Telegram API root — telegram-proxy.cjs rewrites fetch calls to this endpoint.
 # HF Spaces blocks api.telegram.org. Override via TELEGRAM_API_BASE env var.
-TELEGRAM_API_ROOT="${TELEGRAM_API_BASE:-https://telegram-api.mykdigi.com}"
+TELEGRAM_API_ROOT="${TELEGRAM_API_BASE:-https://render-proxy-ukjd.onrender.com/telegram}"
 export TELEGRAM_API_BASE="$TELEGRAM_API_ROOT"
 echo "[telegram] Proxy: api.telegram.org → ${TELEGRAM_API_BASE}" 
 
