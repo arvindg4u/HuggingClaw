@@ -102,7 +102,7 @@ function handleWhatsAppHttp(req, res, path) {
     path: waParsed.pathname + waParsed.search,
     method: req.method,
     headers: { ...req.headers, host: targetHost },
-    timeout: 30000,
+    timeout: 120000,
   };
   delete options.headers["x-hc"];
   delete options.headers["x-target-host"];
