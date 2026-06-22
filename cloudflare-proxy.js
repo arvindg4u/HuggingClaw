@@ -746,7 +746,12 @@ class TunnelPool {
       }
     });
 
-    this.ws.on('close', () => this._invalidateAll(new Error('pool WebSocket closed')));
+    this.ws.on('close', () => {
+      this._invalidateAll(new Error('pool WebSocket closed'));
+      // Instant reconnect: start establishing new WS connection immediately
+      // Next request will find pendingOpen and pick it up
+      this._ensureWebSocket().catch(() => {});
+    });
     this.ws.on('error', () => {}); // handled by _invalidateAll on close
 
     try {
