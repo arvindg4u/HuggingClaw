@@ -763,8 +763,6 @@ fi
 
 # WhatsApp (optional)
 if [ "$WHATSAPP_ENABLED_NORMALIZED" = "true" ]; then
-  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.plugins.entries.whatsapp = {"enabled": true}')
-  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.plugins.installs.whatsapp = {"source": "clawhub:@openclaw/whatsapp", "version": "2026.6.9"}')
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.channels.whatsapp = {"dmPolicy": "pairing"}')
   # Baileys socket timing overrides — prevents 408 timeout behind proxy
   # OpenClaw docs: https://docs.openclaw.ai/channels/whatsapp#runtime-model
