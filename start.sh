@@ -617,9 +617,7 @@ fi
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   PLUGIN_ALLOW_JSON=$(jq '. + ["telegram"]' <<<"$PLUGIN_ALLOW_JSON")
 fi
-if [ "$WHATSAPP_ENABLED_NORMALIZED" = "true" ]; then
-  PLUGIN_ALLOW_JSON=$(jq '. + ["whatsapp"]' <<<"$PLUGIN_ALLOW_JSON")
-fi
+
 
 # Apply plugin allow/deny + per-entry toggles in one jq pass.
 BROWSER_DISABLED=true
@@ -701,11 +699,6 @@ TELEGRAM_API_ROOT="${TELEGRAM_API_BASE:-https://render-proxy-ukjd.onrender.com/t
 export TELEGRAM_API_BASE="$TELEGRAM_API_ROOT"
 echo "[telegram] Proxy: api.telegram.org → ${TELEGRAM_API_BASE}" 
 
-# WhatsApp API root — whatsapp-proxy.cjs rewrites fetch calls to this endpoint.
-# HF Spaces blocks WhatsApp domains. Override via WHATSAPP_PROXY_BASE env var.
-WHATSAPP_PROXY_BASE="${WHATSAPP_PROXY_BASE:-https://render-proxy-ukjd.onrender.com}"
-export WHATSAPP_PROXY_BASE
-echo "[whatsapp] Proxy: WhatsApp domains → ${WHATSAPP_PROXY_BASE}"
 
 # Telegram (supports multiple user IDs, comma-separated)
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
@@ -760,25 +753,11 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
       '.channels.telegram += {"dmPolicy": "allowlist", "allowFrom": [$userId]}' <<<"$CONFIG_JSON")
   fi
 fi
-
-# WhatsApp (optional)
-if [ "$WHATSAPP_ENABLED_NORMALIZED" = "true" ]; then
-  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.channels.whatsapp = {"dmPolicy": "pairing"}')
-  # Baileys socket timing overrides — prevents 408 timeout behind proxy
-  # OpenClaw docs: https://docs.openclaw.ai/channels/whatsapp#runtime-model
-  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.web.whatsapp = {
-    "keepAliveIntervalMs": 30000,
-    "connectTimeoutMs": 60000,
-    "defaultQueryTimeoutMs": 60000
-  }')
 fi
 
 # Write config
 EXISTING_CONFIG="/home/node/.openclaw/openclaw.json"
-WHATSAPP_CONFIG_ENABLED=false
-if [ "$WHATSAPP_ENABLED_NORMALIZED" = "true" ]; then
-  WHATSAPP_CONFIG_ENABLED=true
-fi
+
 TELEGRAM_CONFIG_ENABLED=false
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   TELEGRAM_CONFIG_ENABLED=true
@@ -790,7 +769,7 @@ if [ -f "$EXISTING_CONFIG" ]; then
     --arg tg_api_root "${TELEGRAM_API_ROOT:-}" \
     --arg tg_bot_token "${TELEGRAM_BOT_TOKEN:-}" \
     '.gateway.auth.token = $token
-     | del(.["web.whatsapp"])
+
      | del(.gateway.controlUi.dangerouslyDisableDeviceAuth)
      | if $tg_api_root != "" then .channels.telegram.apiRoot = $tg_api_root else . end
      | if $tg_bot_token != "" then .channels.telegram.botToken = $tg_bot_token else . end' \
@@ -867,7 +846,7 @@ echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
 # These preload scripts patch iframe embedding, API key rotation, and
 # proxy routing (ROUTE_ENDPOINT/ROUTE_TARGETS for SOCKS5/WS proxy).
 export NODE_PATH="${NODE_PATH:-/home/node/browser-deps/node_modules}"
-export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/dns-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs --require /home/node/app/whatsapp-proxy.cjs"
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/dns-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs"
 
 # ── Startup Summary ──
 echo ""
@@ -877,11 +856,6 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   echo "Telegram  : enabled"
 else
   echo "Telegram  : not configured"
-fi
-if [ "$WHATSAPP_ENABLED_NORMALIZED" = "true" ]; then
-  echo "WhatsApp  : enabled"
-else
-  echo "WhatsApp  : disabled"
 fi
 if [ -n "${HF_TOKEN:-}" ]; then
   echo "Backup    : ${BACKUP_DATASET:-huggingclaw-backup} (every ${SYNC_INTERVAL:-600}s / debounce:60s)"
@@ -1705,17 +1679,6 @@ start_background_sync_once() {
   SYNC_LOOP_PID=$!
 }
 
-start_guardian_once() {
-  [ "$WHATSAPP_ENABLED_NORMALIZED" = "true" ] || return 0
-
-  if [ -n "$GUARDIAN_PID" ] && kill -0 "$GUARDIAN_PID" 2>/dev/null; then
-    return 0
-  fi
-
-  node /home/node/app/wa-guardian.js &
-  GUARDIAN_PID=$!
-  echo "WhatsApp Guardian started (PID: $GUARDIAN_PID)"
-}
 
 
 
@@ -1781,7 +1744,7 @@ while true; do
     fi
   fi
 
-  # ── Resolve WhatsApp/Telegram domains via DNS-over-HTTPS ──
+  # ── Resolve Telegram domains via DNS-over-HTTPS ──
   # HF Spaces blocks DNS for these domains; DoH bypasses the block.
   if [ -f /home/node/app/dns-resolve.py ]; then
     python3 /home/node/app/dns-resolve.py 2>&1 || true
@@ -1839,8 +1802,8 @@ while true; do
     fi
   fi
 
-  # 11. Start WhatsApp Guardian after the gateway is accepting connections
-  start_guardian_once
+
+
 
   # 11.5 Warm up the managed browser so first browser actions have a live tab
   warmup_browser
