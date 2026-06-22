@@ -788,6 +788,7 @@ class TunnelPool {
       }
     });
     duplex.setMaxListeners(0);
+    duplex.on('error', () => {}); // prevent crash on pool disconnect
 
     const conn = { duplex, resolve: null, reject: null, timer: null };
     this.connections.set(connId, conn);
@@ -864,6 +865,7 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
           }
         });
         duplex.setMaxListeners(0);
+    duplex.on('error', () => {}); // prevent crash on pool disconnect
 
         ws.on('message', (data) => {
           if (settled) return;
