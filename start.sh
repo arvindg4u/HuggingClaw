@@ -753,7 +753,6 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
       '.channels.telegram += {"dmPolicy": "allowlist", "allowFrom": [$userId]}' <<<"$CONFIG_JSON")
   fi
 fi
-fi
 
 # Write config
 EXISTING_CONFIG="/home/node/.openclaw/openclaw.json"
