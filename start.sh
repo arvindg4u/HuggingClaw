@@ -865,7 +865,7 @@ else
   echo "Telegram  : not configured"
 fi
 if [ -n "${HF_TOKEN:-}" ]; then
-  echo "Backup    : ${BACKUP_DATASET:-huggingclaw-backup} (every ${SYNC_INTERVAL:-600}s / debounce:60s)"
+  echo "Backup    : ${BACKUP_DATASET:-huggingclaw-backup} (every ${SYNC_INTERVAL:-180}s / debounce:60s)"
 else
   echo "Backup    : disabled"
 fi
