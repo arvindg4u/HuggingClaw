@@ -36,13 +36,11 @@ from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 OPENCLAW_HOME = Path("/home/node/.openclaw")
-# Additional paths to include in backup (already covered by snapshot_state_into_workspace)
-EXTRA_BACKUP_PATHS: list[Path] = []
 OPENCLAW_CONFIG_FILE = OPENCLAW_HOME / "openclaw.json"
 WORKSPACE = OPENCLAW_HOME / "workspace"
-STATUS_FILE = OPENCLAW_HOME / "sync-status.json"
+STATUS_FILE = Path("/tmp/sync-status.json")
 SYNC_LOCK_FILE = Path("/tmp/huggingclaw-sync.lock")
-INTERVAL = int(os.environ.get("SYNC_INTERVAL", "300"))
+INTERVAL = int(os.environ.get("SYNC_INTERVAL", "600"))
 INITIAL_DELAY = int(os.environ.get("SYNC_START_DELAY", "10"))
 CONFIG_WATCH_INTERVAL = max(
     0.5,
@@ -54,7 +52,7 @@ CONFIG_SETTLE_SECONDS = max(
 )
 # Debounce window: rapid changes (e.g. gateway restart + config patch)
 # are batched into a single sync within this window.
-DEBOUNCE_SECONDS = int(os.environ.get("SYNC_DEBOUNCE_SECONDS", "0"))
+DEBOUNCE_SECONDS = int(os.environ.get("SYNC_DEBOUNCE_SECONDS", "60"))
 # 429 rate limit retry: exponential backoff 60s/120s/240s/480s
 UPLOAD_RETRIES = int(os.environ.get("SYNC_UPLOAD_RETRIES", "5"))
 BASE_RETRY_DELAY = int(os.environ.get("SYNC_RETRY_BASE_DELAY", "60"))
@@ -80,7 +78,6 @@ OPENCLAW_STATE_BACKUP_DIR = STATE_DIR / "openclaw"
 EXCLUDED_STATE_NAMES = {
     "workspace",
     "openclaw-app",
-    "extensions",
     "gateway.log",
     "browser",
     "npm",
@@ -103,8 +100,6 @@ def write_status(status: str, message: str) -> None:
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     tmp_path = STATUS_FILE.with_suffix(".tmp")
-    # Remove stale temp file if it exists (wrong permissions from previous run)
-    tmp_path.unlink(missing_ok=True)
     tmp_path.write_text(json.dumps(payload), encoding="utf-8")
     tmp_path.replace(STATUS_FILE)
 
@@ -201,49 +196,6 @@ def snapshot_state_into_workspace() -> None:
             print(
                 "Warning: OpenClaw state snapshot had copy failures; updated remaining state entries."
             )
-        # Also copy extra backup paths (e.g., /OpenClaw-Home/extensions/)
-        for extra_path in EXTRA_BACKUP_PATHS:
-            if not extra_path.exists():
-                continue
-            for item in extra_path.iterdir():
-                name = item.name
-                if name in EXCLUDED_STATE_NAMES:
-                    continue
-                backup_target = staging_dir / name
-                try:
-                    if backup_target.exists():
-                        if backup_target.is_dir():
-                            shutil.rmtree(backup_target, ignore_errors=True)
-                        else:
-                            backup_target.unlink(missing_ok=True)
-                    if item.is_dir():
-                        shutil.copytree(item, backup_target)
-                    elif item.is_file():
-                        shutil.copy2(item, backup_target)
-                except Exception as exc:
-                    print(f"Warning: could not back up extra path {item}: {exc}")
-
-        # Also copy explicitly listed extra paths
-        for extra_path in EXTRA_BACKUP_PATHS:
-            if not extra_path.exists():
-                continue
-            name = extra_path.name
-            if name in EXCLUDED_STATE_NAMES:
-                continue
-            backup_target = staging_dir / name
-            try:
-                if backup_target.exists():
-                    if backup_target.is_dir():
-                        shutil.rmtree(backup_target, ignore_errors=True)
-                    else:
-                        backup_target.unlink(missing_ok=True)
-                if extra_path.is_dir():
-                    shutil.copytree(extra_path, backup_target)
-                elif extra_path.is_file():
-                    shutil.copy2(extra_path, backup_target)
-            except Exception as exc:
-                print(f"Warning: could not back up extra path {extra_path}: {exc}")
-
         # Atomically swap staging → real backup dir
         if OPENCLAW_STATE_BACKUP_DIR.exists():
             shutil.rmtree(OPENCLAW_STATE_BACKUP_DIR, ignore_errors=True)
@@ -454,6 +406,7 @@ def fingerprint_dir(root: Path) -> str:
                 f"Workspace changed while hashing {rel}; retrying next sync pass."
             )
     return hasher.hexdigest()
+
 
 def create_snapshot_dir(source_root: Path) -> Path:
     staging_root = Path(tempfile.mkdtemp(prefix="huggingclaw-sync-"))
