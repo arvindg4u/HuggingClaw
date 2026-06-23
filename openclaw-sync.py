@@ -40,7 +40,7 @@ OPENCLAW_CONFIG_FILE = OPENCLAW_HOME / "openclaw.json"
 WORKSPACE = OPENCLAW_HOME / "workspace"
 STATUS_FILE = Path("/tmp/sync-status.json")
 SYNC_LOCK_FILE = Path("/tmp/huggingclaw-sync.lock")
-INTERVAL = int(os.environ.get("SYNC_INTERVAL", "600"))
+INTERVAL = int(os.environ.get("SYNC_INTERVAL", "180"))
 INITIAL_DELAY = int(os.environ.get("SYNC_START_DELAY", "10"))
 CONFIG_WATCH_INTERVAL = max(
     0.5,
@@ -99,9 +99,18 @@ def write_status(status: str, message: str) -> None:
         "message": message,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    tmp_path = STATUS_FILE.with_suffix(".tmp")
+    # Use unique temp path to avoid PermissionError on stale root-owned files
+    fd, tmp_path_str = tempfile.mkstemp(prefix="hc-status-", suffix=".json", dir="/tmp")
+    os.close(fd)
+    tmp_path = Path(tmp_path_str)
     tmp_path.write_text(json.dumps(payload), encoding="utf-8")
-    tmp_path.replace(STATUS_FILE)
+    try:
+        tmp_path.replace(STATUS_FILE)
+    except PermissionError:
+        # If STATUS_FILE is root-owned, write directly (fallback)
+        STATUS_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def read_status() -> dict[str, str]:
