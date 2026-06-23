@@ -53,7 +53,6 @@ CONFIG_SETTLE_SECONDS = max(
 )
 # Debounce window: rapid changes (e.g. gateway restart + config patch)
 # are batched into a single sync within this window.
-DEBOUNCE_SECONDS = int(os.environ.get("SYNC_DEBOUNCE_SECONDS", "60"))
 # 429 rate limit retry: exponential backoff 60s/120s/240s/480s
 UPLOAD_RETRIES = int(os.environ.get("SYNC_UPLOAD_RETRIES", "5"))
 BASE_RETRY_DELAY = int(os.environ.get("SYNC_RETRY_BASE_DELAY", "60"))
@@ -522,7 +521,6 @@ def restore_workspace() -> bool:
 
 
 # Track last sync time for debounce
-_last_sync_time: float = 0.0
 
 
 def upload_with_retry(repo_id: str, folder_path: str) -> None:
@@ -608,8 +606,6 @@ def _sync_once_unlocked(
     finally:
         shutil.rmtree(snapshot_dir, ignore_errors=True)
 
-    global _last_sync_time
-    _last_sync_time = time.monotonic()
     write_status("success", f"Uploaded workspace to {repo_id}")
     return (current_fingerprint, current_marker)
 
@@ -744,34 +740,22 @@ def wait_for_config_settle(config_marker: tuple[int, int, int]) -> tuple[str, tu
     return ("stopped", current_marker)
 
 
-def _debounce_remaining() -> float:
-    """Return seconds remaining in the debounce window, or 0 if expired."""
-    global _last_sync_time
-    elapsed = time.monotonic() - _last_sync_time
-    return max(0.0, DEBOUNCE_SECONDS - elapsed)
-
-
 def wait_for_sync_trigger(
     config_marker: tuple[int, int, int],
     last_sessions_sync_time: float = 0.0,
 ) -> tuple[str, tuple[int, int, int]]:
     deadline = time.monotonic() + max(0, INTERVAL)
     last_sessions_marker = sessions_marker()
-    # Prevent immediate re-trigger after a just-finished sync
-    _debounce_remaining()  # primes _last_sync_time reference
 
     while not STOP_EVENT.is_set():
-        # Debounce check: skip config/session triggers if we just synced
-        db_remain = _debounce_remaining()
-
         current_config_marker = file_marker(OPENCLAW_CONFIG_FILE)
-        if current_config_marker != config_marker and db_remain <= 0:
+        if current_config_marker != config_marker:
             return wait_for_config_settle(current_config_marker)
 
         sessions_gap_elapsed = (
             time.monotonic() - last_sessions_sync_time >= SESSIONS_MIN_SYNC_GAP
         )
-        if sessions_gap_elapsed and db_remain <= 0:
+        if sessions_gap_elapsed:
             current_sessions_marker = sessions_marker()
             if current_sessions_marker != last_sessions_marker:
                 return ("sessions", current_config_marker)
@@ -780,10 +764,7 @@ def wait_for_sync_trigger(
         if remaining <= 0:
             return ("interval", current_config_marker)
 
-        # If debounce is active, wait for it to expire before checking again
         wait_seconds = min(CONFIG_WATCH_INTERVAL, remaining)
-        if db_remain > 0:
-            wait_seconds = min(wait_seconds, db_remain)
         if STOP_EVENT.wait(wait_seconds):
             return ("stopped", current_config_marker)
 
@@ -794,14 +775,12 @@ def loop() -> int:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    global _last_sync_time
-    _last_sync_time = time.monotonic()
 
     previous_status = read_status().get("status", "")
 
     try:
         repo_id = resolve_backup_namespace()
-        write_status("configured", f"Backup loop active for {repo_id} with {INTERVAL}s interval (debounce: {DEBOUNCE_SECONDS}s).")
+        write_status("configured", f"Backup loop active for {repo_id} with {INTERVAL}s interval.")
     except Exception as exc:
         write_status("error", str(exc))
         print(f"Workspace sync error: {exc}")
