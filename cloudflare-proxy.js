@@ -77,28 +77,47 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
   const pUrl = PROXY_URL || '';
 
   // Try SOCKS5 first (if proxy URL is socks5://)
-  // Note: if proxy is behind Cloudflare (Render), SOCKS5 raw TCP may fail.
-  // Fall back to HTTP CONNECT (which Cloudflare proxies) then direct.
   if (pUrl.startsWith('socks5')) {
     return socks5Connect(targetHost, targetPort, timeout)
-      .catch(() => httpConnectProxy(targetHost, targetPort, timeout))
-      .catch(() => directConnect(targetHost, targetPort, timeout));
+      .catch(() => {
+        log(`SOCKS5 failed for ${targetHost}:${targetPort}, trying HTTP CONNECT`);
+        return httpConnectProxy(targetHost, targetPort, timeout);
+      })
+      .catch(() => {
+        const err = new Error(`FATAL: All proxy methods failed for ${targetHost}:${targetPort} - no direct fallback`);
+        log(err.message);
+        throw err;
+      });
   }
 
   // WebSocket proxy (for wss:// or ws:// URLs)
   if (pUrl.startsWith('wss') || pUrl.startsWith('ws://')) {
     return wsConnectProxy(targetHost, targetPort, timeout)
-      .catch(() => tlsConnectProxy(targetHost, targetPort, timeout))
-      .catch(() => directConnect(targetHost, targetPort, timeout));
+      .catch(() => {
+        log(`WS proxy failed for ${targetHost}:${targetPort}, retrying once...`);
+        return wsConnectProxy(targetHost, targetPort, timeout);
+      })
+      .catch(() => {
+        const err = new Error(`FATAL: WebSocket proxy failed for ${targetHost}:${targetPort} - no fallback`);
+        log(err.message);
+        throw err;
+      });
   }
 
-  // For https:// URLs: try WebSocket first (bypasses Cloudflare TCP blocks),
-  // then TLS+HTTP CONNECT (works through Cloudflare to Render),
-  // then HTTP CONNECT, then direct.
+  // For https:// URLs: try WebSocket with retry, then TLS/HTTP CONNECT.
+  // NEVER fall back to directConnect - fail visibly if proxy is down.
   return wsConnectProxy(targetHost, targetPort, Math.min(timeout, 30000))
+    .catch(() => {
+      log(`WS proxy failed for ${targetHost}:${targetPort}, retrying once...`);
+      return wsConnectProxy(targetHost, targetPort, Math.min(timeout, 30000));
+    })
     .catch(() => tlsConnectProxy(targetHost, targetPort, timeout)
       .catch(() => httpConnectProxy(targetHost, targetPort, timeout)
-        .catch(() => directConnect(targetHost, targetPort, timeout))));
+        .catch(() => {
+          const err = new Error(`FATAL: All proxy methods failed for ${targetHost}:${targetPort} - no direct fallback`);
+          log(err.message);
+          throw err;
+        })));
 }
 
 // Direct TCP connection (no proxy)
@@ -230,12 +249,9 @@ https.request = function(...args) {
 
   if (opts._hc || !needsProxy(hn)) return origHttps.call(this, ...args);
 
-  const nopts = { ...opts, _hc: true, createConnection: (o, c) => {
-    proxyConnect(o.host || o.hostname || "localhost", o.port || 443)
-      .then(s => c(null, s)).catch(e => c(e));
-    // Must NOT return new net.Socket() — Node would use that instead
-    // of the callback socket. Return undefined → Node uses callback.
-  }};
+  // Remove our flag so internal tls.connect → net.connect path fires
+  const nopts = { ...opts };
+  delete nopts._hc;
   return origHttps.call(this, nopts, cb);
 };
 
@@ -785,7 +801,11 @@ class TunnelPool {
     ws.send(JSON.stringify({ type: "connect", connId, host, port }));
 
     return new Promise((resolve, reject) => {
-      conn.resolve = resolve;
+      conn.resolve = (duplex) => {
+        // Emit 'connect' so tls.connect({socket: duplex}) starts TLS handshake
+        duplex.emit('connect');
+        resolve(duplex);
+      };
       conn.reject = reject;
       conn.timer = setTimeout(() => {
         this.connections.delete(connId);
@@ -856,9 +876,11 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
     duplex.on('error', () => {}); // prevent crash on pool disconnect
 
         ws.on('message', (data) => {
-          if (settled) return;
-          const str = typeof data === 'string' ? data : (Buffer.isBuffer(data) ? data.toString() : '');
+          const isBinary = Buffer.isBuffer(data) || data instanceof Buffer;
+          const str = !isBinary ? (typeof data === 'string' ? data : data.toString()) : '';
           if (str.length > 0 && str[0] === '{') {
+            // Text frame — JSON control message
+            if (settled) return; // Already connected, ignore control messages
             try {
               const parsed = JSON.parse(str);
               if (parsed.status === 'connected' || parsed.type === 'connected') {
@@ -869,7 +891,7 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
                   pendingWriteBuffer = [];
                   if (ws.readyState === WebSocket.OPEN) ws.send(buf, { binary: true }, () => {});
                 }
-                if (!settled) { settled = true; resolve(duplex); }
+                if (!settled) { settled = true; duplex.emit('connect'); resolve(duplex); }
                 return;
               }
               if (parsed.error) {
@@ -878,9 +900,11 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
                 return;
               }
             } catch(e) {}
+            return; // Non-JSON text, ignore
           }
+          // Binary frame — forward to duplex (always, even if settled)
           const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-          if (!duplex.push(buf)) {}
+          if (buf.length > 0 && !duplex.push(buf)) {}
         });
 
         ws.on('open', () => {
