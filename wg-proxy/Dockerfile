@@ -1,8 +1,8 @@
 # ── HuggingClaw WireGuard (Proton VPN) Proxy for Render ──
-# IP rotation: set WG_ENDPOINTS with comma-separated endpoint IP:port pairs
-#   WG_ENDPOINTS=ip1:51820,ip2:51820,ip3:51820
-#   WG_ROTATION_INTERVAL=1800000  (ms, default 30 min)
-# Falls back to WG_ENDPOINT for single-endpoint mode.
+# 9 Proton VPN FREE configs with 1-minute IP rotation
+# Override via WG_CONFIGS env var (JSON array) on Render dashboard
+#   WG_CONFIGS='[{"privateKey":"...","peerPublicKey":"...","endpoint":"ip:51820"}]'
+# Rotation interval: WG_ROTATION_INTERVAL=60000 (ms, default 1 min)
 FROM node:22-alpine
 
 RUN apk add --no-cache wget ca-certificates
@@ -13,9 +13,8 @@ ARG WIREPROXY_VERSION=1.1.2
 RUN wget -qO- "https://github.com/pufferffish/wireproxy/releases/download/v${WIREPROXY_VERSION}/wireproxy_linux_${TARGETARCH}.tar.gz" \
     | tar -xz -C /usr/local/bin wireproxy
 
-ENV WG_PRIVATE_KEY=wHTOhHm7orE8evqF39HezxB8Vc+fwuVsEtDN2rl2HnA=
-ENV WG_PEER_PUBLIC_KEY=Y4jxn/IIoorfo/X99RZFU6HbL9WWn7ffGI5isYFU9lo=
-ENV WG_ENDPOINT=146.70.202.34:51820
+ENV WG_CONFIGS='[{"privateKey":"wHTOhHm7orE8evqF39HezxB8Vc+fwuVsEtDN2rl2HnA=","peerPublicKey":"Y4jxn/IIoorfo/X99RZFU6HbL9WWn7ffGI5isYFU9lo=","endpoint":"146.70.202.34:51820"},{"privateKey":"6J4kyAvFKtVFIZu4KaTpVIPIb9eqdW29G6lHRJBXllU=","peerPublicKey":"jShHBnjRpU3cgm2apLl0OElwSK0fs/gJTm9nnjdO8Ec=","endpoint":"149.40.62.119:51820"},{"privateKey":"+HMkwLLgbynGfifsMk2dSWkk9fyl41EutI9Vsjj2ZXk=","peerPublicKey":"KZ9UhGk5qLny663HP6xWCfyIDH2xgvu9DNH5tGYmYnw=","endpoint":"138.199.50.144:51820"},{"privateKey":"UARft8SuSAsx9i3EXQuOYpr55C0VWa7ixFgnH6l/Fk4=","peerPublicKey":"eAXAQ+pjJuejhTOjyCnC39GS/8lv8Zw7Cj5u7gMzIgE=","endpoint":"151.243.141.166:51820"},{"privateKey":"8EsXHKNXdR7pNM4lN/Dl18wXZfarPnyEb5Tn+hOK00I=","peerPublicKey":"LnAW4J80mzbBRPWuJyPcT1H04MElAYZus93sOG4WCFE=","endpoint":"146.70.230.82:51820"},{"privateKey":"+B0nD8F86Qz1EgnuPglmKEtdVPQeFxfbgO3E+kkwhl4=","peerPublicKey":"OKHT7YYBH4VD4vmuxrpbWQtY4SIRHuibasAZthkWEzg=","endpoint":"146.70.230.98:51820"},{"privateKey":"QDNLJjX8stIOVJza9HzlHUWgF6MA9QYL+7rzAiDHbUE=","peerPublicKey":"8jEgre7McUnWFLvjlQSenvYJgUGISWeNyLonrEupuDA=","endpoint":"146.70.230.114:51820"},{"privateKey":"EJaBl0BHpFVM4LF/850a5ZKDkmO+eSs5eXmAuIIzAmI=","peerPublicKey":"v5X/QsIRV2BRh6XKeDk1+NOiqAZDYYTD6xL3Qiu/b2g=","endpoint":"151.243.141.164:51820"},{"privateKey":"IInph6mqE0DmcpVvdsX5K5kCAqimzgRhqB+fDrJNmXg=","peerPublicKey":"qwoWn5tpqguIWdYpsIjUIMnrMT0dtxnrKwSUB4ZvMTA=","endpoint":"151.243.141.160:51820"}]'
+ENV WG_ROTATION_INTERVAL=60000
 
 WORKDIR /app
 COPY package.json package-lock.json ./
