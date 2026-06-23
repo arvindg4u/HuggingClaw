@@ -96,7 +96,8 @@ RUN mkdir -p /home/node/.openclaw/extensions && \
       echo "[build] Discord plugin pre-bundled from npm."; \
     else \
       echo "[build] Warning: could not pre-bundle Discord plugin (will install at runtime)"; \
-    fi
+    fi && \
+    chown -R 1000:1000 /home/node/.openclaw
 
 COPY --chown=1000:1000 cloudflare-proxy.js /opt/cloudflare-proxy.js
 COPY --chown=1000:1000 dns-resolve.py /home/node/app/dns-resolve.py

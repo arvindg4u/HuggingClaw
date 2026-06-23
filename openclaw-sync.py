@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import signal
 import sys
 import tempfile
@@ -275,9 +276,7 @@ def restore_embedded_state() -> None:
                     source_path.unlink(missing_ok=True)
                 continue
             target_path = OPENCLAW_HOME / name
-            shutil.rmtree(target_path, ignore_errors=True)
-            if target_path.is_file():
-                target_path.unlink(missing_ok=True)
+            subprocess.run(['rm', '-rf', str(target_path)], capture_output=True)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             if source_path.is_dir():
                 shutil.copytree(source_path, target_path)
