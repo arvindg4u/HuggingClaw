@@ -455,42 +455,8 @@ def fingerprint_dir(root: Path) -> str:
             )
     return hasher.hexdigest()
 
-
-def _copy_extra_path(staging_root: Path, src: Path) -> None:
-    if not src.exists():
-        return
-    target = staging_root / src.name
-    try:
-        if target.exists():
-            shutil.rmtree(target, ignore_errors=True) if target.is_dir() else target.unlink(missing_ok=True)
-        if src.is_dir():
-            shutil.copytree(src, target)
-        else:
-            shutil.copy2(src, target)
-    except Exception as exc:
-        print(f"Warning: could not copy extra path {src}: {exc}")
-
-
-def _restore_extensions_from_workspace() -> None:
-    """Restore extensions/ from dataset root back to ~/.openclaw/extensions/"""
-    src = WORKSPACE / "extensions"
-    dst = OPENCLAW_HOME / "extensions"
-    if not src.exists():
-        return
-    try:
-        if dst.exists():
-            shutil.rmtree(dst, ignore_errors=True)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src, dst)
-        print("Extensions restored from workspace backup.")
-    except Exception as exc:
-        print(f"Warning: could not restore extensions: {exc}")
-
-
 def create_snapshot_dir(source_root: Path) -> Path:
     staging_root = Path(tempfile.mkdtemp(prefix="huggingclaw-sync-"))
-    # Also copy extensions/ to snapshot root (separate from state snapshot)
-    _copy_extra_path(staging_root, OPENCLAW_HOME / "extensions")
     for path in sorted(source_root.rglob("*")):
         rel = path.relative_to(source_root)
         rel_posix = rel.as_posix()
@@ -576,8 +542,6 @@ def restore_workspace() -> bool:
                     shutil.copy2(child, destination)
 
         restore_embedded_state()
-        # Restore extensions/ from dataset root -> ~/.openclaw/extensions/
-        _restore_extensions_from_workspace()
         write_status("restored", f"Restored workspace from {repo_id}")
         return True
     except RepositoryNotFoundError:

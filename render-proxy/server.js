@@ -1,13 +1,14 @@
 /**
- * HuggingClaw Render Proxy — Telegram + WhatsApp relay
+ * HuggingClaw Render Proxy — Telegram + WhatsApp + Discord relay
  *
- * Deploy on Render free tier.  HF Spaces routes Telegram API and WhatsApp
+ * Deploy on Render free tier.  HF Spaces routes Telegram API, WhatsApp, and Discord
  * traffic through this proxy to bypass outbound connection blocks.
  *
  * Endpoints:
  *   /telegram/*         →  proxies to https://api.telegram.org/*
  *   /whatsapp/*         →  proxies WhatsApp Web HTTP endpoints
  *   /whatsapp-ws/       →  WebSocket proxy for WhatsApp Web
+ *   /discord/*          →  proxies to https://discord.com/*
  *   /health             →  health check (for cron ping)
  *   /                   →  status page
  */
@@ -131,6 +132,33 @@ function handleWhatsAppHttp(req, res, path) {
   req.pipe(proxyReq);
 }
 
+// ── HTTP proxy for Discord API ───────────────────────────────────────────
+function handleDiscord(req, res, path) {
+  const discordPath = path.replace(/^\/discord/, "") || "/";
+  const options = {
+    hostname: "discord.com",
+    port: 443,
+    path: discordPath,
+    method: req.method,
+    headers: { ...req.headers },
+    timeout: 30000,
+  };
+  delete options.headers["host"];
+  delete options.headers["x-target-host"];
+
+  log("discord", `${req.method} ${discordPath}`);
+  const proxyReq = https.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+  proxyReq.on("error", (e) => {
+    log("discord", `ERROR: ${e.message}`);
+    if (!res.headersSent) res.writeHead(502).end(JSON.stringify({ error: e.message }));
+  });
+  proxyReq.on("timeout", () => { proxyReq.destroy(); if (!res.headersSent) res.writeHead(504).end("timeout"); });
+  req.pipe(proxyReq);
+}
+
 // ── Health endpoint ─────────────────────────────────────────────────────
 function handleHealth(res) {
   res.writeHead(200, {
@@ -144,13 +172,14 @@ function handleHealth(res) {
     timestamp: new Date().toISOString(),
     telegram: "https://api.telegram.org",
     whatsapp: "web.whatsapp.com",
+    discord: "https://discord.com",
   }));
 }
 
 // ── Status / landing page ───────────────────────────────────────────────
 function handleStatus(res) {
   res.writeHead(200, { "Content-Type": "text/plain", "Cache-Control": "no-cache" });
-  res.end(`HuggingClaw Render Proxy\nUptime: ${Math.floor(process.uptime())}s\n\nEndpoints:\n  /telegram/*     → Telegram Bot API proxy\n  /whatsapp/*     → WhatsApp Multi-domain HTTP proxy (x-target-host)\n  /whatsapp-ws    → WhatsApp WebSocket relay (query: ?host=&path=)\n  /health         → Health check\n`);
+  res.end(`HuggingClaw Render Proxy\nUptime: ${Math.floor(process.uptime())}s\n\nEndpoints:\n  /telegram/*     → Telegram Bot API proxy\n  /whatsapp/*     → WhatsApp Multi-domain HTTP proxy (x-target-host)\n  /whatsapp-ws    → WhatsApp WebSocket relay (query: ?host=&path=)\n  /discord/*      → Discord API proxy\n  /health         → Health check\n`);
 }
 
 // ── HTTP Server ──────────────────────────────────────────────────────────
@@ -166,6 +195,7 @@ const server = http.createServer((req, res) => {
     return res.end("Upgrade Required — use WebSocket");
   }
   if (path.startsWith("/whatsapp")) return handleWhatsAppHttp(req, res, path);
+  if (path.startsWith("/discord")) return handleDiscord(req, res, path);
 
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("Not Found");

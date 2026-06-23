@@ -704,6 +704,10 @@ echo "[telegram] Proxy: api.telegram.org → ${TELEGRAM_API_BASE}"
 WHATSAPP_PROXY_BASE="${WHATSAPP_PROXY_BASE:-https://render-proxy-ukjd.onrender.com}"
 export WHATSAPP_PROXY_BASE
 
+# Discord API root — discord-proxy.cjs rewrites discord.com to this proxy.
+DISCORD_PROXY_BASE="${DISCORD_PROXY_BASE:-https://render-proxy-ukjd.onrender.com/discord}"
+export DISCORD_PROXY_BASE
+
 # Telegram (supports multiple user IDs, comma-separated)
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.plugins.entries.telegram = {"enabled": true}')
@@ -849,7 +853,7 @@ echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
 # These preload scripts patch iframe embedding, API key rotation, and
 # proxy routing (ROUTE_ENDPOINT/ROUTE_TARGETS for SOCKS5/WS proxy).
 export NODE_PATH="${NODE_PATH:-/home/node/browser-deps/node_modules}"
-export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/dns-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs --require /home/node/app/whatsapp-proxy.cjs"
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/dns-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs --require /home/node/app/whatsapp-proxy.cjs --require /home/node/app/discord-proxy.cjs"
 
 # ── Startup Summary ──
 echo ""
