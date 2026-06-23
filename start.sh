@@ -708,6 +708,19 @@ export WHATSAPP_PROXY_BASE
 DISCORD_PROXY_BASE="${DISCORD_PROXY_BASE:-https://render-proxy-ukjd.onrender.com/discord}"
 export DISCORD_PROXY_BASE
 
+# Discord WebSocket gateway fallback — wg-proxy via ROUTE_TARGETS
+if [ -n "${DISCORD_PROXY_BASE:-}" ] && [ -n "${ROUTE_ENDPOINT:-}" ]; then
+  if [ -n "${ROUTE_TARGETS:-}" ]; then
+    if ! echo "$ROUTE_TARGETS" | grep -q "gateway.discord.gg"; then
+      export ROUTE_TARGETS="${ROUTE_TARGETS},gateway.discord.gg"
+      echo "[discord] Gateway fallback: gateway.discord.gg added to proxy routing"
+    fi
+  else
+    export ROUTE_TARGETS="gateway.discord.gg"
+    echo "[discord] Gateway fallback: gateway.discord.gg added to proxy routing"
+  fi
+fi
+
 # Telegram (supports multiple user IDs, comma-separated)
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.plugins.entries.telegram = {"enabled": true}')
@@ -724,7 +737,7 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
     .channels.telegram.enabled = true
     | .channels.telegram.botToken = $token
     | .channels.telegram.commands.native = true
-    | .channels.telegram.timeoutSeconds = 60
+    | .channels.telegram.timeoutSeconds = 10  # Reduced from 60 to break 409 conflict loop (see openclaw#50064)
     | .channels.telegram.streaming = {
         "mode": "partial",
         "preview": {
