@@ -57,7 +57,7 @@ CONFIG_SETTLE_SECONDS = max(
 )
 # Debounce window: rapid changes (e.g. gateway restart + config patch)
 # are batched into a single sync within this window.
-DEBOUNCE_SECONDS = int(os.environ.get("SYNC_DEBOUNCE_SECONDS", "60"))
+DEBOUNCE_SECONDS = int(os.environ.get("SYNC_DEBOUNCE_SECONDS", "0"))
 # 429 rate limit retry: exponential backoff 60s/120s/240s/480s
 UPLOAD_RETRIES = int(os.environ.get("SYNC_UPLOAD_RETRIES", "5"))
 BASE_RETRY_DELAY = int(os.environ.get("SYNC_RETRY_BASE_DELAY", "60"))
