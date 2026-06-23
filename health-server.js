@@ -49,7 +49,7 @@ const DEVDATA_SYNC_INTERVAL = (process.env.DEVDATA_SYNC_INTERVAL || "180").trim(
 const DEVDATA_SEPARATE_DATASET = DEVDATA_DATASET_NAME !== BACKUP_DATASET_NAME;
 const DEVDATA_ENABLED = JUPYTER_ENABLED && HF_BACKUP_ENABLED && DEVDATA_SEPARATE_DATASET && !/^(off|false|0|no)$/i.test((process.env.DEVDATA || "on").trim());
 const APP_BASE = normalizeBase(process.env.APP_BASE, "/app");
-const SYNC_STATUS_FILE = "/tmp/sync-status.json";
+const SYNC_STATUS_FILE = "/home/node/.openclaw/sync-status.json";
 
 // ── Private Space redirect support ──
 // HF automatically sets SPACE_ID as "username/spacename" in every Space container.

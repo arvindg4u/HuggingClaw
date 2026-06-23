@@ -36,19 +36,16 @@ from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 OPENCLAW_HOME = Path("/home/node/.openclaw")
-# Additional paths to include in backup (explicit overrides)
+# Additional paths to include in backup (plugin binaries, Jupyter-visible dirs)
 EXTRA_BACKUP_PATHS = [
-    OPENCLAW_HOME / "extensions",  # Plugin binaries
-]
-# Additional paths to include in backup (e.g., Jupyter-visible directories)
-EXTRA_BACKUP_PATHS = [
-    Path("/OpenClaw-Home"),
+    OPENCLAW_HOME / "extensions",  # Plugin binaries (WhatsApp, etc.)
+    OPENCLAW_HOME / "openclaw.json",  # Gateway config
 ]
 OPENCLAW_CONFIG_FILE = OPENCLAW_HOME / "openclaw.json"
 WORKSPACE = OPENCLAW_HOME / "workspace"
-STATUS_FILE = Path("/tmp/sync-status.json")
+STATUS_FILE = OPENCLAW_HOME / "sync-status.json"
 SYNC_LOCK_FILE = Path("/tmp/huggingclaw-sync.lock")
-INTERVAL = int(os.environ.get("SYNC_INTERVAL", "600"))
+INTERVAL = int(os.environ.get("SYNC_INTERVAL", "300"))
 INITIAL_DELAY = int(os.environ.get("SYNC_START_DELAY", "10"))
 CONFIG_WATCH_INTERVAL = max(
     0.5,
