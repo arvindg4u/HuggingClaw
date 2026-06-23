@@ -39,7 +39,7 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 OPENCLAW_HOME = Path("/home/node/.openclaw")
 OPENCLAW_CONFIG_FILE = OPENCLAW_HOME / "openclaw.json"
 WORKSPACE = OPENCLAW_HOME / "workspace"
-STATUS_FILE = Path("/tmp/sync-status.json")
+STATUS_FILE = Path("/home/node/.openclaw/sync-status.json")
 SYNC_LOCK_FILE = Path("/tmp/huggingclaw-sync.lock")
 INTERVAL = int(os.environ.get("SYNC_INTERVAL", "180"))
 INITIAL_DELAY = int(os.environ.get("SYNC_START_DELAY", "10"))
