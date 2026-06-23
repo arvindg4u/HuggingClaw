@@ -1757,7 +1757,20 @@ while true; do
     python3 /home/node/app/dns-resolve.py 2>&1 || true
   fi
 
-  echo "Launching OpenClaw gateway on port ${GATEWAY_PORT}..."
+  
+# ── Ensure pre-bundled plugins survive backup restores ──
+if command -v openclaw &>/dev/null; then
+  if [ ! -d /home/node/.openclaw/extensions/whatsapp ] && [ -n "${WHATSAPP_ENABLED:-}" ]; then
+    echo "[startup] Pre-bundled plugin whatsapp missing — re-installing..."
+    openclaw plugins install clawhub:@openclaw/whatsapp 2>/dev/null || true
+  fi
+  if [ ! -d /home/node/.openclaw/extensions/discord ]; then
+    echo "[startup] Pre-bundled plugin discord missing — re-installing..."
+    openclaw plugins install clawhub:@openclaw/discord 2>/dev/null || true
+  fi
+fi
+
+echo "Launching OpenClaw gateway on port ${GATEWAY_PORT}..."
 
   GATEWAY_ARGS=(gateway run --port "${GATEWAY_PORT}" --bind lan)
   if [ "${GATEWAY_VERBOSE:-0}" = "1" ]; then
