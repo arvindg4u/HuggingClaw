@@ -36,11 +36,8 @@ from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 OPENCLAW_HOME = Path("/home/node/.openclaw")
-# Additional paths to include in backup (plugin binaries, Jupyter-visible dirs)
-EXTRA_BACKUP_PATHS = [
-    OPENCLAW_HOME / "extensions",  # Plugin binaries (WhatsApp, etc.)
-    OPENCLAW_HOME / "openclaw.json",  # Gateway config
-]
+# Additional paths to include in backup (already covered by snapshot_state_into_workspace)
+EXTRA_BACKUP_PATHS: list[Path] = []
 OPENCLAW_CONFIG_FILE = OPENCLAW_HOME / "openclaw.json"
 WORKSPACE = OPENCLAW_HOME / "workspace"
 STATUS_FILE = OPENCLAW_HOME / "sync-status.json"
