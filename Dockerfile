@@ -83,16 +83,16 @@ RUN ln -s /home/node/.openclaw/openclaw-app/openclaw.mjs /usr/local/bin/openclaw
 
 # ── Pre-bundle WhatsApp + Discord plugins (build time, real directory) ──
 RUN mkdir -p /home/node/.openclaw/extensions && \
-    if openclaw plugins install clawhub:@openclaw/whatsapp 2>/dev/null; then \
+    if HOME=/home/node openclaw plugins install clawhub:@openclaw/whatsapp 2>/dev/null; then \
       echo "[build] WhatsApp plugin pre-bundled from ClawHub."; \
-    elif openclaw plugins install @openclaw/whatsapp 2>/dev/null; then \
+    elif HOME=/home/node openclaw plugins install @openclaw/whatsapp 2>/dev/null; then \
       echo "[build] WhatsApp plugin pre-bundled from npm."; \
     else \
       echo "[build] Warning: could not pre-bundle WhatsApp plugin (will install at runtime)"; \
     fi && \
-    if openclaw plugins install clawhub:@openclaw/discord 2>/dev/null; then \
+    if HOME=/home/node openclaw plugins install clawhub:@openclaw/discord 2>/dev/null; then \
       echo "[build] Discord plugin pre-bundled from ClawHub."; \
-    elif openclaw plugins install @openclaw/discord 2>/dev/null; then \
+    elif HOME=/home/node openclaw plugins install @openclaw/discord 2>/dev/null; then \
       echo "[build] Discord plugin pre-bundled from npm."; \
     else \
       echo "[build] Warning: could not pre-bundle Discord plugin (will install at runtime)"; \
