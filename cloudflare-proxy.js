@@ -724,11 +724,16 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
         // Normalize URL: https:// → wss:// for WebSocket constructor
         const wsUrl = proxyUrl.replace(/^https:/i, 'wss:');
         let ws;
+        log(`[wsTrace] Creating WebSocket to ${wsUrl.substring(0, 50)}...`);
         try {
           // handshakeTimeout: abort if WebSocket upgrade not completed in 20s.
           // This prevents the 30s blind timeout from blocking all retries.
           ws = new WebSocket(wsUrl, { handshakeTimeout: 20000 });
-        } catch(e) { clearTimeout(timer); reject(e); return; }
+          log(`[wsTrace] WebSocket constructor returned successfully`);
+        } catch(e) {
+          log(`[wsTrace] WebSocket constructor threw: "${e.message}"`);
+          clearTimeout(timer); reject(e); return;
+        }
 
         let pendingWriteBuffer = [];
         let tunnelReady = false;
@@ -788,14 +793,31 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
         });
 
         ws.on('open', () => {
+          log(`[wsTrace] WebSocket OPEN event for ${targetHost}:${targetPort}`);
           ws.send(JSON.stringify({ host: targetHost, port: targetPort }), { binary: false });
         });
-        ws.on('error', (e) => { clearTimeout(timer); if (!settled) { settled = true; reject(e); } });
-        ws.on('close', () => {
+        ws.on('upgrade', (res) => {
+          log(`[wsTrace] WebSocket upgrade response: ${res.statusCode}`);
+        });
+        ws.on('error', (e) => {
+          log(`[wsTrace] WebSocket ERROR: "${e?.message}" for ${targetHost}:${targetPort}`);
+          clearTimeout(timer); if (!settled) { settled = true; reject(e); }
+        });
+        ws.on('close', (code, reason) => {
+          log(`[wsTrace] WebSocket CLOSE: code=${code} reason="${reason?.toString()}" for ${targetHost}:${targetPort}`);
           clearTimeout(timer);
           if (!tunnelReady && !settled) { settled = true; reject(new Error('WebSocket closed before tunnel ready')); }
           duplex.push(null);
         });
+        // Also track the underlying request for unexpected responses
+        if (ws._req) {
+          ws._req.on('response', (res) => {
+            log(`[wsTrace] Underlying HTTP response: ${res.statusCode} for ${targetHost}:${targetPort}`);
+          });
+          ws._req.on('upgrade', (res) => {
+            log(`[wsTrace] Underlying HTTP upgrade: ${res.statusCode} for ${targetHost}:${targetPort}`);
+          });
+        }
     });
   });
 }
