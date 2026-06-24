@@ -93,11 +93,13 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
   // WebSocket proxy (for wss:// or ws:// URLs)
   if (pUrl.startsWith('wss') || pUrl.startsWith('ws://')) {
     return wsConnectProxy(targetHost, targetPort, timeout)
-      .catch(() => {
+      .catch((e) => {
+        log(`[dbg] wsConnectProxy failed: "${e?.message}" (target=${targetHost}:${targetPort}, pUrl=${pUrl?.substring(0,50)})`);
         log(`WS proxy failed for ${targetHost}:${targetPort}, retrying once...`);
         return wsConnectProxy(targetHost, targetPort, timeout);
       })
-      .catch(() => {
+      .catch((e) => {
+        log(`[dbg] wsConnectProxy retry also failed: "${e?.message}"`);
         const err = new Error(`FATAL: WebSocket proxy failed for ${targetHost}:${targetPort} - no fallback`);
         log(err.message);
         throw err;
@@ -107,11 +109,14 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
   // For https:// URLs: try WebSocket with retry, then TLS/HTTP CONNECT.
   // NEVER fall back to directConnect - fail visibly if proxy is down.
   return wsConnectProxy(targetHost, targetPort, Math.min(timeout, 30000))
-    .catch(() => {
+    .catch((e) => {
+      log(`[dbg] wsConnectProxy(https) failed: "${e?.message}" (target=${targetHost}:${targetPort})`);
       log(`WS proxy failed for ${targetHost}:${targetPort}, retrying once...`);
       return wsConnectProxy(targetHost, targetPort, Math.min(timeout, 30000));
     })
-    .catch(() => tlsConnectProxy(targetHost, targetPort, timeout)
+    .catch((e) => {
+      log(`[dbg] wsConnectProxy(https) retry also failed: "${e?.message}"`);
+      return tlsConnectProxy(targetHost, targetPort, timeout)
       .catch(() => httpConnectProxy(targetHost, targetPort, timeout)
         .catch(() => {
           const err = new Error(`FATAL: All proxy methods failed for ${targetHost}:${targetPort} - no direct fallback`);
