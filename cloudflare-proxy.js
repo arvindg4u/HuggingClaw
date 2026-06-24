@@ -95,33 +95,39 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
       });
   }
 
+  // Helper: retry wsConnectProxy with exponential backoff
+  const wsRetry = (attempts = 3) => {
+    const attempt = (n) => {
+      if (n <= 0) return Promise.reject(new Error('max retries exhausted'));
+      return wsConnectProxy(targetHost, targetPort, timeout)
+        .catch((e) => {
+          const dbgMsg = e?.message || 'unknown error';
+          log(`[dbg] wsConnectProxy failed: "${dbgMsg}" (target=${targetHost}:${targetPort}, remaining=${n-1})`);
+          if (n <= 1) throw e;
+          // Exponential backoff: 1s, 2s, 4s...
+          const delay = Math.min(1000 * Math.pow(2, 3 - n), 8000);
+          return new Promise(r => setTimeout(r, delay)).then(() => attempt(n - 1));
+        });
+    };
+    return attempt(attempts);
+  };
+
   // WebSocket proxy (for wss:// or ws:// URLs)
   if (pUrl.startsWith('wss') || pUrl.startsWith('ws://')) {
-    return wsConnectProxy(targetHost, targetPort, timeout)
+    return wsRetry(3)
       .catch((e) => {
-        log(`[dbg] wsConnectProxy failed: "${e?.message}" (target=${targetHost}:${targetPort}, pUrl=${pUrl?.substring(0,50)})`);
-        log(`WS proxy failed for ${targetHost}:${targetPort}, retrying once...`);
-        return wsConnectProxy(targetHost, targetPort, timeout);
-      })
-      .catch((e) => {
-        log(`[dbg] wsConnectProxy retry also failed: "${e?.message}"`);
+        log(`[dbg] wsConnectProxy all retries failed: "${e?.message}"`);
         const err = new Error(`FATAL: WebSocket proxy failed for ${targetHost}:${targetPort} - no fallback`);
         log(err.message);
         throw err;
       });
   }
 
-  // For https:// URLs: try WebSocket with retry, then TLS/HTTP CONNECT.
-  // NEVER fall back to directConnect - fail visibly if proxy is down.
-  return wsConnectProxy(targetHost, targetPort, Math.min(timeout, 30000))
+  // For https:// URLs: try WebSocket with retry, then TLS/HTTP CONNECT, then fatal
+  return wsRetry(3)
     .catch((e) => {
-      log(`[dbg] wsConnectProxy(https) failed: "${e?.message}" (target=${targetHost}:${targetPort})`);
-      log(`WS proxy failed for ${targetHost}:${targetPort}, retrying once...`);
-      return wsConnectProxy(targetHost, targetPort, Math.min(timeout, 30000));
-    })
-        .catch((e) => {
-      log(`[dbg] wsConnectProxy(https) retry also failed: "${e?.message}"`);
-      // Try TLS CONNECT fallback, then HTTP CONNECT, then fatal error
+      log(`[dbg] wsConnectProxy all retries failed: "${e?.message}"`);
+      // Try TLS CONNECT fallback, then HTTP CONNECT
       return tlsConnectProxy(targetHost, targetPort, timeout)
         .catch(() => httpConnectProxy(targetHost, targetPort, timeout))
         .catch((e2) => {
@@ -130,7 +136,8 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
           throw err;
         });
     });
-  }
+
+}
 
 function directConnect(targetHost, targetPort, timeout = 30000) {
   return new Promise((resolve, reject) => {
@@ -596,15 +603,85 @@ tls.connect = function(...args) {
     return origTlsConnect.call(this, nopts, cb);
   }
 
-  // Socket already provided (e.g. from net.connect patch for proxied host)
-  // Use it directly — don't create a redundant tunnel
+  // Socket already provided (e.g. from https.request createConnection or net.connect)
+  // Use it directly — TLS over the already-established tunnel
   if (opts.socket) return cb ? origTlsConnect.call(this, opts, cb) : origTlsConnect.call(this, opts);
 
   if (opts._hc || !needsProxy(hn)) return origTlsConnect.call(this, ...args);
 
-  // tls.connect for proxied hosts: handled at https.request level via createConnection.
-  // Direct callers pass through to native (bypasses proxy) to avoid race condition.
-  return origTlsConnect.call(this, ...args);
+  // For direct tls.connect calls to proxied hosts (e.g. ws library wss:// connections):
+  // Establish proxy tunnel first, then do TLS over it.
+  // We return a socket that connects asynchronously — Node buffers writes until ready.
+  const tlsOpts = { ...opts, _hc: true };
+  if (cb) {
+    // Callback mode: establish tunnel, then TLS, then call cb
+    proxyConnect(hn, opts.port || 443)
+      .then((tunnel) => {
+        const tlsSocket = origTlsConnect({
+          socket: tunnel,
+          host: opts.host || hn,
+          servername: opts.servername || hn,
+          rejectUnauthorized: opts.rejectUnauthorized !== false,
+        }, () => cb(null, tlsSocket));
+        tlsSocket.on('error', (e) => cb(e));
+      })
+      .catch((e) => {
+        try { if (typeof cb === 'function') cb(e); } catch (_) {}
+      });
+    // Return a placeholder socket — the real one comes via callback
+    const placeholder = new net.Socket();
+    placeholder.setMaxListeners(0);
+    process.nextTick(() => placeholder.emit('error', new Error('connecting')));
+    return placeholder;
+  }
+  // Non-callback mode: tunnel then TLS synchronously via socket option
+  const tunnelPromise = proxyConnect(hn, opts.port || 443);
+  const early = new net.Socket();
+  early.setMaxListeners(0);
+  let settled = false;
+  tunnelPromise.then((tunnel) => {
+    if (settled) return;
+    settled = true;
+    const tlsSocket = origTlsConnect({
+      socket: tunnel,
+      host: opts.host || hn,
+      servername: opts.servername || hn,
+      rejectUnauthorized: opts.rejectUnauthorized !== false,
+    });
+    // Forward TLS socket events to our early socket
+    tlsSocket.on('secureConnect', () => { early.emit('connect'); early.emit('secureConnect'); });
+    tlsSocket.on('data', (d) => { if (!early.destroyed) try { early.push(d); } catch(_) {} });
+    tlsSocket.on('end', () => { if (!early.destroyed) early.push(null); });
+    tlsSocket.on('close', () => { if (!early.destroyed) early.destroy(); });
+    tlsSocket.on('error', (e) => { if (!early.destroyed) early.destroy(e); });
+    // Replace write to forward to tlsSocket
+    early._hc_tls = tlsSocket;
+  }).catch((e) => {
+    if (!settled) { settled = true; early.destroy(e); }
+  });
+  // Override write to buffer or forward to TLS socket
+  const origWrite = early.write;
+  early.write = function(data, ...args) {
+    if (this._hc_tls) return this._hc_tls.write(data, ...args);
+    // Buffer writes until tunnel is ready
+    if (!this._hc_buf) this._hc_buf = [];
+    this._hc_buf.push([Buffer.from(data), args]);
+    return true;
+  };
+  // Drain buffered writes once tunnel is ready
+  const origEnd = early.end;
+  early.end = function(data, ...args) {
+    if (data) this.write(data);
+    if (this._hc_tls) return this._hc_tls.end(...args);
+    if (!this._hc_endBuf) this._hc_endBuf = args;
+  };
+  // Patch destroy to clean up tunnel
+  const origDestroy = early.destroy;
+  early.destroy = function(e) {
+    if (this._hc_tls) { try { this._hc_tls.destroy(e); } catch(_) {} }
+    origDestroy.call(this, e);
+  };
+  return early;
 };
 
 // ── WebSocket proxy connection (one-shot, legacy format) ──

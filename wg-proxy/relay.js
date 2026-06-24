@@ -44,6 +44,7 @@ if (WG_CONFIGS.length === 0) {
 let currentWireProxy = null;
 let currentConfigIdx = 0;
 let rotationTimer = null;
+let wireproxyRestartCount = 0;
 
 function pickConfig() {
   if (WG_CONFIGS.length <= 1) return WG_CONFIGS[0];
@@ -81,9 +82,53 @@ function startWireProxy(cfg) {
   console.log(`[wg-proxy] Starting WireGuard → ${cfg.endpoint}`);
   const wp = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
   wp.on("exit", (code) => {
-    console.log(`[wg-proxy] wireproxy exited (code ${code}) for ${cfg.endpoint}`);
+    console.log(`[wg-proxy] wireproxy exited (code ${code}) for ${cfg.endpoint} -- restarting...`);
+    setTimeout(() => {
+      wireproxyRestartCount++;
+      console.log(`[wg-proxy] Restarting wireproxy (attempt ${wireproxyRestartCount})...`);
+      try {
+        const cfg2 = WG_CONFIGS[currentConfigIdx % WG_CONFIGS.length];
+        writeWireProxyConfig(cfg2);
+        currentWireProxy = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
+        currentWireProxy.on("exit", (code2) => {
+          console.log(`[wg-proxy] Restarted wireproxy also exited (code ${code2})`);
+        });
+      } catch(e) { console.error('[wg-proxy] Restart failed:', e.message); }
+    }, 3000);
   });
   return wp;
+}
+
+// Test if SOCKS5 tunnel is actually working via a real connect
+async function testSocks5Working() {
+  try {
+    return await new Promise((resolve, reject) => {
+      const s = net.createConnection({ host: SOCKS_HOST, port: SOCKS_PORT }, () => {
+        s.write(Buffer.from([0x05, 0x01, 0x00]));
+      });
+      let state = 0, buf = Buffer.alloc(0);
+      const timer = setTimeout(() => { s.destroy(); resolve(false); }, 10000);
+      s.on("data", (d) => {
+        buf = Buffer.concat([buf, d]);
+        try {
+          if (state === 0 && buf.length >= 2) {
+            if (buf[1] !== 0x00) { clearTimeout(timer); s.destroy(); resolve(false); return; }
+            state = 1;
+            const testHost = "1.1.1.1";
+            const testPort = 80;
+            const hb = Buffer.from(testHost);
+            s.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hb.length]), hb, Buffer.from([(testPort >> 8) & 0xFF, testPort & 0xFF])]));
+            buf = Buffer.alloc(0);
+          } else if (state === 1 && buf.length >= 5) {
+            clearTimeout(timer);
+            if (buf[1] === 0x00) { s.end(); resolve(true); }
+            else { s.destroy(); resolve(false); }
+          }
+        } catch(e) { clearTimeout(timer); s.destroy(); resolve(false); }
+      });
+      s.on("error", () => { clearTimeout(timer); resolve(false); });
+    });
+  } catch(e) { return false; }
 }
 
 async function waitForSocks5(timeoutMs = 30000) {
@@ -105,6 +150,16 @@ async function waitForSocks5(timeoutMs = 30000) {
     } catch (e) {
       await new Promise((r) => setTimeout(r, 1000));
     }
+  }
+  // Now verify the tunnel actually works with a real connection
+  const tunnelOk = await testSocks5Working();
+  if (!tunnelOk) {
+    const extendedDeadline = Date.now() + 30000;
+    while (Date.now() < extendedDeadline) {
+      if (await testSocks5Working()) return true;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    return false;
   }
   return false;
 }
@@ -135,6 +190,14 @@ async function rotateConfig() {
 async function startRotationLoop() {
   if (WG_CONFIGS.length <= 1) {
     console.log(`[wg-proxy] Single config (no rotation): ${WG_CONFIGS[0]?.endpoint}`);
+    // Monitor wireproxy health every 60s — signal reconnect if tunnel drops
+    setInterval(async () => {
+      const ok = await testSocks5Working();
+      if (!ok && currentWireProxy && currentWireProxy.exitCode === null) {
+        console.log('[wg-proxy] SOCKS5 unresponsive — sending SIGUSR1 for reconnect');
+        try { currentWireProxy.kill("SIGUSR1"); } catch (e) {}
+      }
+    }, 60000);
     return;
   }
   console.log(`[wg-proxy] IP rotation enabled: ${WG_CONFIGS.length} config(s)`);
@@ -181,6 +244,14 @@ function socks5Connect(targetHost, targetPort) {
 
 // ── HTTP + WebSocket server ──
 const server = http.createServer((req, res) => {
+  // Detailed SOCKS5 health check — tests actual tunnel connectivity
+  if (req.url === "/health/socks5") {
+    testSocks5Working().then((ok) => {
+      res.writeHead(ok ? 200 : 503);
+      res.end(JSON.stringify({ socks5: ok, mode: "wg-proxy" }));
+    });
+    return;
+  }
   const health = {
     status: "ok",
     mode: "wg-proxy",

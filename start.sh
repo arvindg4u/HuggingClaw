@@ -1787,13 +1787,19 @@ while true; do
       echo "[pre-warm] Waking proxy chain: ${PROXY_HOST}..."
       # First warm the HTTP endpoint (wakes Render free tier container)
       curl -sk --max-time 15 "https://${PROXY_HOST}/" >/dev/null 2>&1
-      # Then wait for Tor to be ready by attempting a real SOCKS5 connect
-      # This gives Tor time to bootstrap before the first model request
-      echo "[pre-warm] Waiting for Tor to bootstrap..."
+      # Wait for HTTP endpoint to come up
       for w in $(seq 1 30); do
-        socks_test=$(curl -sk --max-time 5 "https://${PROXY_HOST}/" -o /dev/null -w "%{http_code}" 2>/dev/null)
-        [ "$socks_test" = "200" ] && break
+        http_test=$(curl -sk --max-time 5 "https://${PROXY_HOST}/" -o /dev/null -w "%{http_code}" 2>/dev/null)
+        [ "$http_test" = "200" ] && break
         sleep 1
+      done
+      # Then verify SOCKS5 tunnel is actually ready via /health/socks5 endpoint
+      echo "[pre-warm] Verifying SOCKS5 tunnel..."
+      for w in $(seq 1 30); do
+        socks_health=$(curl -sk --max-time 5 "https://${PROXY_HOST}/health/socks5" 2>/dev/null)
+        socks_ok=$(echo "$socks_health" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('socks5','false'))" 2>/dev/null || echo "false")
+        [ "$socks_ok" = "True" ] && break
+        sleep 2
       done
       echo "[pre-warm] Proxy chain ready"
     fi
