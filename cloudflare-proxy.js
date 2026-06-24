@@ -41,6 +41,11 @@ const SOCKS5_DOMAINS = PROXY_DOMAINS_RAW
   ? PROXY_DOMAINS_RAW.split(',').map(s => s.trim()).filter(Boolean)
   : [];
 
+// Always include httpbin.org for tunnel exit IP verification
+if (!SOCKS5_DOMAINS.includes('httpbin.org')) {
+  SOCKS5_DOMAINS.push('httpbin.org');
+}
+
 // WhatsApp domains that need routing through Cloudflare Worker
 // (HF Spaces blocks direct connections to WhatsApp servers)
 const WHATSAPP_DOMAINS = [

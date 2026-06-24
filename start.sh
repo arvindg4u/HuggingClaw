@@ -65,6 +65,14 @@ GATEWAY_TOKEN="$(trim_var "${GATEWAY_TOKEN:-}")"
 export GATEWAY_TOKEN
 export ROUTE_ENDPOINT
 export ROUTE_TARGETS
+
+# Auto-include IP echo service for tunnel exit verification
+if [ -n "${ROUTE_ENDPOINT:-}" ] && [ -n "${ROUTE_TARGETS:-}" ]; then
+  if ! echo "$ROUTE_TARGETS" | grep -q "httpbin.org"; then
+    export ROUTE_TARGETS="${ROUTE_TARGETS},httpbin.org"
+  fi
+fi
+
 OPENCLAW_PASSWORD="$(trim_var "${OPENCLAW_PASSWORD:-}")"
 LLM_API_KEY="$(trim_var "${LLM_API_KEY:-}")"
 
