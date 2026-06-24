@@ -120,7 +120,6 @@ RUN chmod +x /home/node/app/start.sh \
               /home/node/app/package-manifest.sh \
               /home/node/app/openclaw-sync.py \
               /home/node/app/jupyter-devdata-sync.py \
-
               /home/node/app/dns-resolve.py
 
 # ── Fix /tmp ownership (Docker build as root leaves root-owned files) ──
