@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const http = require("http");
 const net = require("net");
+const dns = require("dns");
 const { spawn } = require("child_process");
 const { WebSocketServer } = require("ws");
 
@@ -208,34 +209,59 @@ async function startRotationLoop() {
 // ── SOCKS5 through WireGuard ──
 function socks5Connect(targetHost, targetPort) {
   const socksStart = Date.now();
-  return new Promise((resolve, reject) => {
-    const s = net.createConnection({ host: SOCKS_HOST, port: SOCKS_PORT }, () => {
-      console.log(`[relay] socks5 TCP connected to wireproxy (${SOCKS_HOST}:${SOCKS_PORT}) in ${Date.now() - socksStart}ms — sending auth`);
-      s.write(Buffer.from([0x05, 0x01, 0x00]));
-    });
-    let state = 0, buf = Buffer.alloc(0);
-    const timer = setTimeout(() => { s.destroy(); reject(new Error("timeout")); }, 20000);
-    const cleanup = () => { clearTimeout(timer); s.removeListener("data", onData); };
-    const onData = (d) => {
-      buf = Buffer.concat([buf, d]);
-      try {
-        if (state === 0 && buf.length >= 2) {
-          if (buf[1] !== 0x00) { cleanup(); s.destroy(); reject(new Error("auth fail")); return; }
-          console.log(`[relay] SOCKS5 auth OK for ${targetHost}:${targetPort} in ${Date.now() - socksStart}ms — sending connect`);
-          state = 1;
-          const hb = Buffer.from(targetHost);
-          s.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hb.length]), hb, Buffer.from([(targetPort >> 8) & 0xFF, targetPort & 0xFF])]));
-          buf = Buffer.alloc(0);
-        } else if (state === 1 && buf.length >= 4) {
-          cleanup();
-          if (buf[1] !== 0x00) { s.destroy(); reject(new Error("reject:" + buf[1])); return; }
-          resolve(s);
+  // Resolve DNS on relay side first to avoid WireGuard tunnel DNS failures
+  const resolveHost = (host) => {
+    return new Promise((res) => {
+      // Check if already an IP address
+      if (net.isIPv4(host) || net.isIPv6(host)) return res(host);
+      dns.lookup(host, 4, (err, ip) => {
+        if (err) {
+          console.log(`[relay] DNS resolve FAILED for ${host}: ${err.code} — falling back to domain name`);
+          return res(host);
         }
-      } catch (e) { cleanup(); reject(e); }
-    };
-    s.on("data", onData);
-    s.on("error", (e) => { cleanup(); reject(e); });
-    s.setTimeout(20000, () => { s.destroy(); cleanup(); reject(new Error("timeout")); });
+        console.log(`[relay] DNS resolved ${host} -> ${ip}`);
+        return res(ip);
+      });
+    });
+  };
+  return resolveHost(targetHost).then((connectHost) => {
+    return new Promise((resolve, reject) => {
+      const s = net.createConnection({ host: SOCKS_HOST, port: SOCKS_PORT }, () => {
+        console.log(`[relay] socks5 TCP connected to wireproxy (${SOCKS_HOST}:${SOCKS_PORT}) in ${Date.now() - socksStart}ms — sending auth`);
+        s.write(Buffer.from([0x05, 0x01, 0x00]));
+      });
+      let state = 0, buf = Buffer.alloc(0);
+      const timer = setTimeout(() => { s.destroy(); reject(new Error("timeout")); }, 20000);
+      const cleanup = () => { clearTimeout(timer); s.removeListener("data", onData); };
+      const onData = (d) => {
+        buf = Buffer.concat([buf, d]);
+        try {
+          if (state === 0 && buf.length >= 2) {
+            if (buf[1] !== 0x00) { cleanup(); s.destroy(); reject(new Error("auth fail")); return; }
+            console.log(`[relay] SOCKS5 auth OK for ${targetHost}:${targetPort} in ${Date.now() - socksStart}ms — sending connect`);
+            state = 1;
+            // Use IPv4 type (0x01) for resolved IPs, domain name type (0x03) as fallback
+            let connectMsg;
+            if (net.isIPv4(connectHost)) {
+              const ipBytes = connectHost.split('.').map(Number);
+              connectMsg = Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x01]), Buffer.from(ipBytes), Buffer.from([(targetPort >> 8) & 0xFF, targetPort & 0xFF])]);
+            } else {
+              const hb = Buffer.from(connectHost);
+              connectMsg = Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hb.length]), hb, Buffer.from([(targetPort >> 8) & 0xFF, targetPort & 0xFF])]);
+            }
+            s.write(connectMsg);
+            buf = Buffer.alloc(0);
+          } else if (state === 1 && buf.length >= 4) {
+            cleanup();
+            if (buf[1] !== 0x00) { s.destroy(); reject(new Error("reject:" + buf[1])); return; }
+            resolve(s);
+          }
+        } catch (e) { cleanup(); reject(e); }
+      };
+      s.on("data", onData);
+      s.on("error", (e) => { cleanup(); reject(e); });
+      s.setTimeout(20000, () => { s.destroy(); cleanup(); reject(new Error("timeout")); });
+    });
   });
 }
 
