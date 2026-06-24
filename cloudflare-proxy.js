@@ -565,6 +565,10 @@ tls.connect = function(...args) {
     return origTlsConnect.call(this, nopts, cb);
   }
 
+  // Socket already provided (e.g. from net.connect patch for proxied host)
+  // Use it directly — don't create a redundant tunnel
+  if (opts.socket) return cb ? origTlsConnect.call(this, opts, cb) : origTlsConnect.call(this, opts);
+
   if (opts._hc || !needsProxy(hn)) return origTlsConnect.call(this, ...args);
 
   // Use proxyConnect which handles socks5://, wss://, and direct fallback
