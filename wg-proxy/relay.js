@@ -168,6 +168,32 @@ async function waitForSocks5(timeoutMs = 30000) {
   return false;
 }
 
+function killAllWireProxy() {
+  try {
+    require("child_process").execSync("pkill -9 wireproxy 2>/dev/null; pkill -9 wireguard-go 2>/dev/null; kill -9 $(lsof -ti:1080 2>/dev/null) 2>/dev/null", { stdio: "ignore" });
+  } catch (e) { /* best effort */ }
+}
+
+async function waitForPortRelease(host, port, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await new Promise((resolve, reject) => {
+        const s = require("net").createConnection({ host, port }, () => {
+          s.destroy();
+          reject(new Error("port still in use"));
+        });
+        s.on("error", () => resolve(true));
+        setTimeout(() => { s.destroy(); reject(new Error("timeout")); }, 2000);
+      });
+      return true;
+    } catch (e) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+  return false;
+}
+
 async function rotateConfig() {
   if (WG_CONFIGS.length <= 1) return;
   
