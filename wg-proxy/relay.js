@@ -80,22 +80,31 @@ BindAddress = 0.0.0.0:1080
 
 function startWireProxy(cfg) {
   writeWireProxyConfig(cfg);
-  console.log(`[wg-proxy] Starting WireGuard → ${cfg.endpoint}`);
+  console.log(`[wg-proxy] Starting WireGuard -> ${cfg.endpoint}`);
   const wp = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
-  wp.on("exit", (code) => {
+  wp.on("exit", async (code) => {
+    try { require("child_process").execSync("pkill -9 wireproxy 2>/dev/null"); } catch(e) {}
     console.log(`[wg-proxy] wireproxy exited (code ${code}) for ${cfg.endpoint} -- restarting...`);
-    setTimeout(() => {
-      wireproxyRestartCount++;
-      console.log(`[wg-proxy] Restarting wireproxy (attempt ${wireproxyRestartCount})...`);
-      try {
-        const cfg2 = WG_CONFIGS[currentConfigIdx % WG_CONFIGS.length];
-        writeWireProxyConfig(cfg2);
-        currentWireProxy = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
-        currentWireProxy.on("exit", (code2) => {
-          console.log(`[wg-proxy] Restarted wireproxy also exited (code ${code2})`);
+    await new Promise(r => setTimeout(r, 2000));
+    wireproxyRestartCount++;
+    console.log(`[wg-proxy] Restarting wireproxy (attempt ${wireproxyRestartCount})...`);
+    try {
+      for (let i = 0; i < 15; i++) {
+        const free = await new Promise(res => {
+          const s = require("net").createConnection({host:"127.0.0.1",port:1080});
+          s.on("connect", () => { s.destroy(); res(false); });
+          s.on("error", () => res(true));
         });
-      } catch(e) { console.error('[wg-proxy] Restart failed:', e.message); }
-    }, 3000);
+        if (free) break;
+        await new Promise(r => setTimeout(r, 500));
+      }
+      const cfg2 = WG_CONFIGS[currentConfigIdx % WG_CONFIGS.length];
+      writeWireProxyConfig(cfg2);
+      currentWireProxy = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
+      currentWireProxy.on("exit", (code2) => {
+        console.log(`[wg-proxy] Restarted wireproxy also exited (code ${code2})`);
+      });
+    } catch(e) { console.error("[wg-proxy] Restart failed:", e.message); }
   });
   return wp;
 }
@@ -165,13 +174,18 @@ async function rotateConfig() {
   const newCfg = pickConfig();
   console.log(`[wg-proxy] Rotating → ${newCfg.endpoint}`);
   
+  // Kill ALL wireproxy processes and wait for port release
   if (currentWireProxy) {
     currentWireProxy.kill("SIGTERM");
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 1000));
     if (currentWireProxy && !currentWireProxy.killed) {
       currentWireProxy.kill("SIGKILL");
     }
   }
+  killAllWireProxy();
+  
+  // Wait for port 1080 to be released
+  await waitForPortRelease('127.0.0.1', 1080, 7500);
   
   currentWireProxy = startWireProxy(newCfg);
   const ready = await waitForSocks5(30000);
