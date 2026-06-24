@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import signal
 import sys
 import tempfile
@@ -39,7 +38,7 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 OPENCLAW_HOME = Path("/home/node/.openclaw")
 OPENCLAW_CONFIG_FILE = OPENCLAW_HOME / "openclaw.json"
 WORKSPACE = OPENCLAW_HOME / "workspace"
-STATUS_FILE = Path("/home/node/.openclaw/sync-status.json")
+STATUS_FILE = Path("/tmp/sync-status.json")
 SYNC_LOCK_FILE = Path("/tmp/huggingclaw-sync.lock")
 INTERVAL = int(os.environ.get("SYNC_INTERVAL", "180"))
 INITIAL_DELAY = int(os.environ.get("SYNC_START_DELAY", "10"))
@@ -54,8 +53,6 @@ CONFIG_SETTLE_SECONDS = max(
 # Debounce window: rapid changes (e.g. gateway restart + config patch)
 # are batched into a single sync within this window.
 # 429 rate limit retry: exponential backoff 60s/120s/240s/480s
-UPLOAD_RETRIES = int(os.environ.get("SYNC_UPLOAD_RETRIES", "5"))
-BASE_RETRY_DELAY = int(os.environ.get("SYNC_RETRY_BASE_DELAY", "60"))
 SESSIONS_MIN_SYNC_GAP = int(os.environ.get("SESSIONS_MIN_SYNC_GAP", "30"))
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 HF_USERNAME = os.environ.get("HF_USERNAME", "").strip()
@@ -99,18 +96,9 @@ def write_status(status: str, message: str) -> None:
         "message": message,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    # Use unique temp path to avoid PermissionError on stale root-owned files
-    fd, tmp_path_str = tempfile.mkstemp(prefix="hc-status-", suffix=".json", dir="/tmp")
-    os.close(fd)
-    tmp_path = Path(tmp_path_str)
+    tmp_path = STATUS_FILE.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(payload), encoding="utf-8")
-    try:
-        tmp_path.replace(STATUS_FILE)
-    except PermissionError:
-        # If STATUS_FILE is root-owned, write directly (fallback)
-        STATUS_FILE.write_text(json.dumps(payload), encoding="utf-8")
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    tmp_path.replace(STATUS_FILE)
 
 
 def read_status() -> dict[str, str]:
@@ -275,7 +263,9 @@ def restore_embedded_state() -> None:
                     source_path.unlink(missing_ok=True)
                 continue
             target_path = OPENCLAW_HOME / name
-            subprocess.run(['rm', '-rf', str(target_path)], capture_output=True)
+            shutil.rmtree(target_path, ignore_errors=True)
+            if target_path.is_file():
+                target_path.unlink(missing_ok=True)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             if source_path.is_dir():
                 shutil.copytree(source_path, target_path)
@@ -523,58 +513,6 @@ def restore_workspace() -> bool:
 # Track last sync time for debounce
 
 
-def upload_with_retry(repo_id: str, folder_path: str) -> None:
-    """Upload folder with exponential backoff on 429 rate limits.
-
-    Retries up to UPLOAD_RETRIES times with BASE_RETRY_DELAY doubling.
-    Sleeps 60s on first 429, 120s on second, etc. Caps at ~31 min total.
-    """
-    import time as _time
-
-    last_exc = None
-    for attempt in range(UPLOAD_RETRIES + 1):
-        try:
-            try:
-                HF_API.upload_large_folder(
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                    folder_path=folder_path,
-                    num_workers=2,
-                    print_report=False,
-                )
-            except AttributeError:
-                upload_folder(
-                    folder_path=folder_path,
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                    token=HF_TOKEN,
-                    commit_message=(
-                        f"HuggingClaw sync "
-                        f"{_time.strftime('%Y-%m-%dT%H:%M:%SZ', _time.gmtime())}"
-                    ),
-                    ignore_patterns=[".git/*", ".git"],
-                )
-            return  # success
-        except HfHubHTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 429:
-                last_exc = exc
-                if attempt < UPLOAD_RETRIES:
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    print(
-                        f"Rate limited (429). "
-                        f"Retrying in {delay}s "
-                        f"(attempt {attempt + 1}/{UPLOAD_RETRIES})..."
-                    )
-                    _time.sleep(delay)
-                    continue
-            raise  # non-429 or out of retries
-        except Exception:
-            raise
-
-    # All retries exhausted
-    raise last_exc or RuntimeError("Upload failed after max retries")
-
-
 def _sync_once_unlocked(
     last_fingerprint: str | None = None,
     last_marker: WorkspaceMarker | None = None,
@@ -598,7 +536,23 @@ def _sync_once_unlocked(
     write_status("syncing", f"Uploading workspace to {repo_id}")
     snapshot_dir = create_snapshot_dir(WORKSPACE)
     try:
-        upload_with_retry(repo_id, str(snapshot_dir))
+        try:
+            HF_API.upload_large_folder(
+                repo_id=repo_id,
+                repo_type="dataset",
+                folder_path=str(snapshot_dir),
+                num_workers=2,
+                print_report=False,
+            )
+        except AttributeError:
+            upload_folder(
+                folder_path=str(snapshot_dir),
+                repo_id=repo_id,
+                repo_type="dataset",
+                token=HF_TOKEN,
+                commit_message=f"HuggingClaw sync {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
+                ignore_patterns=[".git/*", ".git"],
+            )
         try:
             prune_remote_deleted_files(repo_id, snapshot_dir)
         except Exception as prune_exc:

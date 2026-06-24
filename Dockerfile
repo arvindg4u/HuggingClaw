@@ -116,6 +116,7 @@ COPY --chown=1000:1000 dns-fix.cjs /home/node/app/dns-fix.cjs
 COPY --chown=1000:1000 telegram-proxy.cjs /home/node/app/telegram-proxy.cjs
 COPY --chown=1000:1000 whatsapp-proxy.cjs /home/node/app/whatsapp-proxy.cjs
 COPY --chown=1000:1000 discord-proxy.cjs /home/node/app/discord-proxy.cjs
+COPY --chown=1000:1000 discord-loopback-proxy.cjs /home/node/app/discord-loopback-proxy.cjs
 RUN chmod +x /home/node/app/start.sh \
               /home/node/app/package-manifest.sh \
               /home/node/app/openclaw-sync.py \

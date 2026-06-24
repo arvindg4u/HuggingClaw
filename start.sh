@@ -364,7 +364,8 @@ CONFIG_JSON=$(jq \
   --arg consoleLevel "$OPENCLAW_CONSOLE_LOG_LEVEL" \
   --arg consoleStyle "$OPENCLAW_CONSOLE_LOG_STYLE" \
   --arg port "$GATEWAY_PORT" \
-  '.gateway.auth.token = $token
+  '.gateway.mode = "local"
+     | .gateway.auth.token = $token
    | .agents.defaults.model = $model
    | .gateway.port = ($port | tonumber)
    | .logging.level = $fileLevel
@@ -708,19 +709,35 @@ export WHATSAPP_PROXY_BASE
 DISCORD_PROXY_BASE="${DISCORD_PROXY_BASE:-https://render-proxy-ukjd.onrender.com/discord}"
 export DISCORD_PROXY_BASE
 
-# Discord WebSocket gateway fallback — wg-proxy via ROUTE_TARGETS
+# Discord WebSocket gateway + REST API — wg-proxy via ROUTE_TARGETS
 if [ -n "${DISCORD_PROXY_BASE:-}" ] && [ -n "${ROUTE_ENDPOINT:-}" ]; then
+  # Route all Discord domains (REST API + WebSocket Gateway) through WireGuard
+  DISCORD_DOMAINS="discord.com,gateway.discord.gg,discordapp.com,discord.gg"
   if [ -n "${ROUTE_TARGETS:-}" ]; then
-    if ! echo "$ROUTE_TARGETS" | grep -q "gateway.discord.gg"; then
-      export ROUTE_TARGETS="${ROUTE_TARGETS},gateway.discord.gg"
-      echo "[discord] Gateway fallback: gateway.discord.gg added to proxy routing"
-    fi
+    for d in ${DISCORD_DOMAINS//,/ }; do
+      if ! echo "$ROUTE_TARGETS" | grep -q "$d"; then
+        export ROUTE_TARGETS="${ROUTE_TARGETS},${d}"
+      fi
+    done
+    echo "[discord] Discord domains added to routing: discord.com, gateway.discord.gg"
   else
-    export ROUTE_TARGETS="gateway.discord.gg"
-    echo "[discord] Gateway fallback: gateway.discord.gg added to proxy routing"
+    export ROUTE_TARGETS="$DISCORD_DOMAINS"
+    echo "[discord] Discord routing enabled: discord.com, gateway.discord.gg"
   fi
 fi
 
+# Discord loopback proxy — OpenClaw plugin requires loopback URL for proxy validation
+# Starts a local HTTP CONNECT proxy on 127.0.0.1.
+# All CONNECT requests forward via net.connect, intercepted by cloudflare-proxy.js.
+DISCORD_LOOPBACK_PORT="${DISCORD_LOOPBACK_PORT:-31285}"
+export DISCORD_LOOPBACK_PORT
+if [ -n "${DISCORD_BOT_TOKEN:-}" ] && command -v node &>/dev/null; then
+  if [ ! -f /tmp/.discord_loopback_started ]; then
+    nohup node /home/node/app/discord-loopback-proxy.cjs > /tmp/discord-loopback.log 2>&1 &
+    echo "[discord] Loopback proxy started on 127.0.0.1:${DISCORD_LOOPBACK_PORT}"
+    touch /tmp/.discord_loopback_started
+  fi
+fi
 # Telegram (supports multiple user IDs, comma-separated)
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.plugins.entries.telegram = {"enabled": true}')
@@ -775,6 +792,15 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   fi
 fi
 
+# Discord config — enabled + loopback proxy for plugin validation
+if [ -n "${DISCORD_BOT_TOKEN:-}" ]; then
+  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.plugins.entries.discord = {"enabled": true}')
+  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.channels.discord.enabled = true')
+  # Set loopback proxy so Discord plugin proxy validation passes
+  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq --arg proxy_port "${DISCORD_LOOPBACK_PORT:-31285}" 'del(.channels.discord.proxy // empty) | .channels.discord.accounts.default.proxy = "http://127.0.0.1:\($proxy_port)"')
+  echo "[discord] Config: loopback proxy http://127.0.0.1:${DISCORD_LOOPBACK_PORT:-31285}"
+fi
+
 # Write config
 EXISTING_CONFIG="/home/node/.openclaw/openclaw.json"
 
@@ -788,7 +814,10 @@ if [ -f "$EXISTING_CONFIG" ]; then
     --arg token "$GATEWAY_TOKEN" \
     --arg tg_api_root "${TELEGRAM_API_ROOT:-}" \
     --arg tg_bot_token "${TELEGRAM_BOT_TOKEN:-}" \
-    '.gateway.auth.token = $token
+    --argjson desired "$CONFIG_JSON" \
+    '.gateway.mode = ($desired.gateway.mode // .gateway.mode)
+     | .gateway.auth.token = $token
+     | .gateway.port = ($desired.gateway.port // .gateway.port)
 
      | del(.gateway.controlUi.dangerouslyDisableDeviceAuth)
      | if $tg_api_root != "" then .channels.telegram.apiRoot = $tg_api_root else . end
@@ -859,7 +888,8 @@ fi
 # ── Ensure gateway auth token matches GATEWAY_TOKEN env var ──
 # Restored config may have old token; always apply the current env var
 CURRENT_CONFIG=$(cat "$EXISTING_CONFIG")
-CURRENT_CONFIG=$(echo "$CURRENT_CONFIG" | jq --arg token "$GATEWAY_TOKEN" '.gateway.auth.token = $token')
+CURRENT_CONFIG=$(echo "$CURRENT_CONFIG" | jq --arg token "$GATEWAY_TOKEN" '.gateway.mode = "local"
+     | .gateway.auth.token = $token')
 echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
 
 # ── Enable Gateway Preload Fixes ──
