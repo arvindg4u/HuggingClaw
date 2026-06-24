@@ -285,7 +285,6 @@ promote_first_pool_key "AI_GATEWAY_API_KEY" "AI_GATEWAY_API_KEYS"
 
 # kimi-coding uses Moonshot AI endpoint (api.moonshot.cn).
 # If KIMI_API_KEY is set but MOONSHOT_API_KEY is not, mirror it so the
-# multi-provider-key-rotator (which matches on api.moonshot.cn) injects it.
 if [ -z "${MOONSHOT_API_KEY:-}" ] && [ -n "${KIMI_API_KEY:-}" ]; then
   export MOONSHOT_API_KEY="$KIMI_API_KEY"
 fi
@@ -896,7 +895,7 @@ echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
 # These preload scripts patch iframe embedding, API key rotation, and
 # proxy routing (ROUTE_ENDPOINT/ROUTE_TARGETS for SOCKS5/WS proxy).
 export NODE_PATH="${NODE_PATH:-/home/node/browser-deps/node_modules}"
-export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/dns-fix.cjs --require /home/node/app/multi-provider-key-rotator.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs --require /home/node/app/whatsapp-proxy.cjs --require /home/node/app/discord-proxy.cjs"
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/dns-fix.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs --require /home/node/app/whatsapp-proxy.cjs --require /home/node/app/discord-proxy.cjs"
 
 # ── Startup Summary ──
 echo ""
@@ -1020,8 +1019,6 @@ warmup_browser() {
 # ── Start background services ──
 export LLM_MODEL="$LLM_MODEL"
 
-# ── Ensure key-rotator uses the correct HF token for huggingface.co calls ──
-# NODE_OPTIONS preloads multi-provider-key-rotator.cjs into health-server.js.
 # The rotator patches https.request and injects HUGGINGFACE_HUB_TOKEN (or
 # falls back to LLM_API_KEY) for any call to huggingface.co — including the
 # privacy-detection API call in detectSpacePrivacy(). If HUGGINGFACE_HUB_TOKEN
