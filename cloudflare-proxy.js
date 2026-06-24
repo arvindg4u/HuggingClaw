@@ -823,19 +823,18 @@ function getTunnelPool() {
   return _tunnelPool;
 }
 
-// ── WebSocket proxy connection (via persistent tunnel pool) ──
-// Uses TunnelPool to reuse WebSocket connections across multiple TLS tunnels.
-// This saves ~250-2000ms per request (varies by geographic distance to Render).
-// Falls back to direct WebSocket connection if pool is unavailable.
+// ── WebSocket proxy connection (one-shot, legacy format) ──
+// Uses a fresh WebSocket per tunnel with legacy {host, port} format.
+// TunnelPool (multiplexed protocol) was removed because wg-proxy relay
+// works reliably only with legacy format. Multiplexed format caused
+// persistent timeouts due to protocol race conditions on reconnect.
+// This adds ~2s per request (WebSocket connect time) but is reliable.
 function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
-  // Try the persistent pool first
-  const pool = getTunnelPool();
-  return pool.createTunnel(targetHost, targetPort, timeout)
-    .catch((poolErr) => {
-      // Pool failed (WS disconnected, timeout, etc.) — fall back to one-shot WebSocket
-      log(`tunnel pool failed (${poolErr.message}), falling back to one-shot WS`);
-
-      return new Promise((resolve, reject) => {
+  // One-shot WebSocket with legacy {host, port} format (proven working).
+  // TunnelPool (multiplexed protocol) is NOT used because wg-proxy relay
+  // works reliably with legacy format. Multiplexed format causes timeouts
+  // due to protocol race conditions on reconnect.
+  return new Promise((resolve, reject) => {
         const proxyUrl = PROXY_URL || '';
         if (!proxyUrl) return reject(new Error('no proxy URL'));
         if (!WebSocket) return reject(new Error('ws library not available'));
@@ -916,7 +915,6 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
           if (!tunnelReady && !settled) { settled = true; reject(new Error('WebSocket closed before tunnel ready')); }
           duplex.push(null);
         });
-      });
     });
 }
 // HTTP CONNECT proxy fallback
