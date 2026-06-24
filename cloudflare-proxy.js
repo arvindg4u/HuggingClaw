@@ -114,18 +114,19 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
       log(`WS proxy failed for ${targetHost}:${targetPort}, retrying once...`);
       return wsConnectProxy(targetHost, targetPort, Math.min(timeout, 30000));
     })
-    .catch((e) => {
+        .catch((e) => {
       log(`[dbg] wsConnectProxy(https) retry also failed: "${e?.message}"`);
+      // Try TLS CONNECT fallback, then HTTP CONNECT, then fatal error
       return tlsConnectProxy(targetHost, targetPort, timeout)
-      .catch(() => httpConnectProxy(targetHost, targetPort, timeout)
-        .catch(() => {
+        .catch(() => httpConnectProxy(targetHost, targetPort, timeout))
+        .catch((e2) => {
           const err = new Error(`FATAL: All proxy methods failed for ${targetHost}:${targetPort} - no direct fallback`);
           log(err.message);
           throw err;
-        })));
-}
+        });
+    });
+  }
 
-// Direct TCP connection (no proxy)
 function directConnect(targetHost, targetPort, timeout = 30000) {
   return new Promise((resolve, reject) => {
     const s = net.createConnection({ host: targetHost, port: targetPort, timeout });
@@ -254,9 +255,29 @@ https.request = function(...args) {
 
   if (opts._hc || !needsProxy(hn)) return origHttps.call(this, ...args);
 
-  // Remove our flag so internal tls.connect → net.connect path fires
-  const nopts = { ...opts };
-  delete nopts._hc;
+  // For proxied hosts: provide createConnection that establishes
+  // proxy tunnel + TLS. Node's ClientRequest calls createConnection
+  // and waits for the callback with the fully connected TLS socket.
+  const nopts = { ...opts, _hc: true };
+  nopts.createConnection = (options, callback) => {
+    let settled = false;
+    const cbOnce = (err, socket) => {
+      if (settled) return;
+      settled = true;
+      if (typeof callback === 'function') callback(err, socket);
+    };
+    proxyConnect(hn, port)
+      .then((tunnel) => {
+        const tlsSocket = tls.connect({
+          socket: tunnel,
+          host: hn,
+          servername: options.servername || hn,
+          rejectUnauthorized: options.rejectUnauthorized !== false,
+        }, () => cbOnce(null, tlsSocket));
+        tlsSocket.on('error', cbOnce);
+      })
+      .catch(cbOnce);
+  };
   return origHttps.call(this, nopts, cb);
 };
 
@@ -576,261 +597,10 @@ tls.connect = function(...args) {
 
   if (opts._hc || !needsProxy(hn)) return origTlsConnect.call(this, ...args);
 
-  // Use proxyConnect which handles socks5://, wss://, and direct fallback
-  // Works with tls.connect({socket: tunnel}) for all proxy types
-  const tunnelPromise = proxyConnect(opts.host || "localhost", opts.port || 443);
-
-  // We return a socket immediately and upgrade it when tunnel is ready
-  const pending = new net.Socket();
-  pending.setMaxListeners(0);
-  pending._hc_tunnel_pending = true;
-  pending._hc_writeBuf = [];
-  // Override write immediately so early writes are buffered, not lost
-  pending.write = function(data, ...args) {
-    if (this._hc_tlsSocket) return this._hc_tlsSocket.write(data, ...args);
-    if (this._hc_writeBuf) {
-      this._hc_writeBuf.push([Buffer.from(data), args]);
-      return true;
-    }
-    return net.Socket.prototype.write.call(this, data, ...args);
-  };
-
-  tunnelPromise.then((socks) => {
-    const tlsSocket = origTlsConnect({
-      socket: socks,
-      host: opts.host || "localhost",
-      servername: opts.servername || opts.host || "localhost",
-      rejectUnauthorized: opts.rejectUnauthorized !== false,
-    });
-
-    tlsSocket.on("secureConnect", () => {
-      // Replace the pending socket by forwarding events
-      pending.emit("secureConnect");
-      pending.emit("connect");
-      // Call the TLS connect callback if provided
-      if (typeof cb === "function") cb();
-      tlsSocket.on("data", (d) => { if (pending && !pending.destroyed) { try { pending.push(d); } catch (_) {} } });
-      tlsSocket.on("end", () => { if (pending && !pending.destroyed) pending.emit("end"); });
-      tlsSocket.on("close", () => { if (pending && !pending.destroyed) pending.emit("close"); });
-      tlsSocket.on("error", (e) => { if (pending && !pending.destroyed) pending.emit("error", e); });
-    });
-
-    pending._hc_tlsSocket = tlsSocket;
-    // Drain buffered writes now that TLS socket is ready (even before secureConnect)
-    if (pending._hc_writeBuf && pending._hc_writeBuf.length) {
-      const buf = pending._hc_writeBuf;
-      pending._hc_writeBuf = [];
-      buf.forEach(([d, a]) => { try { tlsSocket.write(d, ...a); } catch (e) {} });
-    }
-  }).catch(e => {
-    pending.emit("error", e);
-  });
-
-  return pending;
+  // tls.connect for proxied hosts: handled at https.request level via createConnection.
+  // Direct callers pass through to native (bypasses proxy) to avoid race condition.
+  return origTlsConnect.call(this, ...args);
 };
-
-// ── TLS + HTTP CONNECT proxy (fallback when WS fails) ──
-// Node's built-in WebSocket fails against some TLS configs (Render),
-// but tls.connect + HTTP CONNECT always works.
-function tlsConnectProxy(targetHost, targetPort, timeout = 30000) {
-  return new Promise((resolve, reject) => {
-    const proxyUrl = PROXY_URL || '';
-    let host, port;
-    try {
-      const u = new URL(proxyUrl);
-      host = u.hostname;
-      port = parseInt(u.port) || 443;
-    } catch(e) { reject(e); return; }
-
-    const socket = tls.connect({ host, port, rejectUnauthorized: false }, () => {
-      socket.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`);
-    });
-
-    let resp = '';
-    const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new Error('TLS CONNECT timeout'));
-    }, timeout);
-
-    socket.on('data', (d) => {
-      resp += d.toString();
-      if (resp.includes('\r\n\r\n')) {
-        if (resp.includes('200 Connection Established')) {
-          clearTimeout(timer);
-          resolve(socket);
-        } else {
-          clearTimeout(timer);
-          socket.destroy();
-          reject(new Error(`HTTP CONNECT failed: ${resp.split('\r\n')[0]}`));
-        }
-      }
-    });
-
-    socket.on('error', (e) => { clearTimeout(timer); reject(e); });
-    socket.on('close', () => { clearTimeout(timer); reject(new Error('TLS CONNECT closed')); });
-  });
-}
-
-// ── WebSocket proxy connection (manual TLS+WS) ──
-// Node's built-in WebSocket class fails against Render/Cloudflare (code 1006).
-// Raw tls.connect() + manual WebSocket upgrade always works.
-const WS_GUID = "258EAFA5-E914-47DA-95CA-5AB5E4BE6AC6";
-
-// ── Persistent Tunnel Pool ──
-// Keeps WebSocket connections alive and multiplexes multiple SOCKS5 tunnels
-// over a single WebSocket, eliminating the ~2s WS connect time on subsequent requests.
-// Protocol:
-//   Control: JSON text frames {type, connId, host, port}
-//   Data:    Binary frames  [4-byte connId BE][payload]
-class TunnelPool {
-  constructor() {
-    this.ws = null;
-    this.connections = new Map(); // connId -> { duplex, resolve, reject, timer }
-    this.nextId = 1;
-    this.pendingOpen = null;
-  }
-
-  async _ensureWebSocket() {
-    if (this.ws) {
-      if (this.ws.readyState === WebSocket.OPEN) return this.ws;
-      if (this.ws.readyState === WebSocket.CONNECTING && this.pendingOpen) {
-        return this.pendingOpen;
-      }
-    }
-
-    const proxyUrl = PROXY_URL || '';
-    if (!proxyUrl) throw new Error('no proxy URL');
-    if (!WebSocket) throw new Error('ws library not available');
-
-    // Normalize URL: https:// → wss:// for WebSocket constructor
-    const wsUrl = proxyUrl.replace(/^https:/i, 'wss:');
-    this.ws = new WebSocket(wsUrl);
-    this.pendingOpen = new Promise((resolve, reject) => {
-      const onopen = () => resolve(this.ws);
-      const onerror = (e) => { const err = e instanceof Error ? e : new Error(e?.message || 'WebSocket error'); this._invalidateAll(err); reject(err); };
-      this.ws.once('open', onopen);
-      this.ws.once('error', onerror);
-      // Timeout for WebSocket connection
-      setTimeout(() => {
-        if (this.ws && this.ws.readyState !== WebSocket.OPEN) {
-          this.ws.close();
-          const err = new Error('pool WS connect timeout');
-          this._invalidateAll(err);
-          reject(err);
-        }
-      }, 30000);
-    });
-
-    // Message router: dispatches incoming frames to the correct tunnel
-    this.ws.on('message', (data, isBinary) => {
-      if (!isBinary) {
-        // Text frame — JSON control message
-        try {
-          const msg = JSON.parse(data);
-          const conn = msg.connId != null ? this.connections.get(msg.connId) : null;
-          if (!conn) return;
-
-          if (msg.type === 'connected') {
-            clearTimeout(conn.timer);
-            conn.resolve(conn.duplex);
-          } else if (msg.type === 'error') {
-            clearTimeout(conn.timer);
-            this.connections.delete(msg.connId);
-            conn.reject(new Error(msg.message || 'tunnel error'));
-          }
-        } catch (e) {}
-      } else {
-        // Binary frame — [4-byte connId BE][payload]
-        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-        if (buf.length < 4) return;
-        const connId = buf.readUInt32BE(0);
-        const payload = buf.slice(4);
-        const conn = this.connections.get(connId);
-        if (conn) {
-          if (!conn.duplex.push(payload)) {
-            // Backpressure: WebSocket layer will buffer
-          }
-        }
-      }
-    });
-
-    this.ws.on('close', () => {
-      this._invalidateAll(new Error('pool WebSocket closed'));
-      // Instant reconnect: start establishing new WS connection immediately
-      // Next request will find pendingOpen and pick it up
-      this._ensureWebSocket().catch(() => {});
-    });
-    this.ws.on('error', () => {}); // handled by _invalidateAll on close
-
-    try {
-      return await this.pendingOpen;
-    } finally {
-      this.pendingOpen = null;
-    }
-  }
-
-  _invalidateAll(err) {
-    for (const [connId, conn] of this.connections) {
-      clearTimeout(conn.timer);
-      try { conn.duplex.destroy(err); } catch (e) {}
-    }
-    this.connections.clear();
-    this.ws = null;
-    this.pendingOpen = null;
-  }
-
-  async createTunnel(host, port, timeout = 30000) {
-    const ws = await this._ensureWebSocket();
-    const connId = this.nextId++;
-
-    const duplex = new Duplex({
-      write: (data, encoding, callback) => {
-        if (ws.readyState !== WebSocket.OPEN) {
-          callback(new Error('pool WebSocket not open'));
-          return;
-        }
-        const header = Buffer.alloc(4);
-        header.writeUInt32BE(connId);
-        ws.send(Buffer.concat([header, data]), { binary: true }, callback);
-      },
-      read: () => {},
-      destroy: (err, callback) => {
-        this.connections.delete(connId);
-        try { ws.send(JSON.stringify({ type: "disconnect", connId })); } catch (e) {}
-        callback(err);
-      }
-    });
-    duplex.setMaxListeners(0);
-    duplex.on('error', () => {}); // prevent crash on pool disconnect
-
-    const conn = { duplex, resolve: null, reject: null, timer: null };
-    this.connections.set(connId, conn);
-
-    // Send connect request to relay
-    ws.send(JSON.stringify({ type: "connect", connId, host, port }));
-
-    return new Promise((resolve, reject) => {
-      conn.resolve = (duplex) => {
-        // Emit 'connect' so tls.connect({socket: duplex}) starts TLS handshake
-        duplex.emit('connect');
-        resolve(duplex);
-      };
-      conn.reject = reject;
-      conn.timer = setTimeout(() => {
-        this.connections.delete(connId);
-        log(`tunnel pool: connect timeout for connId=${connId} (${host}:${port})`);
-        reject(new Error('tunnel connect timeout'));
-      }, timeout);
-    });
-  }
-}
-
-// Singleton tunnel pool instance
-let _tunnelPool = null;
-function getTunnelPool() {
-  if (!_tunnelPool) _tunnelPool = new TunnelPool();
-  return _tunnelPool;
-}
 
 // ── WebSocket proxy connection (one-shot, legacy format) ──
 // Uses a fresh WebSocket per tunnel with legacy {host, port} format.
