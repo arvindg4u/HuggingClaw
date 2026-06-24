@@ -146,20 +146,14 @@ async function waitForSocks5(timeoutMs = 30000) {
         s.on("error", reject);
         s.setTimeout(3000, () => { s.destroy(); reject(new Error("timeout")); });
       });
-      return true;
+      // SOCKS5 port is open — now verify the tunnel actually forwards traffic
+      const tunnelOk = await testSocks5Working();
+      if (tunnelOk) return true;
+      // Tunnel not ready yet — keep waiting
     } catch (e) {
-      await new Promise((r) => setTimeout(r, 1000));
+      // SOCKS5 port not open yet — keep waiting
     }
-  }
-  // Now verify the tunnel actually works with a real connection
-  const tunnelOk = await testSocks5Working();
-  if (!tunnelOk) {
-    const extendedDeadline = Date.now() + 30000;
-    while (Date.now() < extendedDeadline) {
-      if (await testSocks5Working()) return true;
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-    return false;
+    await new Promise((r) => setTimeout(r, 1000));
   }
   return false;
 }
@@ -218,7 +212,7 @@ function socks5Connect(targetHost, targetPort) {
       s.write(Buffer.from([0x05, 0x01, 0x00]));
     });
     let state = 0, buf = Buffer.alloc(0);
-    const timer = setTimeout(() => { s.destroy(); reject(new Error("timeout")); }, 30000);
+    const timer = setTimeout(() => { s.destroy(); reject(new Error("timeout")); }, 20000);
     const cleanup = () => { clearTimeout(timer); s.removeListener("data", onData); };
     const onData = (d) => {
       buf = Buffer.concat([buf, d]);
@@ -238,7 +232,7 @@ function socks5Connect(targetHost, targetPort) {
     };
     s.on("data", onData);
     s.on("error", (e) => { cleanup(); reject(e); });
-    s.setTimeout(30000, () => { s.destroy(); cleanup(); reject(new Error("timeout")); });
+    s.setTimeout(20000, () => { s.destroy(); cleanup(); reject(new Error("timeout")); });
   });
 }
 
