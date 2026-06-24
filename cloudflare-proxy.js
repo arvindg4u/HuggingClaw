@@ -724,7 +724,11 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
         // Normalize URL: https:// → wss:// for WebSocket constructor
         const wsUrl = proxyUrl.replace(/^https:/i, 'wss:');
         let ws;
-        try { ws = new WebSocket(wsUrl); } catch(e) { clearTimeout(timer); reject(e); return; }
+        try {
+          // handshakeTimeout: abort if WebSocket upgrade not completed in 20s.
+          // This prevents the 30s blind timeout from blocking all retries.
+          ws = new WebSocket(wsUrl, { handshakeTimeout: 20000 });
+        } catch(e) { clearTimeout(timer); reject(e); return; }
 
         let pendingWriteBuffer = [];
         let tunnelReady = false;
