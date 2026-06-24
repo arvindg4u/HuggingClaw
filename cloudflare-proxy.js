@@ -693,13 +693,29 @@ tls.connect = function(...args) {
 function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
   // One-shot WebSocket with legacy {host, port} format (proven working).
   // TunnelPool (multiplexed protocol) is NOT used because wg-proxy relay
-  // works reliably with legacy format. Multiplexed format causes timeouts
+  // works reliably only with legacy format. Multiplexed format causes timeouts
   // due to protocol race conditions on reconnect.
-  return new Promise((resolve, reject) => {
-        const proxyUrl = PROXY_URL || '';
-        if (!proxyUrl) return reject(new Error('no proxy URL'));
-        if (!WebSocket) return reject(new Error('ws library not available'));
 
+  // Pre-wake Render relay via HTTP before WebSocket connect.
+  // Render free tier spins down after ~15min idle — a direct WebSocket
+  // connection hangs until Render wakes the instance (~20-30s timeout).
+  // A quick HTTP HEAD wakes it in 2-3s so the WebSocket succeeds quickly.
+  const proxyUrl = PROXY_URL || '';
+  if (!proxyUrl) return Promise.reject(new Error('no proxy URL'));
+  if (!WebSocket) return Promise.reject(new Error('ws library not available'));
+
+  return new Promise((resolveWake) => {
+    const httpWakeUrl = proxyUrl.replace(/^wss:/i, 'https:').replace(/^ws:/i, 'http:');
+    try {
+      const u = new URL(httpWakeUrl);
+      const mod = u.protocol === 'https:' ? require('https') : require('http');
+      const wakeReq = mod.get(u, (res) => { res.resume(); resolveWake(); });
+      wakeReq.setTimeout(5000, () => { try { wakeReq.destroy(); } catch(e) {} resolveWake(); });
+      wakeReq.on('error', () => resolveWake());
+    } catch(e) { resolveWake(); }
+  }).then(() => {
+    // Render should be awake now — proceed with WebSocket connection
+    return new Promise((resolve, reject) => {
         let settled = false;
         const timer = setTimeout(() => {
           if (!settled) { settled = true; reject(new Error('ws timeout')); }
@@ -733,7 +749,7 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
           }
         });
         duplex.setMaxListeners(0);
-    duplex.on('error', () => {}); // prevent crash on pool disconnect
+        duplex.on('error', () => {}); // prevent crash on pool disconnect
 
         ws.on('message', (data) => {
           const isBinary = Buffer.isBuffer(data) || data instanceof Buffer;
@@ -777,6 +793,7 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
           duplex.push(null);
         });
     });
+  });
 }
 // HTTP CONNECT proxy fallback
 function httpConnectProxy(targetHost, targetPort, timeout = 30000) {
