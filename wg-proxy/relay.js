@@ -207,8 +207,10 @@ async function startRotationLoop() {
 
 // ── SOCKS5 through WireGuard ──
 function socks5Connect(targetHost, targetPort) {
+  const socksStart = Date.now();
   return new Promise((resolve, reject) => {
     const s = net.createConnection({ host: SOCKS_HOST, port: SOCKS_PORT }, () => {
+      console.log(`[relay] socks5 TCP connected to wireproxy (${SOCKS_HOST}:${SOCKS_PORT}) in ${Date.now() - socksStart}ms — sending auth`);
       s.write(Buffer.from([0x05, 0x01, 0x00]));
     });
     let state = 0, buf = Buffer.alloc(0);
@@ -219,6 +221,7 @@ function socks5Connect(targetHost, targetPort) {
       try {
         if (state === 0 && buf.length >= 2) {
           if (buf[1] !== 0x00) { cleanup(); s.destroy(); reject(new Error("auth fail")); return; }
+          console.log(`[relay] SOCKS5 auth OK for ${targetHost}:${targetPort} in ${Date.now() - socksStart}ms — sending connect`);
           state = 1;
           const hb = Buffer.from(targetHost);
           s.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hb.length]), hb, Buffer.from([(targetPort >> 8) & 0xFF, targetPort & 0xFF])]));
@@ -282,8 +285,11 @@ wss.on("connection", (ws, req) => {
 
         // ── Legacy mode: {host, port} ──
         if (!msg.type && msg.host) {
+          console.log(`[relay] Legacy connect request: ${msg.host}:${msg.port || 443}`);
+          const startTime = Date.now();
           socks5Connect(msg.host, msg.port || 443)
             .then((ts) => {
+              console.log(`[relay] Legacy connect SUCCEEDED for ${msg.host}:${msg.port || 443} in ${Date.now() - startTime}ms`);
               legacySocket = ts;
               ws.send(JSON.stringify({ status: "connected" }));
               ts.on("data", (td) => {
@@ -293,7 +299,7 @@ wss.on("connection", (ws, req) => {
               ts.on("close", () => { legacySocket = null; });
             })
             .catch((err) => {
-              console.error('[relay] legacy socks5 error:', err.message);
+              console.error(`[relay] legacy socks5 FAILED for ${msg.host}:${msg.port || 443} after ${Date.now() - startTime}ms: "${err.message}"`);
               try { ws.send(JSON.stringify({ error: err.message })); } catch (e) {}
             });
           return;
@@ -302,6 +308,8 @@ wss.on("connection", (ws, req) => {
         // ── Multiplexed mode ──
         if (msg.type === 'connect' && msg.connId != null && msg.host) {
           const connId = msg.connId;
+          console.log(`[relay] Mux connect request: connId=${connId} ${msg.host}:${msg.port || 443}`);
+          const muxStart = Date.now();
           socks5Connect(msg.host, msg.port || 443)
             .then((socks) => {
               connections.set(connId, socks);
