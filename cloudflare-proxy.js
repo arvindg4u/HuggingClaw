@@ -764,6 +764,7 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
         duplex.on('error', () => {}); // prevent crash on pool disconnect
 
         ws.on('message', (data, isBinary) => {
+          const str = !isBinary ? (typeof data === 'string' ? data : data.toString()) : '';
           if (str.length > 0 && str[0] === '{') {
             // Text frame — JSON control message
             if (settled) return; // Already connected, ignore control messages
