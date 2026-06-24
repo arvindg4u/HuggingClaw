@@ -717,9 +717,12 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
     // Render should be awake now — proceed with WebSocket connection
     return new Promise((resolve, reject) => {
         let settled = false;
+        // Use 45s timeout (longer than relay's 30s socks5Connect timeout)
+        // so the relay's error response arrives before we give up.
+        const effectiveTimeout = Math.max(timeout, 45000);
         const timer = setTimeout(() => {
           if (!settled) { settled = true; reject(new Error('ws timeout')); }
-        }, timeout);
+        }, effectiveTimeout);
 
         // Normalize URL: https:// → wss:// for WebSocket constructor
         const wsUrl = proxyUrl.replace(/^https:/i, 'wss:');
