@@ -7,7 +7,12 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 10000;
 const SOCKS_HOST = "127.0.0.1";
-const SOCKS_PORT = 1080;
+
+// Dynamic SOCKS port for graceful dual-port IP rotation
+let CURRENT_SOCKS_PORT = 1080;
+let PREV_SOCKS_PORT = null;
+let PREV_WIRE_PROXY = null;
+const activeConnections = new Set(); // tracked by socks5Connect() for drain
 
 // ── WireGuard rotation config ──
 // WG_CONFIGS (JSON array) takes precedence over WG_ENDPOINTS/WG_ENDPOINT
@@ -33,6 +38,47 @@ if (userConfigs) {
   }
 }
 
+// Optionally fetch configs from a URL (overrides WG_CONFIGS if successful)
+async function fetchConfigsFromUrl() {
+  if (!WG_CONFIGS_URL) return null;
+  try {
+    const { get } = require("http");
+    const { get: getTls } = require("https");
+    const fetcher = WG_CONFIGS_URL.startsWith("https") ? getTls : get;
+    return await new Promise((resolve) => {
+      fetcher(WG_CONFIGS_URL, (res) => {
+        if (res.statusCode !== 200) { resolve(null); return; }
+        let body = "";
+        res.on("data", (c) => body += c);
+        res.on("end", () => {
+          try {
+            const arr = JSON.parse(body);
+            resolve(Array.isArray(arr) && arr.length > 0 ? arr : null);
+          } catch (e) { resolve(null); }
+        });
+      }).on("error", () => resolve(null));
+    });
+  } catch (e) { return null; }
+}
+
+// Merge fresh configs into WG_CONFIGS, updating deadEndpoints
+function mergeConfigs(fresh) {
+  if (!fresh || fresh.length === 0) return false;
+  const oldLen = WG_CONFIGS.length;
+  const newEndpoints = new Set(fresh.map(c => c.endpoint));
+  for (const ep of deadEndpoints.keys()) {
+    if (!newEndpoints.has(ep)) deadEndpoints.delete(ep);
+  }
+  for (const cfg of fresh) {
+    if (!WG_CONFIGS.some(c => c.endpoint === cfg.endpoint)) {
+      deadEndpoints.delete(cfg.endpoint);
+    }
+  }
+  WG_CONFIGS = fresh;
+  console.log(`[wg-proxy] Configs refreshed: ${oldLen} → ${WG_CONFIGS.length} endpoint(s)`);
+  return true;
+}
+
 // Fallback: build configs from WG_ENDPOINTS/WG_ENDPOINT + single key pair
 if (WG_CONFIGS.length === 0) {
   const privateKey = process.env.WG_PRIVATE_KEY || "wHTOhHm7orE8evqF39HezxB8Vc+fwuVsEtDN2rl2HnA=";
@@ -46,11 +92,40 @@ let currentWireProxy = null;
 let currentConfigIdx = 0;
 let rotationTimer = null;
 let wireproxyRestartCount = 0;
+let shuttingDown = false;
 
+// Track endpoints that failed SOCKS5 verification (endpoint -> {failures, timestamp})
+const deadEndpoints = new Map();
+const DEAD_ENDPOINT_RETRY_MS = parseInt(process.env.WG_DEAD_RETRY || "300000"); // 5 min
+
+// WireGuard tunnel MTU (env: WG_MTU, default 1384 — safe for Ethernet + WG overhead)
+const WG_MTU = parseInt(process.env.WG_MTU || "1384");
+
+// Health check targets (comma-separated host:port pairs, tried in sequence)
+const HEALTH_CHECK_TARGETS = (process.env.HEALTH_CHECK_TARGETS || "1.1.1.1:80,8.8.8.8:80")
+  .split(",")
+  .map(s => { const [h, p] = s.trim().split(":"); return { host: h, port: parseInt(p) || 80 }; })
+  .filter(t => t.host);
+
+// Max multiplexed SOCKS5 streams per WebSocket client (env: MAX_CONN_PER_CLIENT)
+const MAX_CONNECTIONS_PER_CLIENT = parseInt(process.env.MAX_CONN_PER_CLIENT || "256");
+
+// Optional URL to fetch fresh WG_CONFIGS JSON (refreshed periodically)
+const WG_CONFIGS_URL = process.env.WG_CONFIGS_URL || "";
+const WG_CONFIGS_REFRESH_MS = parseInt(process.env.WG_CONFIGS_REFRESH || "1800000"); // 30 min
 function pickConfig() {
   if (WG_CONFIGS.length <= 1) return WG_CONFIGS[0];
+  // Try up to WG_CONFIGS.length times to find a live endpoint
+  for (let attempt = 0; attempt < WG_CONFIGS.length; attempt++) {
+    currentConfigIdx = (currentConfigIdx + 1) % WG_CONFIGS.length;
+    const cfg = WG_CONFIGS[currentConfigIdx];
+    if (!deadEndpoints.has(cfg.endpoint)) return cfg;
+  }
+  // All endpoints are dead — use the next one (oldest dead entry)
   currentConfigIdx = (currentConfigIdx + 1) % WG_CONFIGS.length;
-  return WG_CONFIGS[currentConfigIdx];
+  const fallback = WG_CONFIGS[currentConfigIdx];
+  console.log(`[wg-proxy] All endpoints dead — falling back to ${fallback.endpoint}`);
+  return fallback;
 }
 
 function getCurrentEndpoint() {
@@ -59,12 +134,13 @@ function getCurrentEndpoint() {
   return WG_CONFIGS[idx].endpoint;
 }
 
-function writeWireProxyConfig(cfg) {
+function writeWireProxyConfig(cfg, port) {
   const fs = require("fs");
   const config = `[Interface]
 PrivateKey = ${cfg.privateKey}
 Address = 10.2.0.2/32
 DNS = 10.2.0.1
+MTU = ${WG_MTU}
 
 [Peer]
 PublicKey = ${cfg.peerPublicKey}
@@ -73,16 +149,17 @@ Endpoint = ${cfg.endpoint}
 PersistentKeepalive = 25
 
 [Socks5]
-BindAddress = 0.0.0.0:1080
+BindAddress = 0.0.0.0:${port}
 `;
   fs.writeFileSync("/etc/wireproxy.conf", config);
 }
 
-function startWireProxy(cfg) {
-  writeWireProxyConfig(cfg);
-  console.log(`[wg-proxy] Starting WireGuard -> ${cfg.endpoint}`);
+function startWireProxy(cfg, port) {
+  writeWireProxyConfig(cfg, port);
+  console.log(`[wg-proxy] Starting WireGuard -> ${cfg.endpoint} on SOCKS5 :${port}`);
   const wp = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
   wp.on("exit", async (code) => {
+    if (shuttingDown) return;
     try { require("child_process").execSync("pkill -9 wireproxy 2>/dev/null"); } catch(e) {}
     console.log(`[wg-proxy] wireproxy exited (code ${code}) for ${cfg.endpoint} -- restarting...`);
     await new Promise(r => setTimeout(r, 2000));
@@ -91,7 +168,7 @@ function startWireProxy(cfg) {
     try {
       for (let i = 0; i < 15; i++) {
         const free = await new Promise(res => {
-          const s = require("net").createConnection({host:"127.0.0.1",port:1080});
+          const s = require("net").createConnection({host:"127.0.0.1",port:CURRENT_SOCKS_PORT});
           s.on("connect", () => { s.destroy(); res(false); });
           s.on("error", () => res(true));
         });
@@ -99,7 +176,7 @@ function startWireProxy(cfg) {
         await new Promise(r => setTimeout(r, 500));
       }
       const cfg2 = WG_CONFIGS[currentConfigIdx % WG_CONFIGS.length];
-      writeWireProxyConfig(cfg2);
+      writeWireProxyConfig(cfg2, CURRENT_SOCKS_PORT);
       currentWireProxy = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
       currentWireProxy.on("exit", (code2) => {
         console.log(`[wg-proxy] Restarted wireproxy also exited (code ${code2})`);
@@ -110,43 +187,54 @@ function startWireProxy(cfg) {
 }
 
 // Test if SOCKS5 tunnel is actually working via a real connect
+// Tries each HEALTH_CHECK_TARGETS entry in sequence, returns true if any succeeds.
 async function testSocks5Working() {
-  try {
-    return await new Promise((resolve, reject) => {
-      const s = net.createConnection({ host: SOCKS_HOST, port: SOCKS_PORT }, () => {
-        s.write(Buffer.from([0x05, 0x01, 0x00]));
-      });
-      let state = 0, buf = Buffer.alloc(0);
-      const timer = setTimeout(() => { s.destroy(); resolve(false); }, 10000);
-      s.on("data", (d) => {
-        buf = Buffer.concat([buf, d]);
-        try {
-          if (state === 0 && buf.length >= 2) {
-            if (buf[1] !== 0x00) { clearTimeout(timer); s.destroy(); resolve(false); return; }
-            state = 1;
-            const testHost = "1.1.1.1";
-            const testPort = 80;
-            const hb = Buffer.from(testHost);
-            s.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hb.length]), hb, Buffer.from([(testPort >> 8) & 0xFF, testPort & 0xFF])]));
-            buf = Buffer.alloc(0);
-          } else if (state === 1 && buf.length >= 5) {
-            clearTimeout(timer);
-            if (buf[1] === 0x00) { s.end(); resolve(true); }
-            else { s.destroy(); resolve(false); }
-          }
-        } catch(e) { clearTimeout(timer); s.destroy(); resolve(false); }
-      });
-      s.on("error", () => { clearTimeout(timer); resolve(false); });
-    });
-  } catch(e) { return false; }
+  for (const target of HEALTH_CHECK_TARGETS) {
+    try {
+      const ok = await testConnect(target.host, target.port);
+      if (ok) return true;
+    } catch (e) {
+      // continue to next target
+    }
+  }
+  return false;
 }
 
-async function waitForSocks5(timeoutMs = 30000) {
+// Single SOCKS5 connect attempt to a specific host:port
+function testConnect(host, port) {
+  return new Promise((resolve) => {
+    const s = net.createConnection({ host: SOCKS_HOST, port: CURRENT_SOCKS_PORT }, () => {
+      s.write(Buffer.from([0x05, 0x01, 0x00]));
+    });
+    let state = 0, buf = Buffer.alloc(0);
+    const timer = setTimeout(() => { s.destroy(); resolve(false); }, 10000);
+    s.on("data", (d) => {
+      buf = Buffer.concat([buf, d]);
+      try {
+        if (state === 0 && buf.length >= 2) {
+          if (buf[1] !== 0x00) { clearTimeout(timer); s.destroy(); resolve(false); return; }
+          state = 1;
+          const hb = Buffer.from(host);
+          s.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hb.length]), hb, Buffer.from([(port >> 8) & 0xFF, port & 0xFF])]));
+          buf = Buffer.alloc(0);
+        } else if (state === 1 && buf.length >= 5) {
+          clearTimeout(timer);
+          if (buf[1] === 0x00) { s.end(); resolve(true); }
+          else { s.destroy(); resolve(false); }
+        }
+      } catch(e) { clearTimeout(timer); s.destroy(); resolve(false); }
+    });
+    s.on("error", () => { clearTimeout(timer); resolve(false); });
+  });
+}
+
+async function waitForSocks5(timeoutMs = 30000, portOverride) {
+  const port = portOverride || CURRENT_SOCKS_PORT;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       await new Promise((resolve, reject) => {
-        const s = net.createConnection({ host: SOCKS_HOST, port: SOCKS_PORT }, () => {
+        const s = net.createConnection({ host: SOCKS_HOST, port }, () => {
           s.write(Buffer.from([0x05, 0x01, 0x00]));
           s.once("data", (d) => {
             if (d.length >= 2 && d[0] === 0x05 && d[1] === 0x00) { s.end(); resolve(); }
@@ -170,7 +258,7 @@ async function waitForSocks5(timeoutMs = 30000) {
 
 function killAllWireProxy() {
   try {
-    require("child_process").execSync("pkill -9 wireproxy 2>/dev/null; pkill -9 wireguard-go 2>/dev/null; kill -9 $(lsof -ti:1080 2>/dev/null) 2>/dev/null", { stdio: "ignore" });
+    require("child_process").execSync("pkill -9 wireproxy 2>/dev/null; pkill -9 wireguard-go 2>/dev/null; kill -9 $(lsof -ti:1080 2>/dev/null) 2>/dev/null; kill -9 $(lsof -ti:1081 2>/dev/null) 2>/dev/null", { stdio: "ignore" });
   } catch (e) { /* best effort */ }
 }
 
@@ -196,30 +284,87 @@ async function waitForPortRelease(host, port, timeoutMs) {
 
 async function rotateConfig() {
   if (WG_CONFIGS.length <= 1) return;
-  
+
   const newCfg = pickConfig();
-  console.log(`[wg-proxy] Rotating → ${newCfg.endpoint}`);
-  
-  // Kill ALL wireproxy processes and wait for port release
-  if (currentWireProxy) {
-    currentWireProxy.kill("SIGTERM");
-    await new Promise((r) => setTimeout(r, 1000));
-    if (currentWireProxy && !currentWireProxy.killed) {
-      currentWireProxy.kill("SIGKILL");
-    }
+  const oldPort = CURRENT_SOCKS_PORT;
+  const newPort = oldPort === 1080 ? 1081 : 1080;
+
+  console.log(`[wg-proxy] Rotating → ${newCfg.endpoint} (port ${oldPort} → ${newPort})`);
+
+  // 1. Write separate config for the new port (use a distinct file path)
+  const fs = require("fs");
+  const configTemplate = `[Interface]
+PrivateKey = ${newCfg.privateKey}
+Address = 10.2.0.2/32
+DNS = 10.2.0.1
+MTU = ${WG_MTU}
+
+[Peer]
+PublicKey = ${newCfg.peerPublicKey}
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = ${newCfg.endpoint}
+PersistentKeepalive = 25
+
+[Socks5]
+BindAddress = 0.0.0.0:${newPort}
+`;
+  fs.writeFileSync("/etc/wireproxy.conf", configTemplate);
+
+  // 2. Start new wireproxy on the alternate port
+  console.log(`[wg-proxy] Starting new wireproxy on :${newPort} → ${newCfg.endpoint}`);
+  const newProxy = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
+  newProxy.on("exit", (code) => {
+    console.log(`[wg-proxy] New wireproxy (port ${newPort}) exited (code ${code})`);
+  });
+
+  // 3. Wait for new SOCKS5 to be ready
+  const ready = await waitForSocks5(30000, newPort);
+  if (!ready) {
+    console.error(`[wg-proxy] Rotation failed — SOCKS5 not ready on :${newPort} for ${newCfg.endpoint}`);
+    deadEndpoints.set(newCfg.endpoint, Date.now());
+    console.log(`[wg-proxy] Marked ${newCfg.endpoint} as dead (${deadEndpoints.size} dead endpoint(s))`);
+    try { newProxy.kill("SIGTERM"); } catch (e) {}
+    return;
   }
-  killAllWireProxy();
-  
-  // Wait for port 1080 to be released
-  await waitForPortRelease('127.0.0.1', 1080, 7500);
-  
-  currentWireProxy = startWireProxy(newCfg);
-  const ready = await waitForSocks5(30000);
-  if (ready) {
-    console.log(`[wg-proxy] Rotation complete → ${newCfg.endpoint} (SOCKS5 ready)`);
-  } else {
-    console.error(`[wg-proxy] Rotation failed — SOCKS5 not ready for ${newCfg.endpoint}`);
+
+  // 4. Redirect new connections to the new port
+  PREV_SOCKS_PORT = oldPort;
+  PREV_WIRE_PROXY = currentWireProxy;
+  CURRENT_SOCKS_PORT = newPort;
+  currentWireProxy = newProxy;
+
+  console.log(`[wg-proxy] Port switched to :${newPort} — draining ${activeConnections.size} active connection(s) on :${oldPort}`);
+
+  // 5. Wait for old connections to drain (max 30s)
+  const drainDeadline = Date.now() + 30000;
+  while (activeConnections.size > 0 && Date.now() < drainDeadline) {
+    await new Promise((r) => setTimeout(r, 500));
   }
+
+  const drainElapsed = Date.now() - (drainDeadline - 30000);
+  const remaining = activeConnections.size;
+  console.log(`[wg-proxy] Drain done in ${drainElapsed}ms — ${remaining} connection(s) remaining`);
+
+  // 6. Kill old wireproxy
+  if (PREV_WIRE_PROXY) {
+    console.log(`[wg-proxy] Killing old wireproxy on :${oldPort}`);
+    try {
+      PREV_WIRE_PROXY.kill("SIGTERM");
+      await new Promise((r) => setTimeout(r, 1500));
+      if (!PREV_WIRE_PROXY.killed) PREV_WIRE_PROXY.kill("SIGKILL");
+    } catch (e) {}
+    // Force-kill any leftover wireproxy on the old port
+    try {
+      require("child_process").execSync(
+        `lsof -ti:${oldPort} 2>/dev/null | xargs -r kill -9 2>/dev/null`,
+        { stdio: "ignore" }
+      );
+    } catch (e) {}
+    PREV_WIRE_PROXY = null;
+    PREV_SOCKS_PORT = null;
+  }
+
+  console.log(`[wg-proxy] Rotation complete → ${newCfg.endpoint} (SOCKS5 :${newPort})`);
 }
 
 async function startRotationLoop() {
@@ -235,6 +380,17 @@ async function startRotationLoop() {
     }, 60000);
     return;
   }
+  // Clean up expired dead-endpoint entries every 60s
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ep, ts] of deadEndpoints) {
+      if (now - ts >= DEAD_ENDPOINT_RETRY_MS) {
+        deadEndpoints.delete(ep);
+        console.log(`[wg-proxy] Endpoint ${ep} removed from dead list (cooldown expired)`);
+      }
+    }
+  }, 60000);
+
   console.log(`[wg-proxy] IP rotation enabled: ${WG_CONFIGS.length} config(s)`);
   WG_CONFIGS.forEach((c, i) => console.log(`  ${i}: ${c.endpoint}`));
   console.log(`[wg-proxy] Rotation interval: ${ROTATION_INTERVAL_MS / 1000}s`);
@@ -245,6 +401,30 @@ async function startRotationLoop() {
   };
   rotationTimer = setTimeout(rotate, ROTATION_INTERVAL_MS);
 }
+
+// If WG_CONFIGS_URL is set, try to fetch fresh configs on startup (replaces WG_CONFIGS)
+if (WG_CONFIGS_URL) {
+  fetchConfigsFromUrl().then((fresh) => {
+    if (fresh) {
+      mergeConfigs(fresh);
+      console.log(`[wg-proxy] Startup configs fetched from ${WG_CONFIGS_URL}`);
+    } else {
+      console.warn(`[wg-proxy] Failed to fetch configs from ${WG_CONFIGS_URL} — using ${WG_CONFIGS.length} static config(s)`);
+    }
+  });
+}
+
+// Periodic config refresh from URL
+if (WG_CONFIGS_URL && WG_CONFIGS_REFRESH_MS > 0) {
+  setInterval(async () => {
+    const fresh = await fetchConfigsFromUrl();
+    if (fresh) {
+      mergeConfigs(fresh);
+      console.log(`[wg-proxy] Configs refreshed from ${WG_CONFIGS_URL}`);
+    }
+  }, WG_CONFIGS_REFRESH_MS);
+}
+
 
 // ── SOCKS5 through WireGuard ──
 function socks5Connect(targetHost, targetPort) {
@@ -267,7 +447,8 @@ function socks5Connect(targetHost, targetPort) {
   return resolveHost(targetHost).then((connectHost) => {
     return new Promise((resolve, reject) => {
       const s = net.createConnection({ host: SOCKS_HOST, port: SOCKS_PORT }, () => {
-        console.log(`[relay] socks5 TCP connected to wireproxy (${SOCKS_HOST}:${SOCKS_PORT}) in ${Date.now() - socksStart}ms — sending auth`);
+        s.setNoDelay(true);
+        console.log(`[relay] socks5 TCP connected to wireproxy (${SOCKS_HOST}:${CURRENT_SOCKS_PORT}) in ${Date.now() - socksStart}ms — sending auth`);
         s.write(Buffer.from([0x05, 0x01, 0x00]));
       });
       let state = 0, buf = Buffer.alloc(0);
@@ -294,6 +475,8 @@ function socks5Connect(targetHost, targetPort) {
           } else if (state === 1 && buf.length >= 4) {
             cleanup();
             if (buf[1] !== 0x00) { s.destroy(); reject(new Error("reject:" + buf[1])); return; }
+            activeConnections.add(s);
+            s.on("close", () => { activeConnections.delete(s); });
             resolve(s);
           }
         } catch (e) { cleanup(); reject(e); }
@@ -318,7 +501,7 @@ const server = http.createServer((req, res) => {
   const health = {
     status: "ok",
     mode: "wg-proxy",
-    socks5: `:${SOCKS_PORT}`,
+    socks5: `:${CURRENT_SOCKS_PORT}`,
     configs: WG_CONFIGS.length,
     currentEndpoint: getCurrentEndpoint()
   };
@@ -339,6 +522,8 @@ wss.on("connection", (ws, req) => {
   let isMultiplexed = false;
   let legacySocket = null; // Single SOCKS5 socket for legacy mode
   const connections = new Map(); // connId -> net.Socket (SOCKS5)
+  // Tracks SOCKS5 sockets whose write() returned false (buffer full)
+  const blockedSocks = new Set();
 
   ws.on("message", (data, isBinary) => {
     // ── Text frames (isBinary=false): JSON control messages ──
@@ -374,7 +559,13 @@ wss.on("connection", (ws, req) => {
         // ── Multiplexed mode ──
         if (msg.type === 'connect' && msg.connId != null && msg.host) {
           const connId = msg.connId;
-          console.log(`[relay] Mux connect request: connId=${connId} ${msg.host}:${msg.port || 443}`);
+          // Enforce per-client connection limit to prevent fd exhaustion
+          if (connections.size >= MAX_CONNECTIONS_PER_CLIENT) {
+            console.log(`[relay] Mux connect REJECTED — ${msg.host}:${msg.port || 443} (connId=${connId}): at limit (${MAX_CONNECTIONS_PER_CLIENT})`);
+            try { ws.send(JSON.stringify({ type: "error", connId, message: "connection limit reached" })); } catch (e) {}
+            return;
+          }
+          console.log(`[relay] Mux connect request: connId=${connId} ${msg.host}:${msg.port || 443} (${connections.size}/${MAX_CONNECTIONS_PER_CLIENT})`);
           const muxStart = Date.now();
           socks5Connect(msg.host, msg.port || 443)
             .then((socks) => {
@@ -412,12 +603,30 @@ wss.on("connection", (ws, req) => {
         const payload = buf.slice(4);
         const socks = connections.get(connId);
         if (socks) {
-          try { socks.write(payload); } catch (e) {}
+          try {
+            if (!socks.write(payload)) {
+              blockedSocks.add(socks);
+              ws.pause();
+              socks.once("drain", () => {
+                blockedSocks.delete(socks);
+                if (blockedSocks.size === 0) ws.resume();
+              });
+            }
+          } catch (e) {}
         }
       } else {
         // Legacy: raw data goes to the single SOCKS5 connection
         if (legacySocket) {
-          try { legacySocket.write(buf); } catch (e) {}
+          try {
+            if (!legacySocket.write(buf)) {
+              blockedSocks.add(legacySocket);
+              ws.pause();
+              legacySocket.once("drain", () => {
+                blockedSocks.delete(legacySocket);
+                if (blockedSocks.size === 0) ws.resume();
+              });
+            }
+          } catch (e) {}
         }
       }
     }
@@ -427,7 +636,9 @@ wss.on("connection", (ws, req) => {
     const socks = connections.get(connId);
     if (socks) {
       connections.delete(connId);
+      blockedSocks.delete(socks);
       try { socks.end(); } catch (e) {}
+      if (blockedSocks.size === 0) ws.resume();
     }
   }
 
@@ -436,6 +647,7 @@ wss.on("connection", (ws, req) => {
       try { socks.end(); } catch (e) {}
     }
     connections.clear();
+    blockedSocks.clear();
     try { legacySocket?.end(); } catch (e) {}
     legacySocket = null;
   }
@@ -449,11 +661,16 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 server.on("connect", (req, socket, head) => {
-  const [host, portStr] = req.url.split(":");
-  const port = parseInt(portStr) || 443;
+  // Parse host:port with IPv6 support — e.g. [2001:db8::1]:443
+  const lastColon = req.url.lastIndexOf(":");
+  const host = req.url.slice(0, lastColon).replace(/^\[|\]$/g, "");
+  const port = parseInt(req.url.slice(lastColon + 1)) || 443;
   socks5Connect(host, port)
     .then((ts) => {
       socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      // Forward any initial data that arrived with the CONNECT request
+      // (TLS-in-CONNECT, Expect: 100-continue, etc.)
+      if (head && head.length > 0) ts.write(head);
       ts.pipe(socket);
       socket.pipe(ts);
     })
@@ -473,7 +690,7 @@ async function main() {
   const initialCfg = WG_CONFIGS[0];
   console.log(`[wg-proxy] Starting WireGuard with ${WG_CONFIGS.length} config(s)...`);
   
-  currentWireProxy = startWireProxy(initialCfg);
+  currentWireProxy = startWireProxy(initialCfg, CURRENT_SOCKS_PORT);
   console.log("[wg-proxy] Waiting for SOCKS5...");
   const ready = await waitForSocks5(45000);
   if (!ready) {
@@ -484,10 +701,44 @@ async function main() {
 
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`[wg-proxy] Proxy ready on :${PORT}`);
-    console.log(`[wg-proxy]   WebSocket relay → WireGuard SOCKS5 :${SOCKS_PORT}`);
+    console.log(`[wg-proxy]   WebSocket relay → WireGuard SOCKS5 :${CURRENT_SOCKS_PORT}`);
   });
 
   startRotationLoop();
 }
+
+// ── Graceful shutdown ──
+const SHUTDOWN_GRACE_MS = 10000;
+
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[wg-proxy] Received ${signal} — starting graceful shutdown...`);
+
+  // 1. Stop accepting new connections
+  server.close(() => {
+    console.log("[wg-proxy] HTTP server closed");
+  });
+
+  // 2. Close all WebSocket clients (sends close frame, triggers cleanupAll)
+  for (const ws of [...wss.clients]) {
+    ws.close(1001, "Server shutting down");
+  }
+
+  // 3. Kill wireproxy
+  if (currentWireProxy) {
+    currentWireProxy.kill("SIGTERM");
+  }
+
+  // 4. Force exit after grace period
+  setTimeout(() => {
+    console.log("[wg-proxy] Shutdown timeout — forcing exit");
+    process.exit(0);
+  }, SHUTDOWN_GRACE_MS);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
 
 main().catch((err) => { console.error("[wg-proxy] Fatal:", err); process.exit(1); });
