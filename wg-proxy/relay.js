@@ -103,7 +103,7 @@ const DEAD_ENDPOINT_RETRY_MS = parseInt(process.env.WG_DEAD_RETRY || "300000"); 
 const WG_MTU = parseInt(process.env.WG_MTU || "1300");
 
 // Health check targets (comma-separated host:port pairs, tried in sequence)
-const HEALTH_CHECK_TARGETS = (process.env.HEALTH_CHECK_TARGETS || "1.1.1.1:80,8.8.8.8:80")
+const HEALTH_CHECK_TARGETS = (process.env.HEALTH_CHECK_TARGETS || "1.1.1.1:80,8.8.8.8:80,opencode.ai:443,httpbin.org:80")
   .split(",")
   .map(s => { const [h, p] = s.trim().split(":"); return { host: h, port: parseInt(p) || 80 }; })
   .filter(t => t.host);
@@ -446,49 +446,74 @@ if (WG_CONFIGS_URL && WG_CONFIGS_REFRESH_MS > 0) {
 // ── SOCKS5 through WireGuard ──
 function socks5Connect(targetHost, targetPort) {
   const socksStart = Date.now();
-  // Use the hostname directly — WireGuard tunnel handles DNS via internal DNS (10.2.0.1).
-  // No need to resolve DNS on the relay side, which adds latency and a potential failure point.
-  return new Promise((resolve, reject) => {
-    const s = net.createConnection({ host: SOCKS_HOST, port: CURRENT_SOCKS_PORT }, () => {
-      s.setNoDelay(true);
-      console.log(`[relay] socks5 TCP connected to wireproxy (${SOCKS_HOST}:${CURRENT_SOCKS_PORT}) in ${Date.now() - socksStart}ms — sending auth`);
-      s.write(Buffer.from([0x05, 0x01, 0x00]));
-    });
-    let state = 0, buf = Buffer.alloc(0);
-    const timer = setTimeout(() => { s.destroy(); reject(new Error("timeout")); }, 20000);
-    const cleanup = () => { clearTimeout(timer); s.removeListener("data", onData); };
-    const onData = (d) => {
-      buf = Buffer.concat([buf, d]);
-      try {
-        if (state === 0 && buf.length >= 2) {
-          if (buf[1] !== 0x00) { cleanup(); s.destroy(); reject(new Error("auth fail")); return; }
-          console.log(`[relay] SOCKS5 auth OK for ${targetHost}:${targetPort} in ${Date.now() - socksStart}ms — sending connect`);
-          state = 1;
-          // Use IPv4 type (0x01) for IP addresses, domain name type (0x03) for hostnames
-          let connectMsg;
-          if (net.isIPv4(targetHost)) {
-            const ipBytes = targetHost.split('.').map(Number);
-            connectMsg = Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x01]), Buffer.from(ipBytes), Buffer.from([(targetPort >> 8) & 0xFF, targetPort & 0xFF])]);
-          } else {
-            const hb = Buffer.from(targetHost);
-            connectMsg = Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hb.length]), hb, Buffer.from([(targetPort >> 8) & 0xFF, targetPort & 0xFF])]);
-          }
-          s.write(connectMsg);
-          buf = Buffer.alloc(0);
-        } else if (state === 1 && buf.length >= 4) {
-          cleanup();
-          if (buf[1] !== 0x00) { s.destroy(); reject(new Error("reject:" + buf[1])); return; }
-          activeConnections.add(s);
-          s.on("close", () => { activeConnections.delete(s); });
-          resolve(s);
+
+  // Resolve hostname to IP on the relay side, bypassing the WireGuard tunnel's
+  // internal DNS (10.2.0.1) which is unreliable on Proton VPN free tier.
+  // When tunnel DNS fails, wireproxy returns SOCKS5 reject:4 (Host unreachable).
+  const resolveHost = () => {
+    if (net.isIPv4(targetHost) || net.isIPv6(targetHost)) return Promise.resolve(targetHost);
+    return new Promise((resolve) => {
+      const t = setTimeout(() => {
+        console.log(`[relay] DNS resolve4 TIMEOUT for ${targetHost} — using hostname directly`);
+        resolve(targetHost);
+      }, 5000);
+      dns.resolve4(targetHost, (err, addresses) => {
+        clearTimeout(t);
+        if (err || !addresses || addresses.length === 0) {
+          console.log(`[relay] DNS resolve4 FAILED for ${targetHost} — using hostname`);
+          resolve(targetHost);
+        } else {
+          console.log(`[relay] DNS resolved ${targetHost} -> ${addresses[0]}`);
+          resolve(addresses[0]);
         }
-      } catch (e) { cleanup(); reject(e); }
-    };
-    s.on("data", onData);
-    s.on("error", (e) => { cleanup(); reject(e); });
-    s.setTimeout(20000, () => { s.destroy(); cleanup(); reject(new Error("timeout")); });
+      });
+    });
+  };
+
+  return resolveHost().then((useHost) => {
+    return new Promise((resolve, reject) => {
+      const s = net.createConnection({ host: SOCKS_HOST, port: CURRENT_SOCKS_PORT }, () => {
+        s.setNoDelay(true);
+        console.log(`[relay] socks5 TCP connected to wireproxy (${SOCKS_HOST}:${CURRENT_SOCKS_PORT}) in ${Date.now() - socksStart}ms — sending auth`);
+        s.write(Buffer.from([0x05, 0x01, 0x00]));
+      });
+      let state = 0, buf = Buffer.alloc(0);
+      const timer = setTimeout(() => { s.destroy(); reject(new Error("socks5 timeout")); }, 20000);
+      const cleanup = () => { clearTimeout(timer); s.removeListener("data", onData); };
+      const onData = (d) => {
+        buf = Buffer.concat([buf, d]);
+        try {
+          if (state === 0 && buf.length >= 2) {
+            if (buf[1] !== 0x00) { cleanup(); s.destroy(); reject(new Error("socks5 auth fail")); return; }
+            console.log(`[relay] SOCKS5 auth OK for ${useHost}:${targetPort} in ${Date.now() - socksStart}ms — sending connect`);
+            state = 1;
+            // Use IPv4 type (0x01) for IP addresses, domain name type (0x03) for hostnames
+            let connectMsg;
+            if (net.isIPv4(useHost)) {
+              const ipBytes = useHost.split(".").map(Number);
+              connectMsg = Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x01]), Buffer.from(ipBytes), Buffer.from([(targetPort >> 8) & 0xFF, targetPort & 0xFF])]);
+            } else {
+              const hb = Buffer.from(useHost);
+              connectMsg = Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hb.length]), hb, Buffer.from([(targetPort >> 8) & 0xFF, targetPort & 0xFF])]);
+            }
+            s.write(connectMsg);
+            buf = Buffer.alloc(0);
+          } else if (state === 1 && buf.length >= 4) {
+            cleanup();
+            if (buf[1] !== 0x00) { s.destroy(); reject(new Error("socks5 reject:" + buf[1])); return; }
+            activeConnections.add(s);
+            s.on("close", () => { activeConnections.delete(s); });
+            resolve(s);
+          }
+        } catch (e) { cleanup(); reject(e); }
+      };
+      s.on("data", onData);
+      s.on("error", (e) => { cleanup(); reject(e); });
+      s.setTimeout(20000, () => { s.destroy(); cleanup(); reject(new Error("socks5 timeout")); });
+    });
   });
 }
+
 // ── HTTP + WebSocket server ──
 const server = http.createServer((req, res) => {
   // Detailed SOCKS5 health check — tests actual tunnel connectivity
