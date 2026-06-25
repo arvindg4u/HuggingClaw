@@ -25,6 +25,11 @@ try { WebSocket = require("ws"); } catch(e) { /* ws not available — continue w
 
 const log = (...args) => console.error("[hc-proxy]", ...args);
 
+// Keepalive agent for HTTPS proxy connections — reduces TCP setup overhead
+// for multiple requests to the same host through the proxy tunnel.
+const httpsKeepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 10, maxFreeSockets: 5, timeout: 60000 });
+
+
 // ── Proxy Routing Config ──
 // WARNING: HF Spaces scans env var NAMES and flags SOCKS5/PROXY/TOR
 // patterns.  Do NOT set env vars containing "SOCKS5_PROXY_URL" on HF
@@ -119,8 +124,18 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
     return attempt(attempts);
   };
 
+  
   // WebSocket proxy (for wss:// or ws:// URLs)
   if (pUrl.startsWith('wss') || pUrl.startsWith('ws://')) {
+    // Try multiplexed pool first, fall back to legacy retry
+    try {
+      const pool = getMultiplexedPool(pUrl);
+      if (pool) {
+        return pool.connectTunnel(targetHost, targetPort, timeout);
+      }
+    } catch(e) {
+      log(`[dbg] multiplexed pool failed: "${e?.message}", falling back to legacy`);
+    }
     return wsRetry(3)
       .catch((e) => {
         log(`[dbg] wsConnectProxy all retries failed: "${e?.message}"`);
@@ -131,6 +146,23 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
   }
 
   // For https:// URLs: try WebSocket with retry, then TLS/HTTP CONNECT, then fatal
+  try {
+    const pool = getMultiplexedPool(pUrl.replace(/^https:/i, 'wss:'));
+    if (pool) {
+      return pool.connectTunnel(targetHost, targetPort, timeout)
+        .catch(() => {
+          log('[dbg] multiplexed pool failed for https URL, falling back to legacy');
+          return wsRetry(3);
+        })
+        .catch(() => tlsConnectProxy(targetHost, targetPort, timeout))
+        .catch(() => httpConnectProxy(targetHost, targetPort, timeout))
+        .catch((e2) => {
+          const err = new Error(`FATAL: All proxy methods failed for ${targetHost}:${targetPort} - no direct fallback`);
+          log(err.message);
+          throw err;
+        });
+    }
+  } catch(e) {}
   return wsRetry(3)
     .catch((e) => {
       log(`[dbg] wsConnectProxy all retries failed: "${e?.message}"`);
@@ -297,6 +329,7 @@ https.request = function(...args) {
       })
       .catch(cbOnce);
   };
+    nopts.agent = httpsKeepAliveAgent;
   return origHttps.call(this, nopts, cb);
 };
 
@@ -800,7 +833,12 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
               callback(new Error('WebSocket closed'));
             }
           },
-          read(size) {},
+          read(size) {
+            // Consumer buffer drained — resume WebSocket data flow if paused
+            if (ws && ws._socket && typeof ws._socket.isPaused === 'function' && ws._socket.isPaused()) {
+              try { ws._socket.resume(); } catch(e) {}
+            }
+          },
           destroy(err, callback) {
             try { ws.close(); } catch(e) {}
             callback(err);
@@ -837,11 +875,26 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
           }
           // Binary frame — forward to duplex (always, even if settled)
           const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-          if (buf.length > 0 && !duplex.push(buf)) {}
+          if (buf.length > 0) {
+            if (!duplex.push(buf)) {
+              // Backpressure: consumer buffer full, pause WebSocket data flow
+              if (ws && ws._socket && typeof ws._socket.pause === 'function') {
+                try { ws._socket.pause(); } catch(e) {}
+              }
+            }
+          }
         });
 
         ws.on('open', () => {
           log(`[wsTrace] WebSocket OPEN event for ${targetHost}:${targetPort}`);
+          // Enable TCP_NODELAY for low-latency streaming (disable Nagle algorithm)
+          if (ws._socket) {
+            try { ws._socket.setNoDelay(true); } catch(e) {}
+          }
+          // Enable TCP_NODELAY for low-latency streaming
+          if (ws._socket) {
+            try { ws._socket.setNoDelay(true); } catch(e) {}
+          }
           ws.send(JSON.stringify({ host: targetHost, port: targetPort }), { binary: false });
         });
         ws.on('upgrade', (res) => {
@@ -869,6 +922,209 @@ function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
     });
   });
 }
+
+
+// ── Multiplexed connection pool for WebSocket relay ──
+// Maintains a persistent WebSocket connection to the relay and uses the
+// multiplexed protocol (connId-based) for multiple concurrent tunnels.
+// Falls back to legacy one-shot connections if multiplexed fails.
+class MultiplexedPool {
+  constructor(wsUrl) {
+    this.wsUrl = wsUrl;
+    this.ws = null;
+    this.pending = new Map(); // connId -> { resolve, reject, duplex, timer, host, port }
+    this.connIdCounter = 0;
+    this.connected = false;
+    this.reconnecting = false;
+    this.destroyed = false;
+    this.connect();
+  }
+
+  _getNextConnId() {
+    return ++this.connIdCounter;
+  }
+
+  connect() {
+    if (this.destroyed) return;
+    try {
+      this.ws = new WebSocket(this.wsUrl, { handshakeTimeout: 20000 });
+    } catch(e) {
+      this._scheduleReconnect();
+      return;
+    }
+
+    this.ws.on('open', () => {
+      this.connected = true;
+      this.reconnecting = false;
+      if (this.ws._socket) {
+        try { this.ws._socket.setNoDelay(true); } catch(e) {}
+      }
+      // Resubscribe any pending connections that were waiting for reconnect
+      for (const [connId, pending] of this.pending) {
+        if (!pending.subscribed) {
+          pending.subscribed = true;
+          this.ws.send(JSON.stringify({ type: 'connect', connId, host: pending.host, port: pending.port }));
+        }
+      }
+    });
+
+    this.ws.on('message', (data, isBinary) => {
+      if (!isBinary) {
+        const str = typeof data === 'string' ? data : data.toString();
+        try {
+          const msg = JSON.parse(str);
+          if (msg.type === 'connected' && msg.connId != null) {
+            const pending = this.pending.get(msg.connId);
+            if (pending) {
+              clearTimeout(pending.timer);
+              pending.ready = true;
+              pending.resolve(pending.duplex);
+            }
+          } else if (msg.type === 'error' && msg.connId != null) {
+            const pending = this.pending.get(msg.connId);
+            if (pending) {
+              clearTimeout(pending.timer);
+              pending.reject(new Error(msg.message || 'multiplexed connect failed'));
+              this.pending.delete(msg.connId);
+            }
+          }
+        } catch(e) {}
+        return;
+      }
+
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      if (buf.length < 4) return;
+      const connId = buf.readUInt32BE(0);
+      const payload = buf.slice(4);
+      const pending = this.pending.get(connId);
+      if (pending && pending.duplex && payload.length > 0) {
+        if (!pending.duplex.push(payload)) {
+          if (this.ws && this.ws._socket && typeof this.ws._socket.pause === 'function') {
+            try { this.ws._socket.pause(); } catch(e) {}
+          }
+        }
+      }
+    });
+
+    this.ws.on('close', () => {
+      this.connected = false;
+      const oldWs = this.ws;
+      this.ws = null;
+      if (this.destroyed) return;
+      this._scheduleReconnect();
+    });
+
+    this.ws.on('error', () => {});
+  }
+
+  _scheduleReconnect() {
+    if (this.reconnecting || this.destroyed) return;
+    this.reconnecting = true;
+    setTimeout(() => {
+      this.reconnecting = false;
+      this.connect();
+    }, 3000);
+  }
+
+  // Create a multiplexed tunnel. Returns a Duplex stream.
+  connectTunnel(targetHost, targetPort, timeout = 45000) {
+    return new Promise((resolve, reject) => {
+      const connId = this._getNextConnId();
+      const duplex = new Duplex({
+        write(data, encoding, callback) {
+          const pending = this._hcPending;
+          if (!pending || !pending.ws || pending.ws.readyState !== WebSocket.OPEN) {
+            callback(new Error('WebSocket closed'));
+            return;
+          }
+          const header = Buffer.alloc(4);
+          header.writeUInt32BE(pending.connId);
+          const frame = Buffer.concat([header, Buffer.from(data)]);
+          pending.ws.send(frame, { binary: true }, callback);
+          if (pending.ws.bufferedAmount > 128 * 1024) {
+            // Backpressure on the WebSocket send buffer
+          }
+        },
+        read(size) {
+          const pending = this._hcPending;
+          if (pending && pending.ws && pending.ws._socket &&
+              typeof pending.ws._socket.isPaused === 'function' && pending.ws._socket.isPaused()) {
+            try { pending.ws._socket.resume(); } catch(e) {}
+          }
+        },
+        destroy(err, callback) {
+          const pending = this._hcPending;
+          if (pending) {
+            pending.destroyed = true;
+            // Send disconnect to relay
+            if (pending.ws && pending.ws.readyState === WebSocket.OPEN) {
+              try {
+                pending.ws.send(JSON.stringify({ type: 'disconnect', connId: pending.connId }));
+              } catch(e) {}
+            }
+            pool.pending.delete(pending.connId);
+          }
+          callback(err);
+        }
+      });
+      duplex.setMaxListeners(0);
+      duplex.on('error', () => {});
+
+      const pending = {
+        connId,
+        host: targetHost,
+        port: targetPort,
+        duplex,
+        resolve,
+        reject,
+        ready: false,
+        destroyed: false,
+        subscribed: false,
+        ws: this.ws,
+        timer: setTimeout(() => {
+          if (!pending.ready) {
+            pending.reject(new Error('multiplexed connect timeout'));
+            pool.pending.delete(connId);
+          }
+        }, timeout)
+      };
+      
+      // Store pool reference for destroy handler
+      duplex._hcPending = pending;
+      this.pending.set(connId, pending);
+
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        pending.subscribed = true;
+        pending.ws = this.ws;
+        this.ws.send(JSON.stringify({ type: 'connect', connId, host: targetHost, port: targetPort }));
+      }
+      // If ws is not open yet, the open handler will send the connect message
+    });
+  }
+
+  destroy() {
+    this.destroyed = true;
+    if (this.ws) {
+      try { this.ws.close(); } catch(e) {}
+      this.ws = null;
+    }
+    for (const [connId, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('pool destroyed'));
+    }
+    this.pending.clear();
+  }
+}
+
+// Global multiplexed pool instance (created lazily)
+let multiplexedPool = null;
+function getMultiplexedPool(wsUrl) {
+  if (!multiplexedPool || multiplexedPool.destroyed) {
+    multiplexedPool = new MultiplexedPool(wsUrl);
+  }
+  return multiplexedPool;
+}
+
 
 // ── Discord WebSocket tunnel (parameterized, uses DISCORD_WS_PROXY_URL) ──
 // Same protocol as wsConnectProxy but accepts a custom WebSocket proxy URL.
@@ -918,7 +1174,12 @@ function discordWsConnect(targetHost, targetPort, wsProxyUrl, timeout = 45000) {
               callback(new Error('WebSocket closed'));
             }
           },
-          read(size) {},
+          read(size) {
+            // Consumer buffer drained — resume WebSocket data flow if paused
+            if (ws && ws._socket && typeof ws._socket.isPaused === 'function' && ws._socket.isPaused()) {
+              try { ws._socket.resume(); } catch(e) {}
+            }
+          },
           destroy(err, callback) {
             try { ws.close(); } catch(e) {}
             callback(err);
@@ -953,10 +1214,21 @@ function discordWsConnect(targetHost, targetPort, wsProxyUrl, timeout = 45000) {
             return;
           }
           const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-          if (buf.length > 0 && !duplex.push(buf)) {}
+          if (buf.length > 0) {
+            if (!duplex.push(buf)) {
+              // Backpressure: consumer buffer full, pause WebSocket data flow
+              if (ws && ws._socket && typeof ws._socket.pause === 'function') {
+                try { ws._socket.pause(); } catch(e) {}
+              }
+            }
+          }
         });
 
         ws.on('open', () => {
+          // Enable TCP_NODELAY for low-latency streaming
+          if (ws._socket) {
+            try { ws._socket.setNoDelay(true); } catch(e) {}
+          }
           ws.send(JSON.stringify({ host: targetHost, port: targetPort }), { binary: false });
         });
         ws.on('error', (e) => {
