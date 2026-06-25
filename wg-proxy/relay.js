@@ -391,6 +391,17 @@ async function startRotationLoop() {
     }
   }, 60000);
 
+  // Monitor active tunnel health every 30s — trigger early rotation if dead
+  setInterval(async () => {
+    const ok = await testSocks5Working();
+    if (!ok && !shuttingDown) {
+      console.log(`[wg-proxy] Tunnel unresponsive — triggering early rotation`);
+      if (rotationTimer) clearTimeout(rotationTimer);
+      await rotateConfig();
+      rotationTimer = setTimeout(rotate, ROTATION_INTERVAL_MS);
+    }
+  }, 30000);
+
   console.log(`[wg-proxy] IP rotation enabled: ${WG_CONFIGS.length} config(s)`);
   WG_CONFIGS.forEach((c, i) => console.log(`  ${i}: ${c.endpoint}`));
   console.log(`[wg-proxy] Rotation interval: ${ROTATION_INTERVAL_MS / 1000}s`);
