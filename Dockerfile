@@ -81,7 +81,8 @@ RUN mkdir -p /home/node/browser-deps && \
 RUN ln -s /home/node/.openclaw/openclaw-app/openclaw.mjs /usr/local/bin/openclaw 2>/dev/null || \
     npm install -g openclaw@${OPENCLAW_VERSION}
 
-# ── Pre-bundle WhatsApp + Discord plugins (build time, real directory) ──
+# ── Pre-bundle WhatsApp plugin (build time, real directory) ──
+# Discord is already bundled in the OpenClaw base image — do not reinstall.
 RUN mkdir -p /home/node/.openclaw/extensions && \
     if HOME=/home/node openclaw plugins install clawhub:@openclaw/whatsapp 2>/dev/null; then \
       echo "[build] WhatsApp plugin pre-bundled from ClawHub."; \
@@ -89,13 +90,6 @@ RUN mkdir -p /home/node/.openclaw/extensions && \
       echo "[build] WhatsApp plugin pre-bundled from npm."; \
     else \
       echo "[build] Warning: could not pre-bundle WhatsApp plugin (will install at runtime)"; \
-    fi && \
-    if HOME=/home/node openclaw plugins install clawhub:@openclaw/discord 2>/dev/null; then \
-      echo "[build] Discord plugin pre-bundled from ClawHub."; \
-    elif HOME=/home/node openclaw plugins install @openclaw/discord 2>/dev/null; then \
-      echo "[build] Discord plugin pre-bundled from npm."; \
-    else \
-      echo "[build] Warning: could not pre-bundle Discord plugin (will install at runtime)"; \
     fi && \
     chown -R 1000:1000 /home/node/.openclaw
 

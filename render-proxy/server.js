@@ -353,6 +353,82 @@ discordWss.on("connection", (ws, req) => {
   });
 });
 
+// ── WebSocket TCP tunnel for WhatsApp ────────────────────────────
+// Same protocol as discord-ws: client sends JSON {host, port},
+// server connects via net.connect(), binary frames flow bidirectionally.
+const whatsappWss = new WebSocketServer({ server, path: "/whatsapp-tcp" });
+
+whatsappWss.on("connection", (ws, req) => {
+  log("whatsapp-tcp", "New tunnel connection");
+  let targetSocket = null;
+
+  const cleanup = () => {
+    if (targetSocket) { try { targetSocket.end(); } catch(_) {} targetSocket = null; }
+  };
+
+  ws.on("message", (data, isBinary) => {
+    if (!isBinary) {
+      const str = typeof data === "string" ? data : data.toString();
+      try {
+        const msg = JSON.parse(str);
+        if (msg.host && msg.port && !targetSocket) {
+          const host = msg.host;
+          const port = parseInt(msg.port) || 443;
+          log("whatsapp-tcp", `Connecting to ${host}:${port}`);
+
+          targetSocket = net.connect(port, host, () => {
+            log("whatsapp-tcp", `Connected to ${host}:${port}`);
+            if (ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({ status: "connected" }), { binary: false });
+            }
+          });
+
+          targetSocket.on("data", (td) => {
+            if (ws.readyState === ws.OPEN) {
+              ws.send(td, { binary: true });
+            }
+          });
+
+          targetSocket.on("error", (err) => {
+            log("whatsapp-tcp", `Socket error: ${err.message}`);
+            try { ws.send(JSON.stringify({ error: err.message })); } catch(_) {}
+            cleanup();
+          });
+
+          targetSocket.on("close", () => {
+            log("whatsapp-tcp", `Socket closed for ${host}:${port}`);
+            cleanup();
+            try { ws.close(); } catch(_) {}
+          });
+
+          return;
+        }
+        if (msg.error && ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({ error: msg.error }));
+        }
+      } catch(e) {
+        log("whatsapp-tcp", `Invalid JSON: ${e.message}`);
+      }
+      return;
+    }
+
+    if (targetSocket) {
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      try { targetSocket.write(buf); } catch(_) {}
+    }
+  });
+
+  ws.on("close", () => {
+    log("whatsapp-tcp", "WebSocket closed");
+    cleanup();
+  });
+
+  ws.on("error", (e) => {
+    log("whatsapp-tcp", `WebSocket error: ${e.message}`);
+    cleanup();
+  });
+});
+
 // ── Self-ping every 10min to prevent Render free tier sleep ─────────────
 setInterval(() => {
   http.get(`http://127.0.0.1:${PORT}/health`, (r) => r.resume());
@@ -364,5 +440,6 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`[hc-render-proxy] Telegram → https://api.telegram.org`);
   console.log(`[hc-render-proxy] WhatsApp → web.whatsapp.com / g.whatsapp.net / mmg.whatsapp.net / pps.whatsapp.net / static.whatsapp.net`);
   console.log(`[hc-render-proxy] Discord WS tunnel → /discord-ws (TCP relay for gateway.discord.gg)`);
+  console.log(`[hc-render-proxy] WhatsApp TCP tunnel → /whatsapp-tcp (TCP relay for WhatsApp domains)`);
   console.log(`[hc-render-proxy] Cron ping → /health every 10min to keep awake`);
 });

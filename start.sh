@@ -712,6 +712,15 @@ echo "[telegram] Proxy: api.telegram.org → ${TELEGRAM_API_BASE}"
 WHATSAPP_PROXY_BASE="${WHATSAPP_PROXY_BASE:-https://render-proxy-ukjd.onrender.com}"
 export WHATSAPP_PROXY_BASE
 
+# WhatsApp WebSocket TCP tunnel — whatsapp-proxy.cjs uses this for TLS/WebSocket connections.
+# Derived from WHATSAPP_PROXY_BASE (e.g., https://render-proxy-ukjd.onrender.com)
+# → wss://render-proxy-ukjd.onrender.com/whatsapp-tcp
+if [ -n "${WHATSAPP_PROXY_BASE:-}" ]; then
+  WHATSAPP_WS_PROXY_URL="$(echo "$WHATSAPP_PROXY_BASE" | sed 's|^https://|wss://|;s|^http://|ws://|;s|/$||')/whatsapp-tcp"
+  export WHATSAPP_WS_PROXY_URL
+  echo "[whatsapp] WS tunnel: ${WHATSAPP_WS_PROXY_URL}"
+fi
+
 # Discord API root — discord-proxy.cjs rewrites discord.com to this proxy.
 DISCORD_PROXY_BASE="${DISCORD_PROXY_BASE:-https://render-proxy-ukjd.onrender.com/discord}"
 export DISCORD_PROXY_BASE
