@@ -93,6 +93,7 @@ let currentConfigIdx = 0;
 let rotationTimer = null;
 let wireproxyRestartCount = 0;
 let shuttingDown = false;
+let isRotating = false; // prevents concurrent rotations
 
 // Track endpoints that failed SOCKS5 verification (endpoint -> {failures, timestamp})
 const deadEndpoints = new Map();
@@ -284,6 +285,8 @@ async function waitForPortRelease(host, port, timeoutMs) {
 
 async function rotateConfig() {
   if (WG_CONFIGS.length <= 1) return;
+  if (isRotating) { console.log('[wg-proxy] Rotation already in progress — skipping'); return; }
+  isRotating = true;
 
   const newCfg = pickConfig();
   const oldPort = CURRENT_SOCKS_PORT;
@@ -320,6 +323,7 @@ BindAddress = 0.0.0.0:${newPort}
   // 3. Wait for new SOCKS5 to be ready
   const ready = await waitForSocks5(30000, newPort);
   if (!ready) {
+    isRotating = false;
     console.error(`[wg-proxy] Rotation failed — SOCKS5 not ready on :${newPort} for ${newCfg.endpoint}`);
     deadEndpoints.set(newCfg.endpoint, Date.now());
     console.log(`[wg-proxy] Marked ${newCfg.endpoint} as dead (${deadEndpoints.size} dead endpoint(s))`);
@@ -364,6 +368,7 @@ BindAddress = 0.0.0.0:${newPort}
     PREV_SOCKS_PORT = null;
   }
 
+  isRotating = false;
   console.log(`[wg-proxy] Rotation complete → ${newCfg.endpoint} (SOCKS5 :${newPort})`);
 }
 
@@ -395,6 +400,7 @@ async function startRotationLoop() {
   setInterval(async () => {
     const ok = await testSocks5Working();
     if (!ok && !shuttingDown) {
+      if (isRotating) { console.log('[wg-proxy] Tunnel dead but rotation in progress — waiting'); return; }
       console.log(`[wg-proxy] Tunnel unresponsive — triggering early rotation`);
       if (rotationTimer) clearTimeout(rotationTimer);
       await rotateConfig();
