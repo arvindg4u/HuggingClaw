@@ -446,7 +446,7 @@ function socks5Connect(targetHost, targetPort) {
   };
   return resolveHost(targetHost).then((connectHost) => {
     return new Promise((resolve, reject) => {
-      const s = net.createConnection({ host: SOCKS_HOST, port: SOCKS_PORT }, () => {
+      const s = net.createConnection({ host: SOCKS_HOST, port: CURRENT_SOCKS_PORT }, () => {
         s.setNoDelay(true);
         console.log(`[relay] socks5 TCP connected to wireproxy (${SOCKS_HOST}:${CURRENT_SOCKS_PORT}) in ${Date.now() - socksStart}ms — sending auth`);
         s.write(Buffer.from([0x05, 0x01, 0x00]));
