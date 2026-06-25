@@ -16,6 +16,7 @@
 
 const http = require("http");
 const https = require("https");
+const net = require("net");
 const url = require("url");
 const { WebSocketServer } = require("ws");
 
@@ -269,6 +270,89 @@ wss.on("connection", (clientWs, req) => {
   });
 });
 
+
+// ── WebSocket TCP tunnel for Discord Gateway ──────────────────────────
+// cloudflare-proxy.js connects here and sends {host, port} JSON to tunnel
+// TCP traffic through Render\'s unrestricted outbound (bypasses WireGuard).
+// Protocol matches the "legacy format" used by wg-proxy/relay.js:
+//   1. Client sends:  {"host":"gateway.discord.gg","port":443}
+//   2. Server replies: {"status":"connected"}
+//   3. Binary frames flow bidirectionally
+const discordWss = new WebSocketServer({ server, path: "/discord-ws" });
+
+discordWss.on("connection", (ws, req) => {
+  log("discord-ws", "New tunnel connection");
+  let targetSocket = null;
+
+  const cleanup = () => {
+    if (targetSocket) { try { targetSocket.end(); } catch(_) {} targetSocket = null; }
+  };
+
+  ws.on("message", (data, isBinary) => {
+    if (!isBinary) {
+      // Text frame \u2014 JSON control message
+      const str = typeof data === "string" ? data : data.toString();
+      try {
+        const msg = JSON.parse(str);
+        if (msg.host && msg.port && !targetSocket) {
+          const host = msg.host;
+          const port = parseInt(msg.port) || 443;
+          log("discord-ws", `Connecting to ${host}:${port}`);
+
+          targetSocket = net.connect(port, host, () => {
+            log("discord-ws", `Connected to ${host}:${port}`);
+            if (ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({ status: "connected" }), { binary: false });
+            }
+          });
+
+          targetSocket.on("data", (td) => {
+            if (ws.readyState === ws.OPEN) {
+              ws.send(td, { binary: true });
+            }
+          });
+
+          targetSocket.on("error", (err) => {
+            log("discord-ws", `Socket error: ${err.message}`);
+            try { ws.send(JSON.stringify({ error: err.message })); } catch(_) {}
+            cleanup();
+          });
+
+          targetSocket.on("close", () => {
+            log("discord-ws", `Socket closed for ${host}:${port}`);
+            cleanup();
+            try { ws.close(); } catch(_) {}
+          });
+
+          return;
+        }
+        if (msg.error && ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({ error: msg.error }));
+        }
+      } catch(e) {
+        log("discord-ws", `Invalid JSON: ${e.message}`);
+      }
+      return;
+    }
+
+    // Binary frame \u2014 forward to target socket
+    if (targetSocket) {
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      try { targetSocket.write(buf); } catch(_) {}
+    }
+  });
+
+  ws.on("close", () => {
+    log("discord-ws", "WebSocket closed");
+    cleanup();
+  });
+
+  ws.on("error", (e) => {
+    log("discord-ws", `WebSocket error: ${e.message}`);
+    cleanup();
+  });
+});
+
 // ── Self-ping every 10min to prevent Render free tier sleep ─────────────
 setInterval(() => {
   http.get(`http://127.0.0.1:${PORT}/health`, (r) => r.resume());
@@ -279,5 +363,6 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`[hc-render-proxy] Listening on port ${PORT}`);
   console.log(`[hc-render-proxy] Telegram → https://api.telegram.org`);
   console.log(`[hc-render-proxy] WhatsApp → web.whatsapp.com / g.whatsapp.net / mmg.whatsapp.net / pps.whatsapp.net / static.whatsapp.net`);
+  console.log(`[hc-render-proxy] Discord WS tunnel → /discord-ws (TCP relay for gateway.discord.gg)`);
   console.log(`[hc-render-proxy] Cron ping → /health every 10min to keep awake`);
 });

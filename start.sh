@@ -716,28 +716,23 @@ export WHATSAPP_PROXY_BASE
 DISCORD_PROXY_BASE="${DISCORD_PROXY_BASE:-https://render-proxy-ukjd.onrender.com/discord}"
 export DISCORD_PROXY_BASE
 
-# Discord WebSocket gateway + REST API — wg-proxy via ROUTE_TARGETS
-if [ -n "${DISCORD_PROXY_BASE:-}" ] && [ -n "${ROUTE_ENDPOINT:-}" ]; then
-  # Route all Discord domains (REST API + WebSocket Gateway) through WireGuard
-  DISCORD_DOMAINS="discord.com,gateway.discord.gg,discordapp.com,discord.gg"
-  if [ -n "${ROUTE_TARGETS:-}" ]; then
-    for d in ${DISCORD_DOMAINS//,/ }; do
-      if ! echo "$ROUTE_TARGETS" | grep -q "$d"; then
-        export ROUTE_TARGETS="${ROUTE_TARGETS},${d}"
-      fi
-    done
-    echo "[discord] Discord domains added to routing: discord.com, gateway.discord.gg"
-  else
-    export ROUTE_TARGETS="$DISCORD_DOMAINS"
-    echo "[discord] Discord routing enabled: discord.com, gateway.discord.gg"
-  fi
-fi
-
+# Discord Gateway WebSocket — routed through Render proxy (DISCORD_WS_PROXY_URL)
+# NOT through ROUTE_TARGETS/wg-proxy (WireGuard is only for opencode.ai).
+# REST API still goes through DISCORD_PROXY_BASE (handled by discord-proxy.cjs).
 # Discord loopback proxy — OpenClaw plugin requires loopback URL for proxy validation
 # Starts a local HTTP CONNECT proxy on 127.0.0.1.
 # All CONNECT requests forward via net.connect, intercepted by cloudflare-proxy.js.
 DISCORD_LOOPBACK_PORT="${DISCORD_LOOPBACK_PORT:-31285}"
 export DISCORD_LOOPBACK_PORT
+
+# Discord Gateway WebSocket tunnel URL \u2014 for cloudflare-proxy.js
+# Derived from DISCORD_PROXY_BASE (e.g., https://render-proxy-ukjd.onrender.com/discord)
+# → wss://render-proxy-ukjd.onrender.com/discord-ws
+if [ -n "${DISCORD_PROXY_BASE:-}" ]; then
+  DISCORD_WS_PROXY_URL="$(echo "$DISCORD_PROXY_BASE" | sed 's|^https://|wss://|;s|/discord$|/discord-ws|')"
+  export DISCORD_WS_PROXY_URL
+  echo "[discord] Gateway WS tunnel: ${DISCORD_WS_PROXY_URL}"
+fi
 if [ -n "${DISCORD_BOT_TOKEN:-}" ] && command -v node &>/dev/null; then
   if [ ! -f /tmp/.discord_loopback_started ]; then
     nohup node /home/node/app/discord-loopback-proxy.cjs > /tmp/discord-loopback.log 2>&1 &
@@ -1817,10 +1812,6 @@ if command -v openclaw &>/dev/null; then
   if [ ! -d /home/node/.openclaw/extensions/whatsapp ] && [ -n "${WHATSAPP_ENABLED:-}" ]; then
     echo "[startup] Pre-bundled plugin whatsapp missing — re-installing..."
     openclaw plugins install clawhub:@openclaw/whatsapp 2>/dev/null || true
-  fi
-  if [ ! -d /home/node/.openclaw/extensions/discord ]; then
-    echo "[startup] Pre-bundled plugin discord missing — re-installing..."
-    openclaw plugins install clawhub:@openclaw/discord 2>/dev/null || true
   fi
 fi
 
