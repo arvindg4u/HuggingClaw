@@ -828,6 +828,27 @@ async function main() {
   }
   console.log(`[wg-proxy] WireGuard ready (endpoint: ${initialCfg.endpoint})`);
 
+  // Verify the initial endpoint can actually reach required targets
+  // (Proton VPN free tier blocks many sites — rotate to a working one)
+  if (WG_CONFIGS.length > 1) {
+    const initialOk = await verifyTunnel(initialCfg.endpoint);
+    if (!initialOk) {
+      console.log(`[wg-proxy] Initial endpoint ${initialCfg.endpoint} unreachable -- rotating immediately`);
+      deadEndpoints.set(initialCfg.endpoint, Date.now());
+      currentWireProxy.wasKilled = true;
+      try { currentWireProxy.kill("SIGTERM"); } catch (e) {}
+      await new Promise(r => setTimeout(r, 1500));
+      if (currentWireProxy && !currentWireProxy.killed) {
+        try { currentWireProxy.kill("SIGKILL"); } catch (e) {}
+      }
+      await waitForPortRelease(SOCKS_HOST, CURRENT_SOCKS_PORT, 5000);
+      isRotating = false;
+      await rotateConfig();
+    } else {
+      console.log(`[wg-proxy] Initial endpoint verified -- ${initialCfg.endpoint} can reach targets`);
+    }
+  }
+
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`[wg-proxy] Proxy ready on :${PORT}`);
     console.log(`[wg-proxy]   WebSocket relay → WireGuard SOCKS5 :${CURRENT_SOCKS_PORT}`);
