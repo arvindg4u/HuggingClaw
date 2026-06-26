@@ -295,7 +295,8 @@ async def mcp_handler(request: Request):
                 info = fetch_info(vid)
                 tracks = info.get("transcripts", [])
                 lines = [f"  - {t}" for t in tracks]
-                return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "Available transcripts:\n" + "\n".join(lines)]}}})
+                text = "Available transcripts:\n" + "\n".join(lines)
+                return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}})
         except HTTPException as e:
             return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": e.detail}})
         except Exception as e:
