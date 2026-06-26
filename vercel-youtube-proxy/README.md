@@ -1,36 +1,51 @@
 # Vercel YouTube Transcript Proxy
 
-YouTube transcripts via Vercel serverless functions. Lightweight, no temp files, no subprocess.
+Zero local setup. Deploy to Vercel, use as remote MCP server.
 
-## Deploy on Vercel
+## Deploy
 
 ```bash
 cd vercel-youtube-proxy
 vercel deploy --prod
 ```
 
-Or connect Git repo to Vercel:
-- **Root Directory**: `vercel-youtube-proxy`
-- **Framework**: Other
-- **Build**: `pip install -r requirements.txt`
+Ya connect Git repo to Vercel — set Root Directory to `vercel-youtube-proxy`.
 
-### Env vars
-- `PROXY_AUTH_TOKEN` — optional auth token
+## Remote MCP Config
 
-## Endpoints
+### Claude Desktop / Cursor / Cline
 
-| GET | Description |
-|-----|-------------|
-| `/health` | Health check |
-| `/transcript/{video_id}?lang=en` | Transcript with segments |
-| `/transcript/{video_id}/text?lang=en` | Plain text |
-| `/transcripts/{video_id}` | Available languages |
+```json
+{
+  "mcpServers": {
+    "youtube-transcript": {
+      "url": "https://vercel-youtube-proxy-chi.vercel.app/mcp",
+      "headers": {
+        "X-Proxy-Token": "your-token"
+      }
+    }
+  }
+}
+```
 
-Auth: `X-Proxy-Token: <token>` header
+### Codex CLI
+
+```toml
+[mcp_servers.youtube-transcript]
+url = "https://vercel-youtube-proxy-chi.vercel.app/mcp"
+headers = { X-Proxy-Token = "your-token" }
+```
+
+### Without MCP (direct REST)
+
+```
+GET https://vercel-youtube-proxy-chi.vercel.app/transcript/VIDEO_ID/text?lang=en
+Header: X-Proxy-Token: your-token
+```
 
 ## Why Vercel?
 
 - Render IPs → YouTube blocked ❌
-- Vercel IPs → YouTube not blocked yet ✅
-- Serverless, auto-scales, free tier
+- Vercel IPs → YouTube not blocked ✅
+- Free tier, auto-scales, no local setup
 - No proxies, no TOS violations
