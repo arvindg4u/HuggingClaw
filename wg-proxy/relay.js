@@ -394,9 +394,10 @@ BindAddress = 0.0.0.0:${newPort}
   CURRENT_SOCKS_PORT = newPort;
   currentWireProxy = newProxy;
 
-  console.log(`[wg-proxy] Port switched to :${newPort} — draining ${activeConnections.size} active connection(s) on :${oldPort}`);
+  // Only wait for drain if we have active connections
+  if (activeConnections.size > 0) {
+    console.log(`[wg-proxy] Port switched to :${newPort} — draining ${activeConnections.size} active connection(s) on :${oldPort}`);
 
-  // 5. Wait for old connections to drain (max 30s)
   const drainDeadline = Date.now() + 30000;
   while (activeConnections.size > 0 && Date.now() < drainDeadline) {
     await new Promise((r) => setTimeout(r, 500));
@@ -405,25 +406,48 @@ BindAddress = 0.0.0.0:${newPort}
   const drainElapsed = Date.now() - (drainDeadline - 30000);
   const remaining = activeConnections.size;
   console.log(`[wg-proxy] Drain done in ${drainElapsed}ms — ${remaining} connection(s) remaining`);
+  } else {
+    console.log(`[wg-proxy] Port switched to :${newPort} — no active connections to drain on :${oldPort}`);
+  }
 
   // 6. Kill old wireproxy
   if (PREV_WIRE_PROXY) {
-    console.log(`[wg-proxy] Killing old wireproxy on :${oldPort}`);
-    PREV_WIRE_PROXY.wasKilled = true;
-    try {
-      PREV_WIRE_PROXY.kill("SIGTERM");
-      await new Promise((r) => setTimeout(r, 1500));
-      if (!PREV_WIRE_PROXY.killed) PREV_WIRE_PROXY.kill("SIGKILL");
-    } catch (e) {}
-    // Force-kill any leftover processes on the old port (by port only)
-    try {
-      require("child_process").execSync(
-        `lsof -ti:${oldPort} 2>/dev/null | xargs -r kill -9 2>/dev/null`,
-        { stdio: "ignore" }
-      );
-    } catch (e) {}
-    PREV_WIRE_PROXY = null;
-    PREV_SOCKS_PORT = null;
+    // If there are still active connections, skip the kill and let them drain
+    // naturally. The old wireproxy will be cleaned up on the next rotation or
+    // when activeConnections finally reaches zero (checked periodically).
+    if (activeConnections.size > 0) {
+      const remainingPort = oldPort;
+      console.log(`[wg-proxy] ${activeConnections.size} connection(s) still active on :${remainingPort} — deferring kill`);
+      // Schedule cleanup: retry in 30s to kill if all connections drained
+      setTimeout(() => {
+        if (PREV_WIRE_PROXY && activeConnections.size === 0) {
+          console.log(`[wg-proxy] Killing deferred old wireproxy on :${remainingPort} (all connections drained)`);
+          PREV_WIRE_PROXY.wasKilled = true;
+          try { PREV_WIRE_PROXY.kill("SIGTERM"); } catch(e) {}
+          setTimeout(() => { try { if (PREV_WIRE_PROXY && !PREV_WIRE_PROXY.killed) PREV_WIRE_PROXY.kill("SIGKILL"); } catch(e) {} }, 2000);
+          try { require("child_process").execSync("kill -9 $(lsof -ti:" + remainingPort + " 2>/dev/null) 2>/dev/null", { stdio: "ignore" }); } catch(e) {}
+          PREV_WIRE_PROXY = null;
+          PREV_SOCKS_PORT = null;
+        }
+      }, 30000);
+    } else {
+      console.log(`[wg-proxy] Killing old wireproxy on :${oldPort}`);
+      PREV_WIRE_PROXY.wasKilled = true;
+      try {
+        PREV_WIRE_PROXY.kill("SIGTERM");
+        await new Promise((r) => setTimeout(r, 1500));
+        if (!PREV_WIRE_PROXY.killed) PREV_WIRE_PROXY.kill("SIGKILL");
+      } catch (e) {}
+      // Kill any leftover on the old port
+      try {
+        require("child_process").execSync(
+          `kill -9 $(lsof -ti:${oldPort} 2>/dev/null) 2>/dev/null`,
+          { stdio: "ignore" }
+        );
+      } catch (e) {}
+      PREV_WIRE_PROXY = null;
+      PREV_SOCKS_PORT = null;
+    }
   }
 
   isRotating = false;
@@ -574,7 +598,14 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify(health));
 });
 
-const wss = new WebSocketServer({ noServer: true });
+// WS ping/pong keepalive prevents Cloudflare, Render, and NAT gateways
+// from silently dropping idle WebSocket connections (typical timeout: 60-120s).
+// During LLM streaming, token bursts are separated by idle gaps (model thinking,
+// tool calls) that can trigger proxy timeouts. 25s ping / 10s pong keeps the
+// connection alive through these gaps.
+const WS_PING_INTERVAL = parseInt(process.env.WS_PING_INTERVAL || "25000");
+const WS_PONG_TIMEOUT = parseInt(process.env.WS_PONG_TIMEOUT || "10000");
+const wss = new WebSocketServer({ noServer: true, pingInterval: WS_PING_INTERVAL, pingTimeout: WS_PONG_TIMEOUT });
 
 wss.on("connection", (ws, req) => {
   // Supports two modes:
