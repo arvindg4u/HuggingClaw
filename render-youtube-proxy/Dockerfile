@@ -1,25 +1,24 @@
-# Stage 1: Build bgutil-ytdlp-pot-provider server (Node.js)
-FROM node:25-bookworm-slim AS bgutil-build
+# Stage 1: Build bgutil-ytdlp-pot-provider server (Node.js only)
+FROM node:22-bookworm-slim AS bgutil-build
 
 WORKDIR /bgutil
-RUN apt-get update && apt-get install -y git && \
-    git clone --depth 1 --branch v1.3.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git . && \
+ADD https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/master.tar.gz /tmp/src.tar.gz
+RUN tar xzf /tmp/src.tar.gz --strip-components=1 && \
     cd server && npm ci && npx tsc
 
-# Stage 2: Final image — Python + Node.js + yt-dlp + PO Tokens
-FROM python:3.12-slim
+# Stage 2: Final image — Node.js (built-in) + Python + yt-dlp + PO Tokens
+FROM node:22-bookworm-slim
 
 WORKDIR /app
 
-# ── Install Node.js 20+ (for bgutil PO token server) ──────────────
-RUN apt-get update && apt-get install -y curl gnupg && \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y nodejs && \
+# ── Install Python 3 + pip ────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ── Install Python dependencies (yt-dlp, bgutil plugin, FastAPI) ──
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install --no-cache-dir -r requirements.txt
 
 # ── Copy bgutil server build (compiled JS + node_modules) ─────────
 COPY --from=bgutil-build /bgutil/server/build   /opt/bgutil/build
@@ -38,4 +37,4 @@ EXPOSE 8000
 CMD ["sh", "-c", \
   "node /opt/bgutil/build/main.js --port 4416 & \
    sleep 1 && \
-   uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
+   python3 -m uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
