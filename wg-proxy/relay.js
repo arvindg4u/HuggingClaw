@@ -214,6 +214,26 @@ function startWireProxy(cfg, port) {
 
 // Test if SOCKS5 tunnel is actually working via a real connect
 // Tries each HEALTH_CHECK_TARGETS entry in sequence, returns true if any succeeds.
+
+// Lightweight SOCKS5 health check — just verifies the SOCKS5 port is open
+// and responds to auth. Does NOT test tunnel forwarding (which Proton VPN
+// blocks for many targets). Returns true if the SOCKS5 server is accepting
+// connections and responds to auth negotiation.
+function testSocks5Auth(port) {
+  const targetPort = port || CURRENT_SOCKS_PORT;
+  return new Promise((resolve) => {
+    const s = net.createConnection({ host: SOCKS_HOST, port: targetPort }, () => {
+      s.write(Buffer.from([0x05, 0x01, 0x00]));
+    });
+    const timer = setTimeout(() => { s.destroy(); resolve(false); }, 3000);
+    s.once("data", (d) => {
+      clearTimeout(timer);
+      if (d.length >= 2 && d[0] === 0x05 && d[1] === 0x00) { s.end(); resolve(true); }
+      else { s.destroy(); resolve(false); }
+    });
+    s.on("error", () => { clearTimeout(timer); resolve(false); });
+  });
+}
 async function testSocks5Working() {
   for (const target of HEALTH_CHECK_TARGETS) {
     try {
@@ -279,10 +299,10 @@ async function waitForSocks5(timeoutMs = 30000, portOverride) {
         s.on("error", reject);
         s.setTimeout(3000, () => { s.destroy(); reject(new Error("timeout")); });
       });
-      // SOCKS5 port is open — now verify the tunnel actually forwards traffic
-      const tunnelOk = await testSocks5Working();
-      if (tunnelOk) return true;
-      // Tunnel not ready yet — keep waiting
+      // SOCKS5 port is open — tunnel is ready
+      // (Don't require full tunnel forwarding — Proton VPN blocks many targets
+      //  even when the tunnel is working. Just SOCKS5 auth success is enough.)
+      return true;
     } catch (e) {
       // SOCKS5 port not open yet — keep waiting
     }
@@ -415,7 +435,7 @@ async function startRotationLoop() {
     console.log(`[wg-proxy] Single config (no rotation): ${WG_CONFIGS[0]?.endpoint}`);
     // Monitor wireproxy health every 60s — signal reconnect if tunnel drops
     setInterval(async () => {
-      const ok = await testSocks5Working();
+      const ok = await testSocks5Auth();
       if (!ok && currentWireProxy && currentWireProxy.exitCode === null) {
         console.log('[wg-proxy] SOCKS5 unresponsive — sending SIGUSR1 for reconnect');
         try { currentWireProxy.kill("SIGUSR1"); } catch (e) {}
@@ -434,12 +454,15 @@ async function startRotationLoop() {
     }
   }, 60000);
 
-  // Monitor active tunnel health every 30s — trigger early rotation if dead
+  // Monitor active tunnel health every 30s — check SOCKS5 port status
+  // Note: We explicitly do NOT trigger rotation on forwarding failure because
+  // Proton VPN free tier frequently blocks external targets even when the
+  // tunnel itself is operational. Only rotate on actual SOCKS5 port failure.
   setInterval(async () => {
-    const ok = await testSocks5Working();
-    if (!ok && !shuttingDown) {
-      if (isRotating) { console.log('[wg-proxy] Tunnel dead but rotation in progress — waiting'); return; }
-      console.log(`[wg-proxy] Tunnel unresponsive — triggering early rotation`);
+    const socksOk = await testSocks5Auth();
+    if (!socksOk && !shuttingDown) {
+      if (isRotating) { console.log('[wg-proxy] SOCKS5 port dead — rotation in progress'); return; }
+      console.log(`[wg-proxy] SOCKS5 port unresponsive — triggering early rotation`);
       if (rotationTimer) clearTimeout(rotationTimer);
       await rotateConfig();
       rotationTimer = setTimeout(rotate, ROTATION_INTERVAL_MS);
