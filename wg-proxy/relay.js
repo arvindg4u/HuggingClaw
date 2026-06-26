@@ -185,7 +185,8 @@ function startWireProxy(cfg, port) {
   const wp = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
   wp.on("exit", async (code) => {
     if (shuttingDown) return;
-    try { require("child_process").execSync("pkill -9 wireproxy 2>/dev/null"); } catch(e) {}
+    // If this wireproxy was deliberately killed (rotation, shutdown), don't restart
+    if (wp.wasKilled) return;
     console.log(`[wg-proxy] wireproxy exited (code ${code}) for ${cfg.endpoint} -- restarting...`);
     await new Promise(r => setTimeout(r, 2000));
     wireproxyRestartCount++;
@@ -291,8 +292,10 @@ async function waitForSocks5(timeoutMs = 30000, portOverride) {
 }
 
 function killAllWireProxy() {
+  // Kill wireproxy on both ports using lsof (more precise than pkill by name)
+  // This avoids killing unrelated processes that happen to include "wireproxy"
   try {
-    require("child_process").execSync("pkill -9 wireproxy 2>/dev/null; pkill -9 wireguard-go 2>/dev/null; kill -9 $(lsof -ti:1080 2>/dev/null) 2>/dev/null; kill -9 $(lsof -ti:1081 2>/dev/null) 2>/dev/null", { stdio: "ignore" });
+    require("child_process").execSync("kill -9 $(lsof -ti:1080 2>/dev/null) 2>/dev/null; kill -9 $(lsof -ti:1081 2>/dev/null) 2>/dev/null", { stdio: "ignore" });
   } catch (e) { /* best effort */ }
 }
 
@@ -360,6 +363,7 @@ BindAddress = 0.0.0.0:${newPort}
     console.error(`[wg-proxy] Rotation failed — SOCKS5 not ready on :${newPort} for ${newCfg.endpoint}`);
     deadEndpoints.set(newCfg.endpoint, Date.now());
     console.log(`[wg-proxy] Marked ${newCfg.endpoint} as dead (${deadEndpoints.size} dead endpoint(s))`);
+    newProxy.wasKilled = true;
     try { newProxy.kill("SIGTERM"); } catch (e) {}
     return;
   }
@@ -385,12 +389,13 @@ BindAddress = 0.0.0.0:${newPort}
   // 6. Kill old wireproxy
   if (PREV_WIRE_PROXY) {
     console.log(`[wg-proxy] Killing old wireproxy on :${oldPort}`);
+    PREV_WIRE_PROXY.wasKilled = true;
     try {
       PREV_WIRE_PROXY.kill("SIGTERM");
       await new Promise((r) => setTimeout(r, 1500));
       if (!PREV_WIRE_PROXY.killed) PREV_WIRE_PROXY.kill("SIGKILL");
     } catch (e) {}
-    // Force-kill any leftover wireproxy on the old port
+    // Force-kill any leftover processes on the old port (by port only)
     try {
       require("child_process").execSync(
         `lsof -ti:${oldPort} 2>/dev/null | xargs -r kill -9 2>/dev/null`,
@@ -777,6 +782,7 @@ function shutdown(signal) {
 
   // 3. Kill wireproxy
   if (currentWireProxy) {
+    currentWireProxy.wasKilled = true;
     currentWireProxy.kill("SIGTERM");
   }
 
