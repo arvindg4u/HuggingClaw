@@ -1,58 +1,35 @@
-# MCP YouTube Transcript Proxy
+# YouTube Transcript MCP Server
 
-Render proxy ke through YouTube transcripts fetch karne ke liye MCP server.
+Uses **yt-dlp** directly to fetch YouTube transcripts — no proxies, no external APIs.
 
-## Usage
+## How it works
 
-### Codex CLI
+1. Calls `yt-transcript.py` (Python MCP server) in the repo root
+2. yt-dlp fetches transcripts using `player_client=android` (bypasses IP blocks)
+3. Falls back through tv → ios → web clients
 
-`.codex/config.toml` mein add karo:
+## Usage in Codex CLI
 
 ```toml
+# .codex/config.toml
 [mcp_servers.youtube-transcript]
 command = "node"
-args = ["<path-to>/mcp-servers/youtube-transcript/server.js"]
-env = { YT_PROXY_TOKEN = "your-token" }
-```
-
-Ya npx se:
-
-```toml
-[mcp_servers.youtube-transcript]
-command = "npx"
-args = ["-y", "mcp-youtube-transcript-proxy"]
-env = { YT_PROXY_TOKEN = "your-token" }
-```
-
-### Claude Desktop
-
-`claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "youtube-transcript": {
-      "command": "node",
-      "args": ["/full/path/to/mcp-servers/youtube-transcript/server.js"],
-      "env": {
-        "YT_PROXY_TOKEN": "your-token"
-      }
-    }
-  }
-}
+args = ["<repo>/mcp-servers/youtube-transcript/server.js"]
 ```
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `get_transcript` | Transcript with timestamps |
-| `get_transcript_text` | Plain text (no timestamps) |
-| `list_transcripts` | Available languages for a video |
+| `get_transcript` | Transcript text from YouTube video |
+| `get_transcript_text` | Same — plain text output |
+| `get_video_info` | Video metadata + available transcript languages |
 
-## Env Vars
+## Requirements
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `YT_PROXY_BASE` | `https://render-youtube-proxy.onrender.com` | Render proxy URL |
-| `YT_PROXY_TOKEN` | — | Auth token (required) |
+- Python 3.9+ with `yt-dlp` installed: `pip install yt-dlp`
+- Node.js 18+ (for the MCP wrapper)
+
+## No Render dependency
+
+This MCP server calls `yt-transcript.py` directly — no Render proxy needed.

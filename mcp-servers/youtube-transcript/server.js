@@ -1,112 +1,115 @@
 /**
- * MCP YouTube Transcript Proxy Server
+ * MCP YouTube Transcript Server — uses yt-dlp directly, no proxies.
  *
- * Wraps the Render-hosted YouTube Transcript API as MCP tools.
- * Use with any MCP client (Codex CLI, Claude Desktop, Cursor, etc.)
- *
- * Config:
- *   YT_PROXY_BASE  — Render proxy URL (default: https://render-youtube-proxy.onrender.com)
- *   YT_PROXY_TOKEN — Auth token from PROXY_AUTH_TOKEN
+ * Calls the local yt-transcript.py (which wraps yt-dlp with android/tv/web clients).
+ * No Render proxy needed. Runs entirely local.
  */
 
+import { spawn } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const PROXY_BASE = process.env.YT_PROXY_BASE || "https://render-youtube-proxy.onrender.com";
-const PROXY_TOKEN = process.env.YT_PROXY_TOKEN || "";
-
-if (!PROXY_TOKEN) {
-  console.error("[yt-mcp] WARNING: YT_PROXY_TOKEN not set — API calls will fail");
-}
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const SCRIPT = path.resolve(__dirname, "../../yt-transcript.py");
 
 /**
- * Call the Render YouTube Transcript API
+ * Call the local yt-transcript.py MCP server via stdio.
+ * We send a JSON-RPC request and get the response back.
  */
-async function callApi(path) {
-  const url = `${PROXY_BASE}${path}`;
-  const res = await fetch(url, {
-    headers: { "X-Proxy-Token": PROXY_TOKEN },
+function callYTscript(request) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("python3", [SCRIPT], {
+      stdio: ["pipe", "pipe", "inherit"],
+      timeout: 120_000,
+    });
+
+    let output = "";
+    proc.stdout.on("data", (chunk) => (output += chunk.toString()));
+
+    proc.on("close", (code) => {
+      if (code !== 0 && !output.trim()) {
+        reject(new Error(`yt-transcript.py exited with code ${code}`));
+        return;
+      }
+      // Parse the last JSON line (response)
+      const lines = output.trim().split("\n").filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const parsed = JSON.parse(lines[i]);
+          if (parsed.id === request.id) {
+            resolve(parsed);
+            return;
+          }
+        } catch {}
+      }
+      reject(new Error("No valid JSON-RPC response from yt-transcript.py"));
+    });
+
+    proc.on("error", reject);
+    proc.stdin.write(JSON.stringify(request) + "\n");
+    proc.stdin.end();
   });
-  const body = await res.json();
-  if (!res.ok) {
-    throw new Error(body.detail || `API error: ${res.status}`);
-  }
-  return body;
 }
 
 // ── MCP Server ────────────────────────────────────────────────────────────
 const server = new McpServer({
-  name: "youtube-transcript-proxy",
+  name: "youtube-transcript",
   version: "1.0.0",
 });
 
-// ── Tool: get_transcript (with timestamps) ────────────────────────────────
 server.tool(
   "get_transcript",
   {
     videoId: z.string().describe("YouTube video ID or full URL"),
-    lang: z.string().optional().default("en").describe("Language code (e.g., en, es, de)"),
+    lang: z.string().optional().default("en").describe("Language code"),
   },
   async ({ videoId, lang }) => {
-    const data = await callApi(`/transcript/${encodeURIComponent(videoId)}?lang=${lang}`);
-    const segments = data.segments.map((s) => {
-      const mins = Math.floor(s.start / 60);
-      const secs = Math.floor(s.start % 60);
-      return `[${mins}:${secs.toString().padStart(2, "0")}] ${s.text}`;
+    const resp = await callYTscript({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "get_transcript_text", arguments: { videoId, lang } },
     });
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Transcript for video ${data.video_id}\nLanguage: ${data.language} (${data.language_code})\n${segments.join("\n")}`,
-        },
-      ],
-    };
+    const text = resp?.result?.content?.[0]?.text || "No transcript available";
+    return { content: [{ type: "text", text }] };
   },
 );
 
-// ── Tool: get_transcript_text (plain text, no timestamps) ─────────────────
 server.tool(
   "get_transcript_text",
   {
     videoId: z.string().describe("YouTube video ID or full URL"),
-    lang: z.string().optional().default("en").describe("Language code (e.g., en, es, de)"),
-    maxChars: z.number().optional().default(50000).describe("Max characters to return"),
+    lang: z.string().optional().default("en").describe("Language code"),
   },
-  async ({ videoId, lang, maxChars }) => {
-    const data = await callApi(`/transcript/${encodeURIComponent(videoId)}/text?lang=${lang}`);
-    const text = data.text.length > maxChars ? data.text.slice(0, maxChars) + "\n\n...[truncated]" : data.text;
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Transcript for video ${data.video_id}\nLanguage: ${data.language} (${data.language_code})\n\n${text}`,
-        },
-      ],
-    };
+  async ({ videoId, lang }) => {
+    const resp = await callYTscript({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "get_transcript_text", arguments: { videoId, lang } },
+    });
+    const text = resp?.result?.content?.[0]?.text || "No transcript available";
+    return { content: [{ type: "text", text }] };
   },
 );
 
-// ── Tool: list_transcripts (available languages) ──────────────────────────
 server.tool(
-  "list_transcripts",
+  "get_video_info",
   {
     videoId: z.string().describe("YouTube video ID or full URL"),
   },
   async ({ videoId }) => {
-    const data = await callApi(`/transcripts/${encodeURIComponent(videoId)}`);
-    const lines = data.transcripts.map((t) =>
-      `  - ${t.language} (${t.language_code})${t.is_generated ? " [auto-generated]" : ""}`
-    );
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Available transcripts for video ${data.video_id}:\n${lines.join("\n")}`,
-        },
-      ],
-    };
+    const resp = await callYTscript({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "get_video_info", arguments: { videoId } },
+    });
+    const text = resp?.result?.content?.[0]?.text || "No info available";
+    return { content: [{ type: "text", text }] };
   },
 );
 
@@ -114,7 +117,7 @@ server.tool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`[yt-mcp] Server started → proxy: ${PROXY_BASE}`);
+  console.error("[yt-mcp] Server started — using yt-dlp directly");
 }
 
 main().catch((err) => {

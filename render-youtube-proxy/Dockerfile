@@ -2,8 +2,12 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Install yt-dlp
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Verify yt-dlp installed
+RUN yt-dlp --version
 
 COPY app.py .
 
