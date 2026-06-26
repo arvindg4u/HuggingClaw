@@ -283,6 +283,26 @@ function testConnect(host, port) {
   });
 }
 
+// Verify the WireGuard tunnel can actually reach targets through SOCKS5.
+// Proton VPN free tier blocks many targets, so we try each HEALTH_CHECK_TARGET
+// in sequence. Returns true if ANY target is reachable.
+async function verifyTunnel(endpoint) {
+  for (const target of HEALTH_CHECK_TARGETS) {
+    try {
+      const ok = await testConnect(target.host, target.port);
+      if (ok) {
+        console.log(`[wg-proxy] Tunnel verified via ${target.host}:${target.port} for ${endpoint}`);
+        return true;
+      }
+      console.log(`[wg-proxy] Tunnel target ${target.host}:${target.port} unreachable for ${endpoint} -- trying next`);
+    } catch (e) {
+      console.log(`[wg-proxy] Tunnel target ${target.host}:${target.port} error for ${endpoint}: ${e.message}`);
+    }
+  }
+  console.log(`[wg-proxy] Tunnel verification FAILED for ${endpoint} -- no targets reachable`);
+  return false;
+}
+
 async function waitForSocks5(timeoutMs = 30000, portOverride) {
   const port = portOverride || CURRENT_SOCKS_PORT;
   const deadline = Date.now() + timeoutMs;
@@ -406,11 +426,44 @@ async function rotateConfig() {
     console.log(`[wg-proxy] Marked ${newCfg.endpoint} as dead (${deadEndpoints.size} dead endpoint(s))`);
     newProxy.wasKilled = true;
     try { newProxy.kill("SIGTERM"); } catch (e) {}
-    return;
+    // Try next endpoint — SOCKS5 failed to start on this one
+    return retryRotation(newCfg.endpoint);
+  }
+
+  // 4. Verify the tunnel can reach required targets (opencode.ai, etc.)
+  //    Proton VPN free blocks many sites — only keep endpoints that work
+  const tunnelOk = await verifyTunnel(newCfg.endpoint);
+  if (!tunnelOk) {
+    deadEndpoints.set(newCfg.endpoint, Date.now());
+    console.log(`[wg-proxy] Marked ${newCfg.endpoint} as dead (${deadEndpoints.size} dead endpoint(s))`);
+    newProxy.wasKilled = true;
+    try { newProxy.kill("SIGTERM"); } catch (e) {}
+    // Try next endpoint — tunnel unusable for required targets
+    return retryRotation(newCfg.endpoint);
   }
 
   isRotating = false;
   console.log(`[wg-proxy] Rotation complete -> ${newCfg.endpoint} (SOCKS5 :${port})`);
+}
+
+// track endpoints tried in the current rotation cycle to prevent infinite loops
+let _rotationTriedEndpoints = new Set();
+
+function retryRotation(failedEndpoint) {
+  _rotationTriedEndpoints.add(failedEndpoint);
+  // If we've tried all endpoints, stop and wait for dead cooldown
+  const remaining = WG_CONFIGS.filter(c => !_rotationTriedEndpoints.has(c.endpoint));
+  if (remaining.length === 0) {
+    console.log(`[wg-proxy] All ${WG_CONFIGS.length} endpoints failed — waiting for next rotation cycle`);
+    _rotationTriedEndpoints.clear();
+    return;
+  }
+  console.log(`[wg-proxy] Retrying rotation — ${remaining.length} untried endpoint(s) remaining`);
+  setTimeout(() => {
+    _rotationTriedEndpoints.clear();
+    isRotating = false;
+    rotateConfig();
+  }, 1000);
 }
 
 async function startRotationLoop() {
@@ -567,6 +620,14 @@ const WS_PONG_TIMEOUT = parseInt(process.env.WS_PONG_TIMEOUT || "10000");
 const wss = new WebSocketServer({ noServer: true, pingInterval: WS_PING_INTERVAL, pingTimeout: WS_PONG_TIMEOUT });
 
 wss.on("connection", (ws, req) => {
+  const clientIp = req.socket.remoteAddress;
+  console.log(`[relay] WebSocket client connected from ${clientIp} (${wss.clients.size} total)`);
+  ws.on("close", () => {
+    console.log(`[relay] WebSocket client disconnected from ${clientIp} (${wss.clients.size} remaining)`);
+  });
+  ws.on("error", (e) => {
+    console.log(`[relay] WebSocket client error from ${clientIp}: ${e.message}`);
+  });
   // Supports two modes:
   // 1. Legacy (single-connection): first msg is {host, port} (no type field)
   // 2. Multiplexed (multiple connections): connect/disconnect via {type, connId}
