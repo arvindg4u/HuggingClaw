@@ -1,4 +1,4 @@
 fastapi
 uvicorn
-httpx>=0.28.0
 youtube-transcript-api>=1.2.4
+requests>=2.32.0
