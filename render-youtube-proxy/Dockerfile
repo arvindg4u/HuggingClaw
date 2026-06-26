@@ -36,5 +36,11 @@ EXPOSE 8000
 # ── Start bgutil PO token server (background) + FastAPI ──────────
 CMD ["sh", "-c", \
   "node /opt/bgutil/build/main.js --port 4416 & \
-   sleep 1 && \
+   echo 'Waiting for bgutil server...' && \
+   for i in $(seq 1 15); do \
+     if curl -sf http://127.0.0.1:4416/ping > /dev/null 2>&1; then \
+       echo 'bgutil ready!'; break; \
+     fi; \
+     echo "attempt $i/15..."; sleep 1; \
+   done && \
    python3 -m uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
