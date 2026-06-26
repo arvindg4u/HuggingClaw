@@ -5,6 +5,10 @@ Fetches YouTube transcripts via residential IP.
 
 import os
 import re
+import asyncio
+import threading
+import time
+import urllib.request
 from fastapi import FastAPI, HTTPException, Header, Query
 from typing import Optional
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -18,6 +22,7 @@ from youtube_transcript_api._errors import (
 app = FastAPI(title="YouTube Transcript API", docs_url=None, redoc_url=None)
 
 AUTH_TOKEN = os.getenv("PROXY_AUTH_TOKEN", "changeme")
+PORT = int(os.getenv("PORT", "8000"))
 
 # Optional: route through another proxy if needed
 UPSTREAM_PROXY = os.getenv("UPSTREAM_PROXY", "")
@@ -53,6 +58,24 @@ def check_auth(token: str):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+# ── Self-ping to prevent Render free tier sleep ──────────────────────────
+def _self_ping():
+    """Ping /health every 10 min to keep Render awake."""
+    while True:
+        time.sleep(600)  # 10 min
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=10)
+        except Exception:
+            pass  # don't log — just keep the server warm
+
+
+@app.on_event("startup")
+async def _startup():
+    t = threading.Thread(target=_self_ping, daemon=True)
+    t.start()
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -64,86 +87,63 @@ async def get_transcript_text(
     lang: str = Query("en", description="Language code"),
     x_proxy_token: str = Header(..., alias="X-Proxy-Token")
 ):
-    """
-    Get transcript as plain text (just the words, no timestamps).
-    """
     check_auth(x_proxy_token)
-
     try:
         video_id = get_video_id(video_input)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
     ytt = get_ytt_client()
-
     try:
         transcript = ytt.fetch(video_id, languages=[lang])
         full_text = " ".join(seg.text for seg in transcript.snippets)
-
         return {
             "video_id": video_id,
             "language": transcript.language,
             "language_code": transcript.language_code,
             "text": full_text
         }
-
     except TranscriptsDisabled:
-        raise HTTPException(status_code=404, detail="Transcripts are disabled for this video")
+        raise HTTPException(status_code=404, detail="Transcripts disabled")
     except NoTranscriptFound:
-        raise HTTPException(status_code=404, detail=f"No transcript found for language: {lang}")
+        raise HTTPException(status_code=404, detail=f"No transcript for language: {lang}")
     except VideoUnavailable:
         raise HTTPException(status_code=404, detail="Video unavailable")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching transcript: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 @app.get("/transcript/{video_input:path}")
 async def get_transcript(
     video_input: str,
-    lang: str = Query("en", description="Language code (e.g., 'en', 'es', 'de')"),
+    lang: str = Query("en", description="Language code"),
     x_proxy_token: str = Header(..., alias="X-Proxy-Token")
 ):
-    """
-    Get transcript for a YouTube video.
-
-    - video_input: Video ID or full YouTube URL
-    - lang: Preferred language code (will fall back to available languages)
-    """
     check_auth(x_proxy_token)
-
     try:
         video_id = get_video_id(video_input)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
     ytt = get_ytt_client()
-
     try:
         transcript = ytt.fetch(video_id, languages=[lang])
-
         return {
             "video_id": video_id,
             "language": transcript.language,
             "language_code": transcript.language_code,
             "is_generated": transcript.is_generated,
             "segments": [
-                {
-                    "text": seg.text,
-                    "start": seg.start,
-                    "duration": seg.duration
-                }
+                {"text": seg.text, "start": seg.start, "duration": seg.duration}
                 for seg in transcript.snippets
             ]
         }
-
     except TranscriptsDisabled:
-        raise HTTPException(status_code=404, detail="Transcripts are disabled for this video")
+        raise HTTPException(status_code=404, detail="Transcripts disabled")
     except NoTranscriptFound:
-        raise HTTPException(status_code=404, detail=f"No transcript found for language: {lang}")
+        raise HTTPException(status_code=404, detail=f"No transcript for language: {lang}")
     except VideoUnavailable:
         raise HTTPException(status_code=404, detail="Video unavailable")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching transcript: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 @app.get("/transcripts/{video_input:path}")
@@ -151,23 +151,14 @@ async def list_transcripts(
     video_input: str,
     x_proxy_token: str = Header(..., alias="X-Proxy-Token")
 ):
-    """
-    List all available transcripts for a YouTube video.
-
-    - video_input: Video ID or full YouTube URL
-    """
     check_auth(x_proxy_token)
-
     try:
         video_id = get_video_id(video_input)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
     ytt = get_ytt_client()
-
     try:
         transcript_list = ytt.list(video_id)
-
         return {
             "video_id": video_id,
             "transcripts": [
@@ -180,10 +171,9 @@ async def list_transcripts(
                 for t in transcript_list
             ]
         }
-
     except TranscriptsDisabled:
-        raise HTTPException(status_code=404, detail="Transcripts are disabled for this video")
+        raise HTTPException(status_code=404, detail="Transcripts disabled")
     except VideoUnavailable:
         raise HTTPException(status_code=404, detail="Video unavailable")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing transcripts: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")

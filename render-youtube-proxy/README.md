@@ -4,7 +4,7 @@ YouTube transcripts ke liye REST API proxy — HF Spaces se YouTube block hai, R
 
 ## Deploy on Render
 
-1. **Is directory ko** apne GitHub repo mein push karo
+1. **Is directory ko** GitHub repo mein push karo
 2. [Render Dashboard](https://dashboard.render.com) mein **New + → Web Service**
 3. Connect repo, set:
    - **Name**: `yt-transcript-proxy` (ya kuch bhi)
@@ -14,6 +14,8 @@ YouTube transcripts ke liye REST API proxy — HF Spaces se YouTube block hai, R
 4. **Environment Variables**:
    - `PROXY_AUTH_TOKEN` → `openssl rand -hex 32` se generate karo
 5. Deploy karo — Render Docker build karega aur run karega
+
+**Self-ping**: App khud ko har 10 min mein `/health` hit karta rahega — Render sleep nahi karega. Koi external cron zaroorat nahi. ✅
 
 ## Endpoints
 
@@ -39,25 +41,19 @@ curl -H "X-Proxy-Token: your-token" \
   https://yt-transcript-proxy.onrender.com/transcript/dQw4w9WgXcQ/text
 ```
 
-## Keep Alive
-
-Render free tier 15 min inactivity ke baad sleep karta hai. Cron ping set karo:
-
-```bash
-curl -s https://yt-transcript-proxy.onrender.com/health
-```
-
-[UptimeRobot](https://uptimerobot.com) (free) ya [cron-job.org](https://cron-job.org) (free) use karo har 10 min mein `/health` hit karne ke liye.
-
 ## Usage from HuggingClaw
 
-Is API ko call karne ke liye do options hain:
+### Via MCP (recommended)
 
-### Option A: Via LLM fetch tool
-Seedha REST API call karo tool se:
-```
-fetch(url="https://yt-transcript-proxy.onrender.com/transcript/VIDEO_ID", headers={"X-Proxy-Token": "your-token"})
-```
+MCP server already create hai `mcp-servers/youtube-transcript/` mein. Codex/Claude ko do tools mil jayenge:
 
-### Option B: Custom MCP server wrapper
-Ek chhota MCP server banao jo is API ko wrap kare — tab LLM seedha tool call kar sakta hai directly Claude/Codex mein.
+- `get_transcript` — timestamped transcript
+- `get_transcript_text` — plain text
+- `list_transcripts` — available languages
+
+### Via raw fetch
+
+```
+fetch(url="https://render-youtube-proxy.onrender.com/transcript/VIDEO_ID",
+      headers={"X-Proxy-Token": "your-token"})
+```
