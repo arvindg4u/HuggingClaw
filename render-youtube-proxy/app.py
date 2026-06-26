@@ -14,7 +14,8 @@ import threading
 import time
 import urllib.request
 import urllib.error
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Header, Query, Request
+from fastapi.responses import JSONResponse
 
 app = FastAPI(title="YouTube Transcript API", docs_url=None, redoc_url=None)
 
@@ -28,8 +29,6 @@ PLAYER_CLIENTS = ["android", "tv", "ios", "web", "mweb"]
 BGUTIL_URL = "http://127.0.0.1:4416"
 # Extractor args passed to yt-dlp for PO token support
 BGUTIL_EXARGS = f"youtubepot-bgutilhttp:base_url={BGUTIL_URL}"
-# Common extractor args across all clients
-BASE_EXARGS = ",".join([BGUTIL_EXARGS])
 
 
 def get_video_id(video_input: str) -> str:
@@ -134,7 +133,7 @@ def fetch_info(video_id: str) -> dict:
 
 
 def check_auth(token: str):
-    if token != AUTH_TOKEN:
+    if AUTH_TOKEN and token != AUTH_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
@@ -159,16 +158,14 @@ def _self_ping():
 
 @app.on_event("startup")
 async def _startup():
-    # Start self-ping to keep Render free tier alive
     threading.Thread(target=_self_ping, daemon=True).start()
-    # Log bgutil server status
     if _bgutil_health():
         print("[yt-proxy] bgutil PO token server is RUNNING on localhost:4416")
     else:
-        print("[yt-proxy] WARNING: bgutil PO token server NOT reachable. YouTube IP blocks may persist.")
+        print("[yt-proxy] WARNING: bgutil PO token server NOT reachable")
 
 
-# ── Endpoints ──────────────────────────────────────────────────────
+# ── REST Endpoints ──────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     bgutil_ok = _bgutil_health()
@@ -184,7 +181,7 @@ async def health():
 async def get_transcript_text(
     video_input: str,
     lang: str = Query("en"),
-    x_proxy_token: str = Header(..., alias="X-Proxy-Token"),
+    x_proxy_token: str = Header(default="", alias="X-Proxy-Token"),
 ):
     check_auth(x_proxy_token)
     try:
@@ -205,7 +202,7 @@ async def get_transcript_text(
 async def get_transcript(
     video_input: str,
     lang: str = Query("en"),
-    x_proxy_token: str = Header(..., alias="X-Proxy-Token"),
+    x_proxy_token: str = Header(default="", alias="X-Proxy-Token"),
 ):
     check_auth(x_proxy_token)
     try:
@@ -227,7 +224,7 @@ async def get_transcript(
 @app.get("/transcripts/{video_input:path}")
 async def list_transcripts(
     video_input: str,
-    x_proxy_token: str = Header(..., alias="X-Proxy-Token"),
+    x_proxy_token: str = Header(default="", alias="X-Proxy-Token"),
 ):
     check_auth(x_proxy_token)
     try:
@@ -241,3 +238,75 @@ async def list_transcripts(
         "source": "yt-dlp",
         "transcripts": [{"language": t, "language_code": t} for t in info.get("transcripts", [])],
     }
+
+
+# ── MCP Endpoint ────────────────────────────────────────────────────
+
+MCP_TOOLS = [
+    {"name": "get_transcript", "description": "Get YouTube video transcript with timestamps",
+     "inputSchema": {"type": "object", "properties": {
+         "videoId": {"type": "string", "description": "YouTube video ID or URL"},
+         "lang": {"type": "string", "description": "Language code", "default": "en"},
+     }, "required": ["videoId"]}},
+    {"name": "get_transcript_text", "description": "Get YouTube video transcript as plain text",
+     "inputSchema": {"type": "object", "properties": {
+         "videoId": {"type": "string", "description": "YouTube video ID or URL"},
+         "lang": {"type": "string", "description": "Language code", "default": "en"},
+     }, "required": ["videoId"]}},
+    {"name": "list_transcripts", "description": "List available transcript languages",
+     "inputSchema": {"type": "object", "properties": {
+         "videoId": {"type": "string", "description": "YouTube video ID or URL"},
+     }, "required": ["videoId"]}},
+]
+
+
+@app.post("/mcp")
+async def mcp_handler(request: Request):
+    body = await request.json()
+    rid = body.get("id")
+    method = body.get("method")
+    params = body.get("params", {})
+    auth = request.headers.get("x-proxy-token", "")
+
+    if method == "tools/list":
+        return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {"tools": MCP_TOOLS}})
+
+    if method == "tools/call":
+        tool = params.get("name", "")
+        args = params.get("arguments", {})
+        if AUTH_TOKEN and auth != AUTH_TOKEN:
+            return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "Unauthorized"}})
+        try:
+            vid = get_video_id(args.get("videoId", ""))
+            lang = args.get("lang", "en")
+        except ValueError as e:
+            return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": str(e)}})
+
+        try:
+            if tool in ("get_transcript_text", "get_transcript"):
+                data = fetch_transcript(vid, lang)
+                text = data["text"]
+                if tool == "get_transcript":
+                    lines = [f"[{i}] {s}" for i, s in enumerate(text.split(". "), 1)]
+                    text = "Transcript:\n" + "\n".join(lines)
+                return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}})
+
+            if tool == "list_transcripts":
+                info = fetch_info(vid)
+                tracks = info.get("transcripts", [])
+                lines = [f"  - {t}" for t in tracks]
+                return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "Available transcripts:\n" + "\n".join(lines)]}}})
+        except HTTPException as e:
+            return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": e.detail}})
+        except Exception as e:
+            return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": str(e)}})
+
+    if method == "initialize":
+        return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {"name": "youtube-transcript", "version": "1.0.0"},
+            "capabilities": {"tools": {}},
+        }})
+    if method == "notifications/initialized":
+        return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {}})
+    return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"Unknown method: {method}"}})
