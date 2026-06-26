@@ -1,35 +1,29 @@
 # YouTube Transcript MCP Server
 
-Uses **yt-dlp** directly to fetch YouTube transcripts — no proxies, no external APIs.
+Local yt-dlp + Vercel fallback for YouTube transcripts. No proxies, no tunnels.
 
-## How it works
+## Sources (in order)
 
-1. Calls `yt-transcript.py` (Python MCP server) in the repo root
-2. yt-dlp fetches transcripts using `player_client=android` (bypasses IP blocks)
-3. Falls back through tv → ios → web clients
+1. **yt-dlp** (local) — tries android → tv → ios → web clients
+2. **Vercel API** (remote) — calls `YT_API_BASE` if yt-dlp fails
 
-## Usage in Codex CLI
+## Setup
+
+```bash
+pip install yt-dlp
+```
+
+### Codex CLI
 
 ```toml
-# .codex/config.toml
 [mcp_servers.youtube-transcript]
 command = "node"
 args = ["<repo>/mcp-servers/youtube-transcript/server.js"]
+env = { YT_API_BASE = "https://yt-transcript-proxy.vercel.app", YT_API_TOKEN = "your-token" }
 ```
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `get_transcript` | Transcript text from YouTube video |
-| `get_transcript_text` | Same — plain text output |
-| `get_video_info` | Video metadata + available transcript languages |
-
-## Requirements
-
-- Python 3.9+ with `yt-dlp` installed: `pip install yt-dlp`
-- Node.js 18+ (for the MCP wrapper)
-
-## No Render dependency
-
-This MCP server calls `yt-transcript.py` directly — no Render proxy needed.
+- `get_transcript` — Transcript text
+- `get_transcript_text` — Plain text
+- `get_video_info` — Video metadata + available languages

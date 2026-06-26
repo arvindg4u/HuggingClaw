@@ -1,8 +1,9 @@
 /**
- * MCP YouTube Transcript Server — uses yt-dlp directly, no proxies.
+ * MCP YouTube Transcript Server
  *
- * Calls the local yt-transcript.py (which wraps yt-dlp with android/tv/web clients).
- * No Render proxy needed. Runs entirely local.
+ * Two modes:
+ * 1. Local — calls yt-transcript.py (yt-dlp) directly
+ * 2. Vercel — calls Vercel-hosted API as fallback
  */
 
 import { spawn } from "node:child_process";
@@ -14,113 +15,94 @@ import { z } from "zod";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.resolve(__dirname, "../../yt-transcript.py");
+const VERIFY_BASE = process.env.YT_API_BASE || "https://yt-transcript-proxy.vercel.app";
+const VERIFY_TOKEN = process.env.YT_API_TOKEN || "";
 
 /**
- * Call the local yt-transcript.py MCP server via stdio.
- * We send a JSON-RPC request and get the response back.
+ * Try local yt-dlp first, fallback to Vercel API.
  */
-function callYTscript(request) {
+async function fetchTranscript(videoId, lang, mode = "text") {
+  // Try local yt-dlp
+  try {
+    const resp = await callLocalYT(videoId, lang, mode);
+    if (resp?.result?.content?.[0]?.text) {
+      return { source: "local", text: resp.result.content[0].text };
+    }
+  } catch {}
+
+  // Fallback to Vercel
+  if (VERIFY_BASE) {
+    try {
+      const endpoint = mode === "text"
+        ? `${VERIFY_BASE}/transcript/${videoId}/text?lang=${lang}`
+        : `${VERIFY_BASE}/transcript/${videoId}?lang=${lang}`;
+      const res = await fetch(endpoint, {
+        headers: VERIFY_TOKEN ? { "X-Proxy-Token": VERIFY_TOKEN } : {},
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const text = data.text || data.segments?.map((s) => s.text).join(" ") || "";
+        return { source: "vercel", text };
+      }
+    } catch {}
+  }
+
+  throw new Error("Transcript unavailable from all sources");
+}
+
+function callLocalYT(videoId, lang, mode) {
   return new Promise((resolve, reject) => {
     const proc = spawn("python3", [SCRIPT], {
       stdio: ["pipe", "pipe", "inherit"],
-      timeout: 120_000,
+      timeout: 90_000,
     });
-
     let output = "";
     proc.stdout.on("data", (chunk) => (output += chunk.toString()));
-
     proc.on("close", (code) => {
-      if (code !== 0 && !output.trim()) {
-        reject(new Error(`yt-transcript.py exited with code ${code}`));
-        return;
-      }
-      // Parse the last JSON line (response)
+      if (code !== 0 && !output.trim()) return reject(new Error(`exit ${code}`));
       const lines = output.trim().split("\n").filter(Boolean);
       for (let i = lines.length - 1; i >= 0; i--) {
-        try {
-          const parsed = JSON.parse(lines[i]);
-          if (parsed.id === request.id) {
-            resolve(parsed);
-            return;
-          }
-        } catch {}
+        try { return resolve(JSON.parse(lines[i])); } catch {}
       }
-      reject(new Error("No valid JSON-RPC response from yt-transcript.py"));
+      reject(new Error("No valid response"));
     });
-
     proc.on("error", reject);
-    proc.stdin.write(JSON.stringify(request) + "\n");
+    proc.stdin.write(
+      JSON.stringify({
+        jsonrpc: "2.0", id: 1,
+        method: "tools/call",
+        params: { name: mode === "text" ? "get_transcript_text" : "get_transcript", arguments: { videoId, lang } },
+      }) + "\n"
+    );
     proc.stdin.end();
   });
 }
 
 // ── MCP Server ────────────────────────────────────────────────────────────
-const server = new McpServer({
-  name: "youtube-transcript",
-  version: "1.0.0",
-});
+const server = new McpServer({ name: "youtube-transcript", version: "1.0.0" });
 
 server.tool(
   "get_transcript",
-  {
-    videoId: z.string().describe("YouTube video ID or full URL"),
-    lang: z.string().optional().default("en").describe("Language code"),
-  },
+  { videoId: z.string().describe("YouTube video ID or URL"), lang: z.string().optional().default("en") },
   async ({ videoId, lang }) => {
-    const resp = await callYTscript({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/call",
-      params: { name: "get_transcript_text", arguments: { videoId, lang } },
-    });
-    const text = resp?.result?.content?.[0]?.text || "No transcript available";
-    return { content: [{ type: "text", text }] };
+    const { source, text } = await fetchTranscript(videoId, lang, "detailed");
+    return { content: [{ type: "text", text: `[${source}] ${text}` }] };
   },
 );
 
 server.tool(
   "get_transcript_text",
-  {
-    videoId: z.string().describe("YouTube video ID or full URL"),
-    lang: z.string().optional().default("en").describe("Language code"),
-  },
+  { videoId: z.string().describe("YouTube video ID or URL"), lang: z.string().optional().default("en") },
   async ({ videoId, lang }) => {
-    const resp = await callYTscript({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: { name: "get_transcript_text", arguments: { videoId, lang } },
-    });
-    const text = resp?.result?.content?.[0]?.text || "No transcript available";
-    return { content: [{ type: "text", text }] };
+    const { source, text } = await fetchTranscript(videoId, lang, "text");
+    return { content: [{ type: "text", text: `[${source}] ${text}` }] };
   },
 );
 
-server.tool(
-  "get_video_info",
-  {
-    videoId: z.string().describe("YouTube video ID or full URL"),
-  },
-  async ({ videoId }) => {
-    const resp = await callYTscript({
-      jsonrpc: "2.0",
-      id: 3,
-      method: "tools/call",
-      params: { name: "get_video_info", arguments: { videoId } },
-    });
-    const text = resp?.result?.content?.[0]?.text || "No info available";
-    return { content: [{ type: "text", text }] };
-  },
-);
-
-// ── Start ─────────────────────────────────────────────────────────────────
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("[yt-mcp] Server started — using yt-dlp directly");
+  console.error(`[yt-mcp] Server started — local yt-dlp + Vercel fallback (${VERIFY_BASE})`);
 }
 
-main().catch((err) => {
-  console.error("[yt-mcp] Fatal:", err);
-  process.exit(1);
-});
+main().catch((err) => { console.error("[yt-mcp] Fatal:", err); process.exit(1); });
