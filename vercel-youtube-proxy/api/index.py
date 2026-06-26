@@ -1,6 +1,8 @@
 """
-Vercel YouTube Transcript Proxy — REST API + MCP endpoint.
-Zero local setup needed. Deploy to Vercel, use the URL directly.
+Vercel YouTube Transcript Proxy
+- Direct (youtube-transcript-api) — works if Vercel IP not blocked
+- Webshare residential proxies — bypass YouTube blocks (optional)
+- Zero local setup. Just add WEBSHARE_USERNAME + WEBSHARE_PASSWORD env vars.
 """
 
 import os, re, json, random
@@ -8,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
 from requests import Session
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig
 from youtube_transcript_api._errors import (
     TranscriptsDisabled, NoTranscriptFound, VideoUnavailable,
 )
@@ -15,6 +18,8 @@ from youtube_transcript_api._errors import (
 app = FastAPI(title="YouTube Transcript API", docs_url=None, redoc_url=None)
 
 AUTH_TOKEN = os.getenv("PROXY_AUTH_TOKEN", "")
+WEBSHARE_USER = os.getenv("WEBSHARE_USERNAME", "")
+WEBSHARE_PASS = os.getenv("WEBSHARE_PASSWORD", "")
 
 USER_AGENTS = [
     "com.google.android.youtube/19.09.37 (Linux; U; Android 14)",
@@ -23,16 +28,16 @@ USER_AGENTS = [
 ]
 
 
-def get_video_id(video_input: str) -> str:
+def get_video_id(v: str) -> str:
     patterns = [
         r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/)([a-zA-Z0-9_-]{11})',
         r'^([a-zA-Z0-9_-]{11})$',
     ]
     for p in patterns:
-        m = re.search(p, video_input.strip())
+        m = re.search(p, v.strip())
         if m:
             return m.group(1)
-    raise ValueError(f"Invalid video input: {video_input}")
+    raise ValueError(f"Invalid video input: {v}")
 
 
 def check_token(token: str):
@@ -40,18 +45,27 @@ def check_token(token: str):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-def build_session():
+def build_client():
+    """Build YouTubeTranscriptApi — uses Webshare residential proxies if configured."""
     sess = Session()
     sess.headers.update({
         "User-Agent": random.choice(USER_AGENTS),
         "Accept-Language": "en-US,en;q=0.9",
     })
-    return sess
+
+    if WEBSHARE_USER and WEBSHARE_PASS:
+        proxy = WebshareProxyConfig(
+            proxy_username=WEBSHARE_USER,
+            proxy_password=WEBSHARE_PASS,
+            retries_when_blocked=3,
+        )
+        return YouTubeTranscriptApi(http_client=sess, proxy_config=proxy)
+
+    return YouTubeTranscriptApi(http_client=sess)
 
 
 def do_fetch(video_id: str, lang: str = "en"):
-    """Fetch transcript and return structured data."""
-    ytt = YouTubeTranscriptApi(http_client=build_session())
+    ytt = build_client()
     transcript = ytt.fetch(video_id, languages=[lang])
     segments = [{"text": s.text, "start": s.start, "duration": s.duration} for s in transcript.snippets]
     full_text = " ".join(s["text"] for s in segments)
@@ -66,14 +80,13 @@ def do_fetch(video_id: str, lang: str = "en"):
 
 
 def do_list(video_id: str):
-    """List available transcripts."""
-    ytt = YouTubeTranscriptApi(http_client=build_session())
-    transcript_list = ytt.list(video_id)
+    ytt = build_client()
+    tl = ytt.list(video_id)
     return {
         "video_id": video_id,
         "transcripts": [
             {"language": t.language, "language_code": t.language_code, "is_generated": t.is_generated}
-            for t in transcript_list
+            for t in tl
         ],
     }
 
@@ -82,7 +95,12 @@ def do_list(video_id: str):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "engine": "youtube-transcript-api", "mcp": "/mcp"}
+    return {
+        "status": "ok",
+        "engine": "youtube-transcript-api",
+        "webshare": bool(WEBSHARE_USER and WEBSHARE_PASS),
+        "mcp": "/mcp",
+    }
 
 
 @app.get("/transcript/{video_id}")
@@ -132,8 +150,6 @@ async def list_transcripts(
 
 
 # ── MCP Endpoint ───────────────────────────────────────────────────────
-# Standard JSON-RPC MCP interface. POST JSON-RPC requests, get JSON-RPC responses.
-# Compatible with any MCP client that supports HTTP.
 
 MCP_TOOLS = [
     {
@@ -177,60 +193,47 @@ MCP_TOOLS = [
 @app.post("/mcp")
 async def mcp_handler(request: Request):
     body = await request.json()
-    req_id = body.get("id")
+    rid = body.get("id")
     method = body.get("method")
     params = body.get("params", {})
     auth = request.headers.get("x-proxy-token", "")
 
     if method == "tools/list":
-        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {"tools": MCP_TOOLS}})
+        return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {"tools": MCP_TOOLS}})
 
     if method == "tools/call":
         tool = params.get("name", "")
         args = params.get("arguments", {})
-
         if AUTH_TOKEN and auth != AUTH_TOKEN:
-            return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": "Unauthorized"}})
-
+            return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "Unauthorized"}})
         try:
-            video_input = args.get("videoId", "")
+            vid = get_video_id(args.get("videoId", ""))
             lang = args.get("lang", "en")
-            vid = get_video_id(video_input)
         except ValueError as e:
-            return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": str(e)}})
+            return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": str(e)}})
 
         try:
             if tool == "get_transcript":
                 data = do_fetch(vid, lang)
                 lines = [f"[{s['start']:.1f}s] {s['text']}" for s in data["segments"]]
-                text = f"Transcript ({data['language']}):\n" + "\n".join(lines)
-                return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": text}]}})
-
+                return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": f"Transcript ({data['language']}):\n" + "\n".join(lines)}]}})
             if tool == "get_transcript_text":
                 data = do_fetch(vid, lang)
-                return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": data["text"]}]}})
-
+                return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": data["text"]}]}})
             if tool == "list_transcripts":
                 data = do_list(vid)
                 lines = [f"  - {t['language']} ({t['language_code']}){' [auto]' if t['is_generated'] else ''}" for t in data["transcripts"]]
-                text = f"Available transcripts for {vid}:\n" + "\n".join(lines)
-                return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": text}]}})
-
-            return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool: {tool}"}})
-
-        except TranscriptsDisabled:
-            return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": "Transcripts disabled"}})
+                return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": f"Available transcripts:\n" + "\n".join(lines)}]}})
+            return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"Unknown tool: {tool}"}})
         except Exception as e:
-            return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": str(e)}})
+            return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": str(e)}})
 
     if method == "initialize":
-        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {
+        return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": "2024-11-05",
             "serverInfo": {"name": "youtube-transcript", "version": "1.0.0"},
             "capabilities": {"tools": {}},
         }})
-
     if method == "notifications/initialized":
-        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
-
-    return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}})
+        return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": {}})
+    return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"Unknown method: {method}"}})

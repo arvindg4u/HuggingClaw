@@ -1,6 +1,6 @@
 # Vercel YouTube Transcript Proxy
 
-Zero local setup. Deploy to Vercel, use as remote MCP server.
+**Zero local setup.** Deploy to Vercel, use as remote MCP server.
 
 ## Deploy
 
@@ -9,43 +9,32 @@ cd vercel-youtube-proxy
 vercel deploy --prod
 ```
 
-Ya connect Git repo to Vercel — set Root Directory to `vercel-youtube-proxy`.
+Or connect Git repo to Vercel — set Root Directory to `vercel-youtube-proxy`.
 
 ## Remote MCP Config
-
-### Claude Desktop / Cursor / Cline
 
 ```json
 {
   "mcpServers": {
     "youtube-transcript": {
-      "url": "https://vercel-youtube-proxy-chi.vercel.app/mcp",
-      "headers": {
-        "X-Proxy-Token": "your-token"
-      }
+      "url": "https://vercel-youtube-proxy-chi.vercel.app/mcp"
     }
   }
 }
 ```
 
-### Codex CLI
+No auth needed unless you set `PROXY_AUTH_TOKEN`.
 
-```toml
-[mcp_servers.youtube-transcript]
-url = "https://vercel-youtube-proxy-chi.vercel.app/mcp"
-headers = { X-Proxy-Token = "your-token" }
-```
+## If YouTube blocks Vercel IP (future)
 
-### Without MCP (direct REST)
+1. Create free account at [webshare.io](https://www.webshare.io) → 10 free residential proxies
+2. On Vercel dashboard → add env vars:
+   - `WEBSHARE_USERNAME` = your webshare username
+   - `WEBSHARE_PASSWORD` = your webshare password
+3. App auto-detects and uses Webshare residential proxies
+
+## REST API (without MCP)
 
 ```
 GET https://vercel-youtube-proxy-chi.vercel.app/transcript/VIDEO_ID/text?lang=en
-Header: X-Proxy-Token: your-token
 ```
-
-## Why Vercel?
-
-- Render IPs → YouTube blocked ❌
-- Vercel IPs → YouTube not blocked ✅
-- Free tier, auto-scales, no local setup
-- No proxies, no TOS violations
