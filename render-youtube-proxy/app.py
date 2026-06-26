@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-YouTube Transcript API Service — uses yt-dlp directly, no proxies.
-Tries multiple player clients (android → tv → ios → web) to bypass YouTube blocks.
+YouTube Transcript API Service — yt-dlp + PO Tokens via bgutil-ytdlp-pot-provider.
+Now with PO Token support to bypass YouTube IP blocks from cloud providers.
 """
 
 import os
@@ -13,6 +13,7 @@ import shutil
 import threading
 import time
 import urllib.request
+import urllib.error
 from fastapi import FastAPI, HTTPException, Header, Query
 
 app = FastAPI(title="YouTube Transcript API", docs_url=None, redoc_url=None)
@@ -20,7 +21,15 @@ app = FastAPI(title="YouTube Transcript API", docs_url=None, redoc_url=None)
 AUTH_TOKEN = os.getenv("PROXY_AUTH_TOKEN", "changeme")
 PORT = int(os.getenv("PORT", "8000"))
 
+# yt-dlp player clients to try (android first — works best with PO tokens)
 PLAYER_CLIENTS = ["android", "tv", "ios", "web", "mweb"]
+
+# bgutil PO token server runs on localhost:4416
+BGUTIL_URL = "http://127.0.0.1:4416"
+# Extractor args passed to yt-dlp for PO token support
+BGUTIL_EXARGS = f"youtubepot-bgutilhttp:base_url={BGUTIL_URL}"
+# Common extractor args across all clients
+BASE_EXARGS = ",".join([BGUTIL_EXARGS])
 
 
 def get_video_id(video_input: str) -> str:
@@ -50,12 +59,13 @@ def parse_vtt(text: str) -> str:
 
 
 def fetch_transcript(video_id: str, lang: str = "en") -> dict:
-    """Fetch transcript via yt-dlp, trying multiple player clients."""
+    """Fetch transcript via yt-dlp with PO token support, trying multiple player clients."""
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     for client in PLAYER_CLIENTS:
         tmpdir = tempfile.mkdtemp()
         try:
+            exargs = f"youtube:player_client={client},{BGUTIL_EXARGS}"
             result = subprocess.run(
                 [
                     "yt-dlp",
@@ -64,13 +74,18 @@ def fetch_transcript(video_id: str, lang: str = "en") -> dict:
                     "--sub-langs", f"{lang},en",
                     "--sub-format", "vtt",
                     "--convert-subs", "vtt",
-                    "--extractor-args", f"youtube:player_client={client}",
+                    "--extractor-args", exargs,
                     "--output", os.path.join(tmpdir, "%(id)s"),
                     "--no-warnings", "--quiet",
                     url,
                 ],
                 capture_output=True, text=True, timeout=60,
             )
+
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                if "block" in stderr.lower() or "429" in stderr or "403" in stderr:
+                    continue  # Try next client
 
             for fname in os.listdir(tmpdir):
                 if fname.endswith(".vtt"):
@@ -91,13 +106,14 @@ def fetch_transcript(video_id: str, lang: str = "en") -> dict:
 
 
 def fetch_info(video_id: str) -> dict:
-    """Get video info via yt-dlp."""
+    """Get video info via yt-dlp with PO token support."""
     url = f"https://www.youtube.com/watch?v={video_id}"
     for client in PLAYER_CLIENTS[:3]:
         try:
+            exargs = f"youtube:player_client={client},{BGUTIL_EXARGS}"
             result = subprocess.run(
                 ["yt-dlp", "--skip-download", "--dump-json",
-                 "--extractor-args", f"youtube:player_client={client}",
+                 "--extractor-args", exargs,
                  "--no-warnings", "--quiet", url],
                 capture_output=True, text=True, timeout=30,
             )
@@ -122,7 +138,16 @@ def check_auth(token: str):
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-# ── Self-ping ──────────────────────────────────────────────────────────
+def _bgutil_health() -> bool:
+    """Check if bgutil PO token server is reachable."""
+    try:
+        urllib.request.urlopen(f"{BGUTIL_URL}/ping", timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+# ── Self-ping & health ──────────────────────────────────────────────
 def _self_ping():
     while True:
         time.sleep(600)
@@ -134,13 +159,25 @@ def _self_ping():
 
 @app.on_event("startup")
 async def _startup():
+    # Start self-ping to keep Render free tier alive
     threading.Thread(target=_self_ping, daemon=True).start()
+    # Log bgutil server status
+    if _bgutil_health():
+        print("[yt-proxy] bgutil PO token server is RUNNING on localhost:4416")
+    else:
+        print("[yt-proxy] WARNING: bgutil PO token server NOT reachable. YouTube IP blocks may persist.")
 
 
-# ── Endpoints ──────────────────────────────────────────────────────────
+# ── Endpoints ──────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "engine": "yt-dlp"}
+    bgutil_ok = _bgutil_health()
+    return {
+        "status": "ok",
+        "engine": "yt-dlp",
+        "po_tokens": bgutil_ok,
+        "clients": PLAYER_CLIENTS,
+    }
 
 
 @app.get("/transcript/{video_input:path}/text")
