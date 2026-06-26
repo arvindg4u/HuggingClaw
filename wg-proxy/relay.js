@@ -33,9 +33,7 @@ const PORT = process.env.PORT || 10000;
 const SOCKS_HOST = "127.0.0.1";
 
 // Dynamic SOCKS port for graceful dual-port IP rotation
-let CURRENT_SOCKS_PORT = 1080;
-let PREV_SOCKS_PORT = null;
-let PREV_WIRE_PROXY = null;
+let CURRENT_SOCKS_PORT = parseInt(process.env.WG_SOCKS_PORT || "1080");
 const activeConnections = new Set(); // tracked by socks5Connect() for drain
 
 // ── WireGuard rotation config ──
@@ -183,11 +181,12 @@ function startWireProxy(cfg, port) {
   writeWireProxyConfig(cfg, port);
   console.log(`[wg-proxy] Starting WireGuard -> ${cfg.endpoint} on SOCKS5 :${port}`);
   const wp = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
-  wp.on("exit", async (code) => {
+  wp.on("exit", async (code, signal) => {
     if (shuttingDown) return;
     // If this wireproxy was deliberately killed (rotation, shutdown), don't restart
     if (wp.wasKilled) return;
-    console.log(`[wg-proxy] wireproxy exited (code ${code}) for ${cfg.endpoint} -- restarting...`);
+    const sig = signal ? ` (signal=${signal})` : '';
+    console.log(`[wg-proxy] wireproxy exited (code=${code}${sig}) for ${cfg.endpoint} -- restarting...`);
     await new Promise(r => setTimeout(r, 2000));
     wireproxyRestartCount++;
     console.log(`[wg-proxy] Restarting wireproxy (attempt ${wireproxyRestartCount})...`);
@@ -204,8 +203,9 @@ function startWireProxy(cfg, port) {
       const cfg2 = WG_CONFIGS[currentConfigIdx % WG_CONFIGS.length];
       writeWireProxyConfig(cfg2, CURRENT_SOCKS_PORT);
       currentWireProxy = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
-      currentWireProxy.on("exit", (code2) => {
-        console.log(`[wg-proxy] Restarted wireproxy also exited (code ${code2})`);
+      currentWireProxy.on("exit", (code2, sig2) => {
+        const s2 = sig2 ? ` (signal=${sig2})` : '';
+        console.log(`[wg-proxy] Restarted wireproxy also exited (code=${code2}${s2})`);
       });
     } catch(e) { console.error("[wg-proxy] Restart failed:", e.message); }
   });
@@ -341,46 +341,67 @@ async function waitForPortRelease(host, port, timeoutMs) {
 
 async function rotateConfig() {
   if (WG_CONFIGS.length <= 1) return;
-  if (isRotating) { console.log('[wg-proxy] Rotation already in progress — skipping'); return; }
+  if (isRotating) { console.log('[wg-proxy] Rotation already in progress -- skipping'); return; }
   isRotating = true;
 
   const newCfg = pickConfig();
-  const oldPort = CURRENT_SOCKS_PORT;
-  const newPort = oldPort === 1080 ? 1081 : 1080;
-
-  console.log(`[wg-proxy] Rotating → ${newCfg.endpoint} (port ${oldPort} → ${newPort})`);
-
-  // 1. Write separate config for the new port (use a distinct file path)
+  const port = CURRENT_SOCKS_PORT;
   const fs = require("fs");
-  const configTemplate = `[Interface]
-PrivateKey = ${newCfg.privateKey}
-Address = 10.2.0.2/32
-DNS = 10.2.0.1
-MTU = ${WG_MTU}
 
-[Peer]
-PublicKey = ${newCfg.peerPublicKey}
-AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = ${newCfg.endpoint}
-PersistentKeepalive = 25
+  console.log(`[wg-proxy] Rotating to ${newCfg.endpoint} (same port :${port})`);
 
-[Socks5]
-BindAddress = 0.0.0.0:${newPort}
-`;
-  fs.writeFileSync("/etc/wireproxy.conf", configTemplate);
+  // 1. Kill the old wireproxy FIRST to avoid TUN address conflicts
+  //    (all Proton VPN configs share the same 10.2.0.2/32 address)
+  if (currentWireProxy) {
+    console.log(`[wg-proxy] Killing current wireproxy on :${port}`);
+    currentWireProxy.wasKilled = true;
+    try {
+      currentWireProxy.kill("SIGTERM");
+      await new Promise((r) => setTimeout(r, 1500));
+      if (!currentWireProxy.killed) currentWireProxy.kill("SIGKILL");
+    } catch (e) {}
+    // Force-kill any leftover holding the port
+    try {
+      require("child_process").execSync(
+        `kill -9 $(lsof -ti:${port} 2>/dev/null) 2>/dev/null`,
+        { stdio: "ignore" }
+      );
+    } catch (e) {}
+    // Wait for port to be released
+    await waitForPortRelease(SOCKS_HOST, port, 5000);
+  }
 
-  // 2. Start new wireproxy on the alternate port
-  console.log(`[wg-proxy] Starting new wireproxy on :${newPort} → ${newCfg.endpoint}`);
+  // 2. Write config and start new wireproxy on the SAME port
+  writeWireProxyConfig(newCfg, port);
+  console.log(`[wg-proxy] Starting wireproxy on :${port} -> ${newCfg.endpoint}`);
   const newProxy = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
-  newProxy.on("exit", (code) => {
-    console.log(`[wg-proxy] New wireproxy (port ${newPort}) exited (code ${code})`);
+
+  newProxy.on("exit", (code, signal) => {
+    if (newProxy.wasKilled || shuttingDown) return;
+    const sig = signal ? ` (signal=${signal})` : '';
+    console.log(`[wg-proxy] wireproxy (port ${port}) exited (code=${code}${sig}) -- restarting in 2s...`);
+    setTimeout(() => {
+      if (shuttingDown) return;
+      const cfgRestart = WG_CONFIGS[currentConfigIdx % WG_CONFIGS.length];
+      writeWireProxyConfig(cfgRestart, port);
+      const newWp = spawn("wireproxy", ["-c", "/etc/wireproxy.conf"], { stdio: "inherit" });
+      newWp.on("exit", (c2, s2) => {
+        const sig2 = s2 ? ` (signal=${s2})` : '';
+        console.log(`[wg-proxy] Restarted wireproxy on :${port} exited (code=${c2}${sig2})`);
+      });
+      if (currentWireProxy === newProxy || !currentWireProxy) {
+        currentWireProxy = newWp;
+      }
+    }, 2000);
   });
 
-  // 3. Wait for new SOCKS5 to be ready
-  const ready = await waitForSocks5(30000, newPort);
+  currentWireProxy = newProxy;
+
+  // 3. Wait for SOCKS5 to be ready
+  const ready = await waitForSocks5(30000);
   if (!ready) {
     isRotating = false;
-    console.error(`[wg-proxy] Rotation failed — SOCKS5 not ready on :${newPort} for ${newCfg.endpoint}`);
+    console.error(`[wg-proxy] Rotation failed -- SOCKS5 not ready on :${port} for ${newCfg.endpoint}`);
     deadEndpoints.set(newCfg.endpoint, Date.now());
     console.log(`[wg-proxy] Marked ${newCfg.endpoint} as dead (${deadEndpoints.size} dead endpoint(s))`);
     newProxy.wasKilled = true;
@@ -388,70 +409,8 @@ BindAddress = 0.0.0.0:${newPort}
     return;
   }
 
-  // 4. Redirect new connections to the new port
-  PREV_SOCKS_PORT = oldPort;
-  PREV_WIRE_PROXY = currentWireProxy;
-  CURRENT_SOCKS_PORT = newPort;
-  currentWireProxy = newProxy;
-
-  // Only wait for drain if we have active connections
-  if (activeConnections.size > 0) {
-    console.log(`[wg-proxy] Port switched to :${newPort} — draining ${activeConnections.size} active connection(s) on :${oldPort}`);
-
-  const drainDeadline = Date.now() + 30000;
-  while (activeConnections.size > 0 && Date.now() < drainDeadline) {
-    await new Promise((r) => setTimeout(r, 500));
-  }
-
-  const drainElapsed = Date.now() - (drainDeadline - 30000);
-  const remaining = activeConnections.size;
-  console.log(`[wg-proxy] Drain done in ${drainElapsed}ms — ${remaining} connection(s) remaining`);
-  } else {
-    console.log(`[wg-proxy] Port switched to :${newPort} — no active connections to drain on :${oldPort}`);
-  }
-
-  // 6. Kill old wireproxy
-  if (PREV_WIRE_PROXY) {
-    // If there are still active connections, skip the kill and let them drain
-    // naturally. The old wireproxy will be cleaned up on the next rotation or
-    // when activeConnections finally reaches zero (checked periodically).
-    if (activeConnections.size > 0) {
-      const remainingPort = oldPort;
-      console.log(`[wg-proxy] ${activeConnections.size} connection(s) still active on :${remainingPort} — deferring kill`);
-      // Schedule cleanup: retry in 30s to kill if all connections drained
-      setTimeout(() => {
-        if (PREV_WIRE_PROXY && activeConnections.size === 0) {
-          console.log(`[wg-proxy] Killing deferred old wireproxy on :${remainingPort} (all connections drained)`);
-          PREV_WIRE_PROXY.wasKilled = true;
-          try { PREV_WIRE_PROXY.kill("SIGTERM"); } catch(e) {}
-          setTimeout(() => { try { if (PREV_WIRE_PROXY && !PREV_WIRE_PROXY.killed) PREV_WIRE_PROXY.kill("SIGKILL"); } catch(e) {} }, 2000);
-          try { require("child_process").execSync("kill -9 $(lsof -ti:" + remainingPort + " 2>/dev/null) 2>/dev/null", { stdio: "ignore" }); } catch(e) {}
-          PREV_WIRE_PROXY = null;
-          PREV_SOCKS_PORT = null;
-        }
-      }, 30000);
-    } else {
-      console.log(`[wg-proxy] Killing old wireproxy on :${oldPort}`);
-      PREV_WIRE_PROXY.wasKilled = true;
-      try {
-        PREV_WIRE_PROXY.kill("SIGTERM");
-        await new Promise((r) => setTimeout(r, 1500));
-        if (!PREV_WIRE_PROXY.killed) PREV_WIRE_PROXY.kill("SIGKILL");
-      } catch (e) {}
-      // Kill any leftover on the old port
-      try {
-        require("child_process").execSync(
-          `kill -9 $(lsof -ti:${oldPort} 2>/dev/null) 2>/dev/null`,
-          { stdio: "ignore" }
-        );
-      } catch (e) {}
-      PREV_WIRE_PROXY = null;
-      PREV_SOCKS_PORT = null;
-    }
-  }
-
   isRotating = false;
-  console.log(`[wg-proxy] Rotation complete → ${newCfg.endpoint} (SOCKS5 :${newPort})`);
+  console.log(`[wg-proxy] Rotation complete -> ${newCfg.endpoint} (SOCKS5 :${port})`);
 }
 
 async function startRotationLoop() {
