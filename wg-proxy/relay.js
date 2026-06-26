@@ -121,6 +121,11 @@ let isRotating = false; // prevents concurrent rotations
 const deadEndpoints = new Map();
 const DEAD_ENDPOINT_RETRY_MS = parseInt(process.env.WG_DEAD_RETRY || "300000"); // 5 min
 
+// Track consecutive SOCKS5 connect failures to trigger early rotation
+// Reset by successful connect, triggers rotation after CONSECUTIVE_FAIL_LIMIT
+let consecutiveSocksFailures = 0;
+const CONSECUTIVE_FAIL_LIMIT = 3;
+
 // WireGuard tunnel MTU (env: WG_MTU, default 1384 — safe for Ethernet + WG overhead)
 const WG_MTU = parseInt(process.env.WG_MTU || "1300");
 
@@ -291,8 +296,14 @@ async function verifyTunnel(endpoint) {
     try {
       const ok = await testConnect(target.host, target.port);
       if (ok) {
-        console.log(`[wg-proxy] Tunnel verified via ${target.host}:${target.port} for ${endpoint}`);
-        return true;
+        // Port-80 targets (1.1.1.1, 8.8.8.8) often work when real targets
+        // on 443 are blocked by Proton VPN free — skip if not the real target.
+        if (target.port !== 80 || target.host === 'opencode.ai' || target.host === 'httpbin.org') {
+          console.log(`[wg-proxy] Tunnel verified via ${target.host}:${target.port} for ${endpoint}`);
+          return true;
+        }
+        console.log(`[wg-proxy] Tunnel port-80 only (${target.host}:${target.port}) on ${endpoint} — continuing to check real targets`);
+        continue;
       }
       console.log(`[wg-proxy] Tunnel target ${target.host}:${target.port} unreachable for ${endpoint} -- trying next`);
     } catch (e) {
@@ -656,6 +667,7 @@ wss.on("connection", (ws, req) => {
           const startTime = Date.now();
           socks5Connect(msg.host, msg.port || 443)
             .then((ts) => {
+              consecutiveSocksFailures = 0;
               console.log(`[relay] Legacy connect SUCCEEDED for ${msg.host}:${msg.port || 443} in ${Date.now() - startTime}ms`);
               legacySocket = ts;
               ws.send(JSON.stringify({ status: "connected" }));
@@ -674,8 +686,14 @@ wss.on("connection", (ws, req) => {
               ts.on("close", () => { legacySocket = null; });
             })
             .catch((err) => {
-              console.error(`[relay] legacy socks5 FAILED for ${msg.host}:${msg.port || 443} after ${Date.now() - startTime}ms: "${err.message}"`);
+              consecutiveSocksFailures++;
+              console.error(`[relay] legacy socks5 FAILED for ${msg.host}:${msg.port || 443} after ${Date.now() - startTime}ms: "${err.message}" (failures=${consecutiveSocksFailures})`);
               try { ws.send(JSON.stringify({ error: err.message })); } catch (e) {}
+              if (consecutiveSocksFailures >= CONSECUTIVE_FAIL_LIMIT && !isRotating && WG_CONFIGS.length > 1) {
+                console.log(`[wg-proxy] ${consecutiveSocksFailures} consecutive failures — triggering early rotation`);
+                consecutiveSocksFailures = 0;
+                rotateConfig().catch(e => console.error('[wg-proxy] Early rotation failed:', e.message));
+              }
             });
           return;
         }
@@ -693,6 +711,7 @@ wss.on("connection", (ws, req) => {
           const muxStart = Date.now();
           socks5Connect(msg.host, msg.port || 443)
             .then((socks) => {
+              consecutiveSocksFailures = 0;
               connections.set(connId, socks);
               ws.send(JSON.stringify({ type: "connected", connId }));
 
@@ -713,7 +732,13 @@ wss.on("connection", (ws, req) => {
               socks.on("close", () => cleanupConn(connId));
             })
             .catch((err) => {
+              consecutiveSocksFailures++;
               try { ws.send(JSON.stringify({ type: "error", connId, message: err.message })); } catch (e) {}
+              if (consecutiveSocksFailures >= CONSECUTIVE_FAIL_LIMIT && !isRotating && WG_CONFIGS.length > 1) {
+                console.log(`[wg-proxy] ${consecutiveSocksFailures} consecutive Mux failures — triggering early rotation`);
+                consecutiveSocksFailures = 0;
+                rotateConfig().catch(e => console.error('[wg-proxy] Early rotation failed:', e.message));
+              }
             });
         }
 

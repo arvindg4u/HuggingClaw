@@ -128,13 +128,12 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
   // WebSocket proxy (for wss:// or ws:// URLs)
   if (pUrl.startsWith('wss') || pUrl.startsWith('ws://')) {
     // Try multiplexed pool first, fall back to legacy retry
-    try {
-      const pool = getMultiplexedPool(pUrl);
-      if (pool) {
-        return pool.connectTunnel(targetHost, targetPort, timeout);
-      }
-    } catch(e) {
-      log(`[dbg] multiplexed pool failed: "${e?.message}", falling back to legacy`);
+    const pool = getMultiplexedPool(pUrl);
+    if (pool) {
+      return pool.connectTunnel(targetHost, targetPort, timeout).catch((e) => {
+        log(`[dbg] multiplexed pool failed: "${e?.message}", falling back to legacy`);
+        return wsRetry(3);
+      });
     }
     return wsRetry(3)
       .catch((e) => {
@@ -937,6 +936,7 @@ class MultiplexedPool {
     this.connected = false;
     this.reconnecting = false;
     this.destroyed = false;
+    this.reconnectAttempt = 0;
     this.connect();
   }
 
@@ -1019,11 +1019,19 @@ class MultiplexedPool {
 
   _scheduleReconnect() {
     if (this.reconnecting || this.destroyed) return;
+    if (this.reconnectAttempt >= 10) {
+      console.error('[hc-proxy] MultiplexedPool max reconnects reached — destroying pool');
+      this.destroy();
+      return;
+    }
     this.reconnecting = true;
+    this.reconnectAttempt++;
+    // Exponential backoff: 1s, 2s, 4s, 8s, ... up to 30s, with jitter
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempt - 1), 30000) + Math.floor(Math.random() * 1000);
     setTimeout(() => {
       this.reconnecting = false;
       this.connect();
-    }, 3000);
+    }, delay);
   }
 
   // Create a multiplexed tunnel. Returns a Duplex stream.
