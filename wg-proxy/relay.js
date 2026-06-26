@@ -2,6 +2,30 @@
 const http = require("http");
 const net = require("net");
 const dns = require("dns");
+
+// Shared DNS resolver: resolves hostname on the relay side to bypass
+// WireGuard tunnel's internal DNS (10.2.0.1) which is unreliable.
+// Returns the resolved IP (string) or the original hostname on failure/timeout.
+function resolveHostname(targetHost) {
+  if (net.isIPv4(targetHost) || net.isIPv6(targetHost)) return Promise.resolve(targetHost);
+  return new Promise((resolve) => {
+    const t = setTimeout(() => {
+      console.log(`[relay] DNS resolve TIMEOUT for ${targetHost} — using hostname directly`);
+      resolve(targetHost);
+    }, 5000);
+    dns.resolve4(targetHost, (err, addresses) => {
+      clearTimeout(t);
+      if (err || !addresses || addresses.length === 0) {
+        console.log(`[relay] DNS resolve FAILED for ${targetHost} — using hostname`);
+        resolve(targetHost);
+      } else {
+        console.log(`[relay] DNS resolved ${targetHost} -> ${addresses[0]}`);
+        resolve(addresses[0]);
+      }
+    });
+  });
+}
+
 const { spawn } = require("child_process");
 const { WebSocketServer } = require("ws");
 
@@ -203,29 +227,38 @@ async function testSocks5Working() {
 
 // Single SOCKS5 connect attempt to a specific host:port
 function testConnect(host, port) {
-  return new Promise((resolve) => {
-    const s = net.createConnection({ host: SOCKS_HOST, port: CURRENT_SOCKS_PORT }, () => {
-      s.write(Buffer.from([0x05, 0x01, 0x00]));
+  return resolveHostname(host).then((useHost) => {
+    return new Promise((resolve) => {
+      const s = net.createConnection({ host: SOCKS_HOST, port: CURRENT_SOCKS_PORT }, () => {
+        s.write(Buffer.from([0x05, 0x01, 0x00]));
+      });
+      let state = 0, buf = Buffer.alloc(0);
+      const timer = setTimeout(() => { s.destroy(); resolve(false); }, 10000);
+      s.on("data", (d) => {
+        buf = Buffer.concat([buf, d]);
+        try {
+          if (state === 0 && buf.length >= 2) {
+            if (buf[1] !== 0x00) { clearTimeout(timer); s.destroy(); resolve(false); return; }
+            state = 1;
+            let connectMsg;
+            if (net.isIPv4(useHost)) {
+              const ipBytes = useHost.split(".").map(Number);
+              connectMsg = Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x01]), Buffer.from(ipBytes), Buffer.from([(port >> 8) & 0xFF, port & 0xFF])]);
+            } else {
+              const hb = Buffer.from(useHost);
+              connectMsg = Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hb.length]), hb, Buffer.from([(port >> 8) & 0xFF, port & 0xFF])]);
+            }
+            s.write(connectMsg);
+            buf = Buffer.alloc(0);
+          } else if (state === 1 && buf.length >= 5) {
+            clearTimeout(timer);
+            if (buf[1] === 0x00) { s.end(); resolve(true); }
+            else { s.destroy(); resolve(false); }
+          }
+        } catch(e) { clearTimeout(timer); s.destroy(); resolve(false); }
+      });
+      s.on("error", () => { clearTimeout(timer); resolve(false); });
     });
-    let state = 0, buf = Buffer.alloc(0);
-    const timer = setTimeout(() => { s.destroy(); resolve(false); }, 10000);
-    s.on("data", (d) => {
-      buf = Buffer.concat([buf, d]);
-      try {
-        if (state === 0 && buf.length >= 2) {
-          if (buf[1] !== 0x00) { clearTimeout(timer); s.destroy(); resolve(false); return; }
-          state = 1;
-          const hb = Buffer.from(host);
-          s.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, hb.length]), hb, Buffer.from([(port >> 8) & 0xFF, port & 0xFF])]));
-          buf = Buffer.alloc(0);
-        } else if (state === 1 && buf.length >= 5) {
-          clearTimeout(timer);
-          if (buf[1] === 0x00) { s.end(); resolve(true); }
-          else { s.destroy(); resolve(false); }
-        }
-      } catch(e) { clearTimeout(timer); s.destroy(); resolve(false); }
-    });
-    s.on("error", () => { clearTimeout(timer); resolve(false); });
   });
 }
 
@@ -447,30 +480,8 @@ if (WG_CONFIGS_URL && WG_CONFIGS_REFRESH_MS > 0) {
 function socks5Connect(targetHost, targetPort) {
   const socksStart = Date.now();
 
-  // Resolve hostname to IP on the relay side, bypassing the WireGuard tunnel's
-  // internal DNS (10.2.0.1) which is unreliable on Proton VPN free tier.
-  // When tunnel DNS fails, wireproxy returns SOCKS5 reject:4 (Host unreachable).
-  const resolveHost = () => {
-    if (net.isIPv4(targetHost) || net.isIPv6(targetHost)) return Promise.resolve(targetHost);
-    return new Promise((resolve) => {
-      const t = setTimeout(() => {
-        console.log(`[relay] DNS resolve4 TIMEOUT for ${targetHost} — using hostname directly`);
-        resolve(targetHost);
-      }, 5000);
-      dns.resolve4(targetHost, (err, addresses) => {
-        clearTimeout(t);
-        if (err || !addresses || addresses.length === 0) {
-          console.log(`[relay] DNS resolve4 FAILED for ${targetHost} — using hostname`);
-          resolve(targetHost);
-        } else {
-          console.log(`[relay] DNS resolved ${targetHost} -> ${addresses[0]}`);
-          resolve(addresses[0]);
-        }
-      });
-    });
-  };
-
-  return resolveHost().then((useHost) => {
+  // Resolve hostname on relay side (bypasses Proton VPN's broken tunnel DNS)
+  return resolveHostname(targetHost).then((useHost) => {
     return new Promise((resolve, reject) => {
       const s = net.createConnection({ host: SOCKS_HOST, port: CURRENT_SOCKS_PORT }, () => {
         s.setNoDelay(true);
