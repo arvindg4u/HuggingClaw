@@ -66,31 +66,51 @@ const TUNNEL_STATUS_FILE = '/home/node/.protonvpn/status';
 const TUNNEL_CHECK_INTERVAL = 15000; // re-check status file every 15s
 let tunnelLastCheck = 0;
 
+// Verify port is actually listening by checking /proc/net/tcp
+function isTunnelPortListening() {
+  try {
+    const data = fs.readFileSync('/proc/net/tcp', 'utf8');
+    const hexPort = TUNNEL_PORT.toString(16).toLowerCase();
+    // Format: sl  local_address:PORT  rem_address  st  ...
+    // state 0A = TCP_LISTEN
+    return data.split('\n').some(line => {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 4) return false;
+      const addrPart = parts[1]; // e.g. 0100007F:62F9
+      const state = parts[3];
+      if (!addrPart || !state) return false;
+      const ci = addrPart.lastIndexOf(':');
+      if (ci < 0) return false;
+      return addrPart.substring(ci + 1).toLowerCase() === hexPort && state === '0A';
+    });
+  } catch(e) { return false; }
+}
+
 function checkTunnel() {
   if (tunnelAvailable) return true;
-  // Throttle re-checks to avoid hammering filesystem
   const now = Date.now();
   if (now - tunnelLastCheck < TUNNEL_CHECK_INTERVAL) return false;
   tunnelLastCheck = now;
-  // Check protonvpn status file (synchronous, reliable)
   try {
     const st = fs.readFileSync(TUNNEL_STATUS_FILE, 'utf8').trim();
-    if (st === 'connected') {
+    if (st === 'connected' && isTunnelPortListening()) {
       tunnelAvailable = true;
-      log('[tunnel] WireGuard tunnel connected — routing outbound traffic through Proton VPN');
+      log('[tunnel] Proton VPN active — routing outbound traffic through WireGuard tunnel');
       return true;
+    } else if (st === 'connected' && !isTunnelPortListening()) {
+      log('[tunnel] WARNING: stale status file — port ' + TUNNEL_PORT + ' not listening (VPN not ready yet)');
     }
-  } catch(e) { /* status file not found — tunnel not ready */ }
+  } catch(e) { }
   return false;
 }
-// Periodic re-check: when tunnel becomes available later, auto-detect it
+// Periodic re-check for late tunnel availability
 setInterval(() => {
   if (!tunnelAvailable) {
     try {
       const st = fs.readFileSync(TUNNEL_STATUS_FILE, 'utf8').trim();
-      if (st === 'connected') {
+      if (st === 'connected' && isTunnelPortListening()) {
         tunnelAvailable = true;
-        log('[tunnel] WireGuard tunnel connected (periodic check) — routing outbound traffic through Proton VPN');
+        log('[tunnel] Proton VPN active (periodic check) — routing outbound traffic through WireGuard tunnel');
       }
     } catch(e) {}
   }
