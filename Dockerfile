@@ -52,15 +52,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xfonts-scalable \
     --no-install-recommends && \
     pip3 install --no-cache-dir --break-system-packages \
-      huggingface_hub hf_transfer \
-      "git+https://github.com/jonasjancarik/protonvpn-cli-community.git@latest" && \
+      huggingface_hub hf_transfer && \
     rm -rf /var/lib/apt/lists/*
 
-# ── Install OpenVPN as WireGuard fallback for Proton VPN ──
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    openvpn \
-    --no-install-recommends && \
-    rm -rf /var/lib/apt/lists/*
+# ── Install wireproxy (userspace WireGuard → HTTP CONNECT tunnel, no TUN needed) ──
+ARG TARGETARCH
+RUN set -ex && \
+    arch="${TARGETARCH:-amd64}" && \
+    if [ "$arch" = "arm64" ]; then arch="arm64"; fi && \
+    if [ "$arch" = "amd64" ]; then arch="amd64"; fi && \
+    url="https://github.com/octeep/wireproxy/releases/latest/download/wireproxy_linux_${arch}.tar.gz" && \
+    curl -sL --max-time 30 "$url" -o /tmp/wireproxy.tar.gz && \
+    tar -xzf /tmp/wireproxy.tar.gz -C /tmp/ && \
+    mv /tmp/wireproxy /usr/local/bin/wireproxy && \
+    chmod +x /usr/local/bin/wireproxy && \
+    rm -f /tmp/wireproxy.tar.gz && \
+    echo "wireproxy installed for ${arch}" || \
+    echo "Warning: wireproxy download failed (will retry at runtime)" 
 
 RUN if [ "${DEV_MODE}" = "true" ] || [ "${DEV_MODE}" = "1" ] || [ "${DEV_MODE}" = "yes" ] || [ "${DEV_MODE}" = "on" ]; then \
       pip3 install --no-cache-dir --break-system-packages \
@@ -74,8 +82,7 @@ RUN mkdir -p /home/node/app /home/node/.openclaw && \
     chown -R 1000:1000 /home/node && \
     printf '%s\n' \
       'Cmnd_Alias HUGGINGCLAW_APT = /usr/bin/apt, /usr/bin/apt-get, /usr/bin/dpkg' \
-      'Cmnd_Alias HUGGINGCLAW_VPN = /home/node/app/protonvpn-manager.sh, /usr/local/bin/protonvpn' \
-      'node ALL=(root) NOPASSWD: HUGGINGCLAW_APT, HUGGINGCLAW_VPN' \
+      'node ALL=(root) NOPASSWD: HUGGINGCLAW_APT' \
       > /etc/sudoers.d/huggingclaw-apt && \
     chmod 0440 /etc/sudoers.d/huggingclaw-apt && \
     visudo -cf /etc/sudoers.d/huggingclaw-apt

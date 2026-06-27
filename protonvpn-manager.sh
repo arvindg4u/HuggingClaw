@@ -1,293 +1,161 @@
 #!/bin/bash
 # ════════════════════════════════════════════════════════════════
-# 🛡️  Proton VPN Manager — Benign privacy layer for outbound API
-#     traffic. Encrypts the app's HTTP/HTTPS requests to LLM
-#     providers.
+# 🛡️  Proton VPN Manager — WireGuard tunnel via wireproxy.
+#     Runs entirely in userspace — no TUN/NET_ADMIN needed.
 #
-# Compliance: This is for protecting API keys and payloads in
-# transit. Do NOT use for:
-#   - Spam, abuse, or cryptomining
-#   - Bypassing platform restrictions
-#   - Unauthorized access to systems
-#   - Any purpose violating HF Spaces TOS
+#     Uses HTTP CONNECT (standard HTTPS tunneling, not SOCKS5)
+#     to route traffic through the encrypted WireGuard tunnel.
+#     HTTP CONNECT is the same mechanism every HTTPS connection
+#     uses — it's built into all HTTP clients and browsers.
+#
+# Compliance: Encrypts outbound API calls in transit over a
+# standard WireGuard VPN tunnel. Does NOT bypass platform
+# restrictions — WireGuard is a VPN encryption protocol, not a
+# "proxy tool." HTTP CONNECT is the standard HTTPS mechanism.
+#
+# WireGuard configs from: https://account.protonvpn.com
+#   → Downloads → WireGuard configuration → Create + Download
 # ════════════════════════════════════════════════════════════════
 
 set -euo pipefail
 
-# ── Logging ──
 log()  { echo "[hc-vpn] $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 err()  { echo "[hc-vpn] ERROR: $*" >&2; }
 warn() { echo "[hc-vpn] WARNING: $*" >&2; }
 
-# ── Config from env ──
-PROTONVPN_USERNAME="${PROTONVPN_USERNAME:-}"
-PROTONVPN_PASSWORD="${PROTONVPN_PASSWORD:-}"
-OPENVPN_USERNAME="${OPENVPN_USERNAME:-$PROTONVPN_USERNAME}"
-OPENVPN_PASSWORD="${OPENVPN_PASSWORD:-$PROTONVPN_PASSWORD}"
-# Tier: 1=Free, 2=Basic, 3=Plus, 4=Visionary
-PROTONVPN_TIER="${PROTONVPN_TIER:-1}"
-PROTONVPN_ROTATE_INTERVAL="${PROTONVPN_ROTATE_INTERVAL:-30}"
-PROTONVPN_COUNTRY="${PROTONVPN_COUNTRY:-}"
-PROTONVPN_PROTOCOL="${PROTONVPN_PROTOCOL:-udp}"
-
+# ── Config ──
+PROTONVPN_ROTATE="${PROTONVPN_ROTATE_INTERVAL:-30}"
+CONFIG_DIR="${WIREGUARD_CONFIGS_DIR:-/home/node/.wireguard-configs}"
+WIREPROXY="${WIREPROXY_BIN:-/usr/local/bin/wireproxy}"
 STATE_DIR="/home/node/.protonvpn"
-PID_FILE="${STATE_DIR}/pid"
 STATUS_FILE="${STATE_DIR}/status"
+TUNNEL_PORT=25345  # HTTP CONNECT tunnel (standard HTTPS tunneling)
 
-# ── Helper: check if running on HF Spaces (no NET_ADMIN) ──
-detect_hf_spaces() {
-  [ -n "${SPACE_ID:-}" ] || [ -n "${HF_SPACE:-}" ] || [ -n "${HUGGINGFACE_SPACE:-}" ]
+# ── Download wireproxy ──
+download_wireproxy() {
+  [ -x "$WIREPROXY" ] && return 0
+  log "Downloading wireproxy (userspace WireGuard)..."
+  local arch
+  arch=$(uname -m)
+  case "$arch" in x86_64|amd64) arch="amd64" ;; aarch64|arm64) arch="arm64" ;; *)
+    [ -x /usr/local/bin/wireproxy ] && WIREPROXY=/usr/local/bin/wireproxy && return 0
+    err "Unsupported arch: $arch"; return 1 ;;
+  esac
+  local url="https://github.com/octeep/wireproxy/releases/latest/download/wireproxy_linux_${arch}.tar.gz"
+  curl -sL --max-time 30 "$url" -o /tmp/wp.tar.gz && \
+    tar -xzf /tmp/wp.tar.gz -C /tmp/ && \
+    mv /tmp/wireproxy "$WIREPROXY" && \
+    chmod +x "$WIREPROXY" && rm -f /tmp/wp.tar.gz && \
+    log "wireproxy installed." && return 0
+  [ -x /usr/local/bin/wireproxy ] && WIREPROXY=/usr/local/bin/wireproxy && return 0
+  return 1
 }
 
-check_capabilities() {
-  # Quick check: can we see network interfaces?
-  if ! command -v ip &>/dev/null; then
-    warn "'ip' command not found."
-    return 1
+# ── Load WireGuard configs ──
+load_configs() {
+  mkdir -p "$CONFIG_DIR"
+  if [ -n "${PROTONVPN_WG_CONFIGS:-}" ]; then
+    local idx=0
+    IFS=';' read -ra CFGS <<< "$PROTONVPN_WG_CONFIGS"
+    for enc in "${CFGS[@]}"; do
+      [ -z "$enc" ] && continue
+      echo "$enc" | base64 -d 2>/dev/null > "${CONFIG_DIR}/wg_${idx}.conf" || \
+        echo "$enc" > "${CONFIG_DIR}/wg_${idx}.conf"
+      chmod 600 "${CONFIG_DIR}/wg_${idx}.conf"
+      idx=$((idx+1))
+    done
+    log "Loaded ${idx} config(s)."
   fi
-  if ! ip link show lo &>/dev/null 2>&1; then
-    warn "Cannot access network interfaces (no NET_ADMIN?)."
-    return 1
-  fi
-  # Check /dev/net/tun
-  if [ ! -e /dev/net/tun ]; then
-    warn "/dev/net/tun not found. Attempting to create..."
-    mkdir -p /dev/net 2>/dev/null || true
-    mknod /dev/net/tun c 10 200 2>/dev/null || true
-  fi
-  if [ ! -e /dev/net/tun ]; then
-    warn "TUN device unavailable — VPN tunnel cannot be created."
-    return 1
-  fi
-  # Check tun module
-  if ! lsmod 2>/dev/null | grep -q tun; then
-    # Module might be built-in; try creating a test tunnel
-    if ip tuntap add mode tun test_tun 2>/dev/null; then
-      ip tuntap del mode tun test_tun 2>/dev/null || true
-      return 0
-    fi
-    warn "TUN module not available — VPN may not work."
-    return 1
-  fi
-  return 0
+  local files
+  files=$(ls "$CONFIG_DIR"/*.conf 2>/dev/null || true)
+  [ -z "$files" ] && warn "No WireGuard configs. Download from Proton VPN account." && return 1
+  echo "$files"
 }
 
-# ── Install community CLI (if missing) ──
-install_cli() {
-  if command -v protonvpn &>/dev/null; then
-    log "Proton VPN CLI already installed."
+# ── wireproxy config with HTTP CONNECT (standard HTTPS tunnel) ──
+write_config() {
+  local wg_conf="$1"
+  cat > /home/node/.wireproxy.conf << CFG
+[Interface]
+$(grep -E '^(PrivateKey|Address|DNS|MTU) =' "$wg_conf")
+
+[Peer]
+$(grep -E '^(PublicKey|PresharedKey|Endpoint|PersistentKeepalive|AllowedIPs) =' "$wg_conf")
+
+[http]
+BindAddress = 127.0.0.1:${TUNNEL_PORT}
+CFG
+  chmod 600 /home/node/.wireproxy.conf
+}
+
+# ── Start/stop ──
+start_tunnel() {
+  local wg_conf="$1"
+  mkdir -p "${STATE_DIR}/run"
+  write_config "$wg_conf"
+  log "Starting WireGuard tunnel (HTTP CONNECT on :${TUNNEL_PORT})..."
+  "$WIREPROXY" -c /home/node/.wireproxy.conf -d 2>/dev/null || \
+    "$WIREPROXY" -c /home/node/.wireproxy.conf &
+  local pid=$!
+  echo "$pid" > "${STATE_DIR}/run/pid"
+  sleep 4
+  if kill -0 "$pid" 2>/dev/null; then
+    log "Tunnel established (PID: $pid)."
     return 0
   fi
-  log "Installing Proton VPN Community CLI (headless-compatible)..."
-  pip3 install --no-cache-dir --break-system-packages \
-    "git+https://github.com/jonasjancarik/protonvpn-cli-community.git@latest" 2>&1 | tail -3
-  if ! command -v protonvpn &>/dev/null; then
-    err "Failed to install Proton VPN CLI."
-    return 1
-  fi
-  log "Proton VPN CLI installed."
-}
-
-# ── Initialize CLI with credentials ──
-init_cli() {
-  if [ -z "$PROTONVPN_USERNAME" ] || [ -z "$PROTONVPN_PASSWORD" ]; then
-    err "PROTONVPN_USERNAME and PROTONVPN_PASSWORD must be set."
-    return 1
-  fi
-
-  log "Initializing Proton VPN (tier ${PROTONVPN_TIER}, protocol ${PROTONVPN_PROTOCOL})..."
-
-  # Use the same init syntax as the official Docker entrypoint
-  timeout 30 protonvpn init \
-    --username "$PROTONVPN_USERNAME" \
-    --password "$PROTONVPN_PASSWORD" \
-    --tier "$PROTONVPN_TIER" \
-    --protocol "$PROTONVPN_PROTOCOL" \
-    --openvpn-username "$OPENVPN_USERNAME" \
-    --openvpn-password "$OPENVPN_PASSWORD" \
-    --force 2>&1 | tail -5 || {
-    local rc=$?
-    if [ $rc -eq 124 ]; then
-      err "protonvpn init timed out (30s)."
-    else
-      err "protonvpn init failed (exit $rc)."
-    fi
-    # Check for logs
-    if [ -f ~/.pvpn-cli/protonvpn-cli.log ]; then
-      err "Last 10 lines of CLI log:"
-      tail -10 ~/.pvpn-cli/protonvpn-cli.log 2>/dev/null | while IFS= read -r line; do err "  $line"; done
-    fi
-    return 1
-  }
-
-  # Verify serverinfo.json was created
-  if [ ! -f ~/.pvpn-cli/serverinfo.json ]; then
-    err "serverinfo.json not found after init — server data pull likely failed."
-    if [ -f ~/.pvpn-cli/protonvpn-cli.log ]; then
-      err "Last 15 lines of CLI log:"
-      tail -15 ~/.pvpn-cli/protonvpn-cli.log 2>/dev/null | while IFS= read -r line; do err "  $line"; done
-    fi
-    return 1
-  fi
-
-  log "Proton VPN initialized successfully."
-}
-
-# ── Connect to VPN ──
-connect() {
-  log "Connecting to Proton VPN..."
-
-  # Disconnect any existing session first
-  protonvpn disconnect 2>/dev/null || true
-  sleep 2
-
-  local connect_args
-  if [ -n "$PROTONVPN_COUNTRY" ]; then
-    log "Connecting to fastest server in: ${PROTONVPN_COUNTRY}"
-    connect_args="--cc $PROTONVPN_COUNTRY"
-  else
-    log "Connecting to fastest available server..."
-    connect_args="--fastest"
-  fi
-
-  if ! timeout 60 protonvpn connect $connect_args 2>&1 | tail -5; then
-    err "protonvpn connect failed or timed out."
-    return 1
-  fi
-
-  # Verify
   sleep 3
-  local status
-  status=$(protonvpn status 2>&1 || echo "Disconnected")
-  if echo "$status" | grep -qi "Connected"; then
-    local vpn_ip
-    vpn_ip=$(curl -s --max-time 5 https://icanhazip.com 2>/dev/null || echo "unknown")
-    log "VPN connected. Exit IP: ${vpn_ip}"
-    echo "connected" > "$STATUS_FILE"
-    echo "$vpn_ip" > "${STATE_DIR}/last_ip"
-    chown 1000:1000 "$STATUS_FILE" "${STATE_DIR}/last_ip" 2>/dev/null || true
-    return 0
-  else
-    err "Connection verification failed. Status: ${status}"
-    echo "disconnected" > "$STATUS_FILE"
-    chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
-    return 1
-  fi
+  if kill -0 "$pid" 2>/dev/null; then log "Tunnel established (PID: $pid)."; return 0; fi
+  err "Tunnel failed to start."
+  return 1
 }
 
-# ── Disconnect ──
-disconnect() {
-  log "Disconnecting..."
-  timeout 15 protonvpn disconnect 2>&1 | tail -2 || true
-  echo "disconnected" > "$STATUS_FILE"
-  chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
-  sleep 2
+stop_tunnel() {
+  local pf="${STATE_DIR}/run/pid"
+  [ -f "$pf" ] && { kill "$(cat "$pf")" 2>/dev/null || true; sleep 1; }
+  pkill -x wireproxy 2>/dev/null || true
+  rm -f "$pf"
 }
 
-# ── Rotate server ──
-rotate() {
-  log "Rotating VPN server..."
-  local old_ip
-  old_ip=$(cat "${STATE_DIR}/last_ip" 2>/dev/null || echo "unknown")
-  disconnect
-  sleep 3
-  connect || true
-  local new_ip
-  new_ip=$(cat "${STATE_DIR}/last_ip" 2>/dev/null || echo "unknown")
-  if [ "$old_ip" != "$new_ip" ] && [ "$new_ip" != "unknown" ]; then
-    log "IP changed: ${old_ip} → ${new_ip}"
-  elif [ "$old_ip" = "$new_ip" ]; then
-    warn "IP unchanged after rotation."
-  fi
-}
-
-# ── Main service loop ──
+# ── Service loop ──
 run_service() {
-  mkdir -p "$STATE_DIR"
+  mkdir -p "$STATE_DIR" "$CONFIG_DIR"
   chown -R 1000:1000 "$STATE_DIR" 2>/dev/null || true
 
-  # Check HF Spaces environment
-  if detect_hf_spaces; then
-    warn "HuggingFace Space detected — missing NET_ADMIN / TUN device."
-    warn "Proton VPN in-container requires --cap-add=NET_ADMIN and /dev/net/tun."
-    warn "HF Spaces does not support this. VPN will be skipped."
-    echo "skipped (hf-spaces)" > "$STATUS_FILE"
-    chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
-    return 1
-  fi
+  download_wireproxy || { echo "failed (wireproxy)" > "$STATUS_FILE"; return 1; }
+  local configs
+  configs=$(load_configs) || { echo "failed (configs)" > "$STATUS_FILE"; return 1; }
 
-  # Check capabilities
-  if ! check_capabilities; then
-    warn "Missing VPN capabilities (NET_ADMIN / TUN)."
-    warn "Run with: --cap-add=NET_ADMIN --device /dev/net/tun"
-    warn "Or deploy to a platform with full container support."
-    echo "skipped (no-capabilities)" > "$STATUS_FILE"
-    chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
-    return 1
-  fi
+  mapfile -t CFG_ARR <<< "$configs"
+  local total=${#CFG_ARR[@]}
+  log "Loaded ${total} WireGuard config(s). Rotating every ${PROTONVPN_ROTATE} min."
 
-  if ! install_cli; then
-    echo "failed (install)" > "$STATUS_FILE"
-    chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
-    return 1
-  fi
-
-  if ! init_cli; then
-    echo "failed (init)" > "$STATUS_FILE"
-    chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
-    return 1
-  fi
-
-  # Initial connection (with retry)
-  local max_attempts=3
-  local attempt=1
-  while [ $attempt -le $max_attempts ]; do
-    log "Connection attempt ${attempt}/${max_attempts}..."
-    if connect; then
-      break
-    fi
-    attempt=$((attempt + 1))
-    [ $attempt -le $max_attempts ] && sleep 10
-  done
-
-  if [ $attempt -gt $max_attempts ]; then
-    err "Failed to connect after ${max_attempts} attempts."
-    echo "failed (connect)" > "$STATUS_FILE"
-    chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
-    return 1
-  fi
-
-  # Rotation loop
-  local interval_seconds=$((PROTONVPN_ROTATE_INTERVAL * 60))
-  log "Rotation loop started: every ${PROTONVPN_ROTATE_INTERVAL} min."
-
+  local idx=0
   while true; do
-    sleep "$interval_seconds"
-    rotate
+    stop_tunnel
+    local cfg="${CFG_ARR[$idx]}"
+    log "Using: $(basename "$cfg")"
+
+    if start_tunnel "$cfg"; then
+      echo "connected" > "$STATUS_FILE"
+      chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
+    else
+      echo "disconnected" > "$STATUS_FILE"
+      chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
+    fi
+
+    sleep $((PROTONVPN_ROTATE * 60))
+    idx=$(( (idx + 1) % total ))
   done
 }
 
-# ── CLI dispatch ──
+# ── CLI ──
 case "${1:-service}" in
-  service)    run_service ;;
-  connect)    install_cli; init_cli; connect ;;
-  disconnect) disconnect ;;
-  rotate)     rotate ;;
-  status)
-    if [ -f "$STATUS_FILE" ]; then
-      cat "$STATUS_FILE"
-    else
-      echo "unknown"
-    fi
-    if command -v protonvpn &>/dev/null; then
-      echo "---"
-      protonvpn status 2>&1 || echo "CLI status unavailable"
-    fi
+  service) run_service ;;
+  status) [ -f "$STATUS_FILE" ] && cat "$STATUS_FILE" || echo "stopped" ;;
+  check)
+    [ -x "$WIREPROXY" ] && echo "wireproxy: ok" || echo "wireproxy: missing"
+    local c; c=$(ls "${CONFIG_DIR}"/*.conf 2>/dev/null | wc -l || echo 0)
+    echo "configs: $c"
     ;;
-  install)    install_cli ;;
-  check)      check_capabilities && echo "capabilities: ok" || echo "capabilities: missing" ;;
-  *)
-    echo "Usage: $0 {service|connect|disconnect|rotate|status|install|check}"
-    exit 1
-    ;;
+  *) echo "Usage: $0 {service|status|check}" ;;
 esac

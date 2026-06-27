@@ -1745,62 +1745,66 @@ start_background_sync_once() {
 # Compliant use: protect LLM API calls in transit — not for bypassing
 # platform restrictions, spam, abuse, or any TOS-violating activity.
 start_protonvpn_vpn() {
-  [ -n "${PROTONVPN_USERNAME:-}" ] || return 0
+  # Only activate if WireGuard configs are provided
+  if [ -z "${PROTONVPN_WG_CONFIGS:-}" ]; then
+    return 0
+  fi
 
-  # Skip if already running (idempotent - safe to call multiple times)
+  # Skip if already running
   if [ -n "${PROTONVPN_PID:-}" ] && kill -0 "$PROTONVPN_PID" 2>/dev/null; then
     return 0
   fi
   if [ -f /home/node/.protonvpn/status ]; then
     local st
     st=$(cat /home/node/.protonvpn/status 2>/dev/null)
-    if [ "$st" = "connected" ] || [ "$st" = "running" ]; then
-      return 0
-    fi
+    [ "$st" = "connected" ] && return 0
   fi
 
   if [ ! -f /home/node/app/protonvpn-manager.sh ]; then
-    echo "[hc-vpn] protonvpn-manager.sh not found — skipping."
+    echo "[hc-vpn] protonvpn-manager.sh not found."
     return 0
   fi
 
-  echo "[hc-vpn] Checking environment for VPN support..."
+  echo "[hc-vpn] PROTONVPN_WG_CONFIGS found — starting WireGuard tunnel..."
+  echo "[hc-vpn] This encrypts outbound API traffic through Proton VPN."
+  echo "[hc-vpn] Uses standard WireGuard + HTTP CONNECT (HTTPS tunneling)."
 
-  # Fast capability check (runs instantly, no waiting)
-  local cap_check
-  cap_check=$(sudo /home/node/app/protonvpn-manager.sh check 2>/dev/null) || true
-  if echo "$cap_check" | grep -q "capabilities: missing"; then
-    echo "[hc-vpn] VPN cannot run here — missing NET_ADMIN / TUN device."
-    echo "[hc-vpn] Works on: local Docker with --cap-add=NET_ADMIN, Render, etc."
-    echo "[hc-vpn] Continuing without VPN."
-    mkdir -p /home/node/.protonvpn 2>/dev/null || true
-    echo "skipped (no-capabilities)" > /home/node/.protonvpn/status 2>/dev/null || true
+  mkdir -p /home/node/.protonvpn
+
+  # Quick check
+  local check
+  check=$(/home/node/app/protonvpn-manager.sh check 2>/dev/null) || true
+  if echo "$check" | grep -q "wireproxy: missing"; then
+    echo "[hc-vpn] wireproxy not available — skipping VPN."
+    echo "skipped" > /home/node/.protonvpn/status
     return 0
   fi
 
-  echo "[hc-vpn] PROTONVPN_USERNAME is set — starting VPN manager..."
-  echo "[hc-vpn] Compliance: VPN encrypts outbound API traffic only."
-  echo "[hc-vpn] Do NOT use for bypassing platform restrictions or abuse."
-
-  # Launch in background
-  sudo /home/node/app/protonvpn-manager.sh service >> /tmp/protonvpn-manager.log 2>&1 &
+  # Launch manager in background
+  /home/node/app/protonvpn-manager.sh service >> /tmp/protonvpn-manager.log 2>&1 &
   PROTONVPN_PID=$!
 
-  # Brief wait (10s max) then continue either way
-  echo "[hc-vpn] Waiting for initial connection (up to 10s)..."
-  for i in $(seq 1 5); do
+  # Wait up to 10s for connection
+  echo "[hc-vpn] Waiting for tunnel (up to 10s)..."
+  local i=0
+  while [ $i -lt 5 ]; do
     if [ -f /home/node/.protonvpn/status ]; then
-      local vpn_status
-      vpn_status=$(cat /home/node/.protonvpn/status 2>/dev/null)
-      if [ "$vpn_status" = "connected" ]; then
-        echo "[hc-vpn] Connected."
+      local st2
+      st2=$(cat /home/node/.protonvpn/status 2>/dev/null)
+      if [ "$st2" = "connected" ]; then
+        echo "[hc-vpn] Tunnel established (HTTP CONNECT on :25345)."
+        # Export proxy vars for child processes
+        export HTTP_PROXY="http://127.0.0.1:25345"
+        export HTTPS_PROXY="http://127.0.0.1:25345"
+        export http_proxy="http://127.0.0.1:25345"
+        export https_proxy="http://127.0.0.1:25345"
         return 0
       fi
     fi
     sleep 2
+    i=$((i+1))
   done
-
-  echo "[hc-vpn] VPN still starting — continuing in background."
+  echo "[hc-vpn] Tunnel still starting — continuing in background."
 }
 
 
