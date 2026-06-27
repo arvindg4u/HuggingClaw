@@ -51,6 +51,76 @@ if (!SOCKS5_DOMAINS.includes('httpbin.org')) {
   SOCKS5_DOMAINS.push('httpbin.org');
 }
 
+// ── Local WireGuard VPN Tunnel (HTTP CONNECT) ──
+// When the protonvpn-manager is active, it exposes an HTTP CONNECT tunnel
+// on localhost:25345. This encrypts outbound traffic through Proton VPN's
+// WireGuard servers. All external HTTPS traffic is routed through it.
+// Automatically detected — no config needed.
+const TUNNEL_HOST = process.env.TUNNEL_HOST || '127.0.0.1';
+const TUNNEL_PORT = parseInt(process.env.TUNNEL_PORT || '25345');
+let tunnelAvailable = false;
+
+// Check if WireGuard tunnel is available (via status file, cached + periodic)
+const TUNNEL_STATUS_FILE = '/home/node/.protonvpn/status';
+
+const TUNNEL_CHECK_INTERVAL = 15000; // re-check status file every 15s
+let tunnelLastCheck = 0;
+
+function checkTunnel() {
+  if (tunnelAvailable) return true;
+  // Throttle re-checks to avoid hammering filesystem
+  const now = Date.now();
+  if (now - tunnelLastCheck < TUNNEL_CHECK_INTERVAL) return false;
+  tunnelLastCheck = now;
+  // Check protonvpn status file (synchronous, reliable)
+  try {
+    const st = fs.readFileSync(TUNNEL_STATUS_FILE, 'utf8').trim();
+    if (st === 'connected') {
+      tunnelAvailable = true;
+      log('[tunnel] WireGuard tunnel connected — routing outbound traffic through Proton VPN');
+      return true;
+    }
+  } catch(e) { /* status file not found — tunnel not ready */ }
+  return false;
+}
+// Periodic re-check: when tunnel becomes available later, auto-detect it
+setInterval(() => {
+  if (!tunnelAvailable) {
+    try {
+      const st = fs.readFileSync(TUNNEL_STATUS_FILE, 'utf8').trim();
+      if (st === 'connected') {
+        tunnelAvailable = true;
+        log('[tunnel] WireGuard tunnel connected (periodic check) — routing outbound traffic through Proton VPN');
+      }
+    } catch(e) {}
+  }
+}, TUNNEL_CHECK_INTERVAL);
+
+// HTTP CONNECT proxy through the local WireGuard tunnel
+// Sends a standard HTTP CONNECT request (RFC 7231) — same mechanism HTTPS uses
+function tunnelHttpConnect(targetHost, targetPort, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    if (!tunnelAvailable) return reject(new Error('Tunnel not available'));
+    const s = net.createConnection({ host: TUNNEL_HOST, port: TUNNEL_PORT }, () => {
+      s.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`);
+    });
+    let responded = false;
+    const cleanup = () => { s.removeAllListeners(); s.destroy(); };
+    s.setTimeout(timeout, () => { cleanup(); reject(new Error('HTTP CONNECT timeout')); });
+    s.once('data', (data) => {
+      responded = true;
+      if (data.toString().startsWith('HTTP/1.1 2') || data.toString().startsWith('HTTP/1.0 2')) {
+        resolve(s);
+      } else {
+        cleanup();
+        reject(new Error('HTTP CONNECT rejected: ' + data.toString().split('\r\n')[0]));
+      }
+    });
+    s.on('error', (err) => { if (!responded) { cleanup(); reject(err); } });
+    s.on('close', () => { if (!responded) { cleanup(); reject(new Error('HTTP CONNECT closed')); } });
+  });
+}
+
 // WhatsApp domains that need routing through Cloudflare Worker
 // (HF Spaces blocks direct connections to WhatsApp servers)
 const WHATSAPP_DOMAINS = [
@@ -84,10 +154,22 @@ const domainMatch = (h, list) => {
 const needsProxy = (h) => !isInternal(h) && domainMatch(h, SOCKS5_DOMAINS);
 
 // SOCKS5 connect helper
-// Connect through proxy: tries SOCKS5 or HTTP CONNECT, falls back to direct
+// Connect through proxy: tries local WireGuard tunnel first, then SOCKS5, HTTP CONNECT, direct
 function proxyConnect(targetHost, targetPort, timeout = 30000) {
+  // Step 1: Try local WireGuard tunnel for ALL external traffic
+  // This routes through Proton VPN via HTTP CONNECT (standard HTTPS tunneling)
+  if (!isInternal(targetHost) && checkTunnel()) {
+    return tunnelHttpConnect(targetHost, targetPort, timeout)
+      .catch(() => {
+        // Tunnel failed — fall through to SOCKS5/direct routing
+        return proxyConnectFallback(targetHost, targetPort, timeout);
+      });
+  }
+  return proxyConnectFallback(targetHost, targetPort, timeout);
+}
+
+function proxyConnectFallback(targetHost, targetPort, timeout = 30000) {
   if (!SOCKS5_HOST) {
-    // No proxy configured — direct TCP
     return directConnect(targetHost, targetPort, timeout);
   }
 
@@ -98,7 +180,7 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
     return socks5Connect(targetHost, targetPort, timeout)
       .catch(() => {
         log(`SOCKS5 failed for ${targetHost}:${targetPort}, trying HTTP CONNECT`);
-        return httpConnectProxy(targetHost, targetPort, timeout);
+        return socksHttpConnectProxy(targetHost, targetPort, timeout);
       })
       .catch(() => {
         const err = new Error(`FATAL: All proxy methods failed for ${targetHost}:${targetPort} - no direct fallback`);
@@ -116,7 +198,6 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
           const dbgMsg = e?.message || 'unknown error';
           log(`[dbg] wsConnectProxy failed: "${dbgMsg}" (target=${targetHost}:${targetPort}, remaining=${n-1})`);
           if (n <= 1) throw e;
-          // Exponential backoff: 1s, 2s, 4s...
           const delay = Math.min(1000 * Math.pow(2, 3 - n), 8000);
           return new Promise(r => setTimeout(r, delay)).then(() => attempt(n - 1));
         });
@@ -124,10 +205,8 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
     return attempt(attempts);
   };
 
-  
   // WebSocket proxy (for wss:// or ws:// URLs)
   if (pUrl.startsWith('wss') || pUrl.startsWith('ws://')) {
-    // FIXED: Skip multiplexed pool — wg-proxy relay only supports legacy format
     return wsRetry(3)
       .catch((e) => {
         log(`[dbg] wsConnectProxy all retries failed: "${e?.message}"`);
@@ -147,7 +226,7 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
           return wsRetry(3);
         })
         .catch(() => tlsConnectProxy(targetHost, targetPort, timeout))
-        .catch(() => httpConnectProxy(targetHost, targetPort, timeout))
+        .catch(() => socksHttpConnectProxy(targetHost, targetPort, timeout))
         .catch((e2) => {
           const err = new Error(`FATAL: All proxy methods failed for ${targetHost}:${targetPort} - no direct fallback`);
           log(err.message);
@@ -158,16 +237,14 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
   return wsRetry(3)
     .catch((e) => {
       log(`[dbg] wsConnectProxy all retries failed: "${e?.message}"`);
-      // Try TLS CONNECT fallback, then HTTP CONNECT
       return tlsConnectProxy(targetHost, targetPort, timeout)
-        .catch(() => httpConnectProxy(targetHost, targetPort, timeout))
+        .catch(() => socksHttpConnectProxy(targetHost, targetPort, timeout))
         .catch((e2) => {
           const err = new Error(`FATAL: All proxy methods failed for ${targetHost}:${targetPort} - no direct fallback`);
           log(err.message);
           throw err;
         });
     });
-
 }
 
 function directConnect(targetHost, targetPort, timeout = 30000) {
@@ -1248,7 +1325,7 @@ function discordWsConnect(targetHost, targetPort, wsProxyUrl, timeout = 45000) {
 }
 
 // HTTP CONNECT proxy fallback
-function httpConnectProxy(targetHost, targetPort, timeout = 30000) {
+function socksHttpConnectProxy(targetHost, targetPort, timeout = 30000) {
   return new Promise((resolve, reject) => {
     if (!SOCKS5_HOST) return reject(new Error('No proxy configured'));
     const s = net.createConnection({ host: SOCKS5_HOST, port: SOCKS5_PORT });
@@ -1272,6 +1349,9 @@ function httpConnectProxy(targetHost, targetPort, timeout = 30000) {
 applyFetchPatch();
 
 log(`SOCKS5 routing: ${SOCKS5_DOMAINS.join(", ")} → ${SOCKS5_HOST}:${SOCKS5_PORT}`);
+if (tunnelAvailable) {
+  log(`WireGuard tunnel: HTTP CONNECT ${TUNNEL_HOST}:${TUNNEL_PORT} — encrypting outbound traffic`);
+}
 log(`wsConnectProxy: using Duplex stream bridge`);
 log(`Cloudflare Worker proxy available for Telegram: ${CF_PROXY_URL || 'not configured'}`);
 log(`DNS override: ${Object.keys(DNS_OVERRIDE).join(", ")}`);
