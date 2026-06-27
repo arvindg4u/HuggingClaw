@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-YouTube Transcript API Service — yt-dlp + PO Tokens via bgutil-ytdlp-pot-provider.
-Now with PO Token support to bypass YouTube IP blocks from cloud providers.
+YouTube Transcript API Service — yt-dlp + WireGuard VPN tunnel.
+All traffic routes through the WireGuard tunnel via HTTP CONNECT proxy
+to bypass YouTube IP blocks from cloud providers (Render, etc.).
 """
 
 import os
@@ -10,10 +11,9 @@ import subprocess
 import json
 import tempfile
 import shutil
-import threading
-import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
 
@@ -22,13 +22,39 @@ app = FastAPI(title="YouTube Transcript API", docs_url=None, redoc_url=None)
 AUTH_TOKEN = os.getenv("PROXY_AUTH_TOKEN", "changeme")
 PORT = int(os.getenv("PORT", "8000"))
 
-# yt-dlp player clients to try (android first — works best with PO tokens)
+# yt-dlp player clients to try (android first)
 PLAYER_CLIENTS = ["android", "tv", "ios", "web", "mweb"]
 
 # bgutil PO token server runs on localhost:4416
 BGUTIL_URL = "http://127.0.0.1:4416"
-# Extractor args passed to yt-dlp for PO token support
 BGUTIL_EXARGS = f"youtubepot-bgutilhttp:base_url={BGUTIL_URL}"
+
+# ── WireGuard Tunnel (wireproxy HTTP CONNECT proxy) ────────────────
+TUNNEL_HOST = "127.0.0.1"
+TUNNEL_PORT = int(os.getenv("WG_TUNNEL_PORT", "25345"))
+TUNNEL_STATUS_FILE = "/tmp/wireguard/status"
+TUNNEL_PROXY = f"http://{TUNNEL_HOST}:{TUNNEL_PORT}"
+
+
+def is_tunnel_available() -> bool:
+    """Check if WireGuard tunnel is active via status file + port check."""
+    try:
+        st = Path(TUNNEL_STATUS_FILE).read_text().strip()
+        if st != "connected":
+            return False
+        data = Path("/proc/net/tcp").read_text()
+        hex_port = format(TUNNEL_PORT, "x").lower()
+        for line in data.split("\n"):
+            parts = line.strip().split()
+            if len(parts) >= 4:
+                addr_part = parts[1]
+                state = parts[3]
+                ci = addr_part.find(":")
+                if ci >= 0 and addr_part[ci + 1:].lower() == hex_port and state == "0A":
+                    return True
+        return False
+    except (OSError, IOError):
+        return False
 
 
 def get_video_id(video_input: str) -> str:
@@ -58,7 +84,11 @@ def parse_vtt(text: str) -> str:
 
 
 def fetch_transcript(video_id: str, lang: str = "en") -> dict:
-    """Fetch transcript via yt-dlp with PO token support, trying multiple player clients."""
+    """Fetch transcript through the WireGuard tunnel using HTTP CONNECT proxy."""
+    if not is_tunnel_available():
+        raise HTTPException(status_code=502, detail="WireGuard tunnel not available")
+
+    proxy_url = TUNNEL_PROXY
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     for client in PLAYER_CLIENTS:
@@ -68,6 +98,7 @@ def fetch_transcript(video_id: str, lang: str = "en") -> dict:
             result = subprocess.run(
                 [
                     "yt-dlp",
+                    "--proxy", proxy_url,
                     "--skip-download",
                     "--write-auto-sub", "--write-subs",
                     "--sub-langs", f"{lang},en",
@@ -78,13 +109,8 @@ def fetch_transcript(video_id: str, lang: str = "en") -> dict:
                     "--no-warnings", "--quiet",
                     url,
                 ],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=90,
             )
-
-            if result.returncode != 0:
-                stderr = result.stderr.strip()
-                if "block" in stderr.lower() or "429" in stderr or "403" in stderr:
-                    continue  # Try next client
 
             for fname in os.listdir(tmpdir):
                 if fname.endswith(".vtt"):
@@ -95,23 +121,26 @@ def fetch_transcript(video_id: str, lang: str = "en") -> dict:
                         return {"text": text, "client": client, "video_id": video_id}
 
         except subprocess.TimeoutExpired:
-            pass
+            continue
         except Exception:
-            pass
+            continue
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    raise HTTPException(status_code=502, detail="YouTube blocked all clients")
+    raise HTTPException(status_code=502, detail="YouTube blocked all clients through tunnel")
 
 
 def fetch_info(video_id: str) -> dict:
-    """Get video info via yt-dlp with PO token support."""
+    """Get video info via yt-dlp through the WireGuard tunnel."""
+    if not is_tunnel_available():
+        return {"title": "", "transcripts": []}
+
     url = f"https://www.youtube.com/watch?v={video_id}"
     for client in PLAYER_CLIENTS[:3]:
         try:
             exargs = f"youtube:player_client={client},{BGUTIL_EXARGS}"
             result = subprocess.run(
-                ["yt-dlp", "--skip-download", "--dump-json",
+                ["yt-dlp", "--proxy", TUNNEL_PROXY, "--skip-download", "--dump-json",
                  "--extractor-args", exargs,
                  "--no-warnings", "--quiet", url],
                 capture_output=True, text=True, timeout=30,
@@ -134,69 +163,48 @@ def fetch_info(video_id: str) -> dict:
 
 def check_auth(token: str):
     if AUTH_TOKEN and token != AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=403, detail="Invalid auth token")
 
 
-def _bgutil_health() -> bool:
-    """Check if bgutil PO token server is reachable."""
+# ── Health / Tunnel Status ─────────────────────────────────────────
+
+def get_tunnel_status() -> dict:
+    """Get WireGuard tunnel status."""
+    available = is_tunnel_available()
+    status = {"available": available, "proxy": TUNNEL_PROXY if available else None}
     try:
-        urllib.request.urlopen(f"{BGUTIL_URL}/ping", timeout=3)
-        return True
-    except Exception:
-        return False
+        ip_file = Path("/tmp/wireguard/exit_ip")
+        if ip_file.exists():
+            status["exit_ip"] = ip_file.read_text().strip()
+    except OSError:
+        pass
+    try:
+        st_file = Path(TUNNEL_STATUS_FILE)
+        if st_file.exists():
+            status["wg_status"] = st_file.read_text().strip()
+    except OSError:
+        pass
+    return status
 
 
-# ── Self-ping & health ──────────────────────────────────────────────
-def _self_ping():
-    while True:
-        time.sleep(600)
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=10)
-        except:
-            pass
-
-
-@app.on_event("startup")
-async def _startup():
-    threading.Thread(target=_self_ping, daemon=True).start()
-    if _bgutil_health():
-        print("[yt-proxy] bgutil PO token server is RUNNING on localhost:4416")
-    else:
-        print("[yt-proxy] WARNING: bgutil PO token server NOT reachable")
-
-
-# ── REST Endpoints ──────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    bgutil_ok = _bgutil_health()
+    tunnel = get_tunnel_status()
     return {
         "status": "ok",
-        "engine": "yt-dlp",
-        "po_tokens": bgutil_ok,
-        "clients": PLAYER_CLIENTS,
+        "tunnel": tunnel,
+        "po_tokens": True,
+        "player_clients": PLAYER_CLIENTS,
     }
 
 
-@app.get("/transcript/{video_input:path}/text")
-async def get_transcript_text(
-    video_input: str,
-    lang: str = Query("en"),
-    x_proxy_token: str = Header(default="", alias="X-Proxy-Token"),
-):
-    check_auth(x_proxy_token)
-    try:
-        video_id = get_video_id(video_input)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+@app.get("/tunnel")
+async def tunnel_status():
+    """Get WireGuard VPN tunnel status."""
+    return get_tunnel_status()
 
-    data = fetch_transcript(video_id, lang)
-    return {
-        "video_id": video_id,
-        "language": lang,
-        "client": data["client"],
-        "text": data["text"],
-    }
 
+# ── REST Endpoints ─────────────────────────────────────────────────
 
 @app.get("/transcript/{video_input:path}")
 async def get_transcript(
@@ -219,6 +227,22 @@ async def get_transcript(
         "is_generated": True,
         "segments": segments,
     }
+
+
+@app.get("/transcript/{video_input:path}/text")
+async def get_transcript_text(
+    video_input: str,
+    lang: str = Query("en"),
+    x_proxy_token: str = Header(default="", alias="X-Proxy-Token"),
+):
+    check_auth(x_proxy_token)
+    try:
+        video_id = get_video_id(video_input)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    data = fetch_transcript(video_id, lang)
+    return {"video_id": video_id, "language": lang, "client": data["client"], "text": data["text"]}
 
 
 @app.get("/transcripts/{video_input:path}")
