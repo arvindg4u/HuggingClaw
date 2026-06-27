@@ -1745,8 +1745,9 @@ start_background_sync_once() {
 # Compliant use: protect LLM API calls in transit — not for bypassing
 # platform restrictions, spam, abuse, or any TOS-violating activity.
 start_protonvpn_vpn() {
-  # Only activate if WireGuard configs are provided
-  if [ -z "${PROTONVPN_WG_CONFIGS:-}" ]; then
+  # Disable with PROTONVPN_DISABLED=true (built-in configs enabled by default)
+  if hc_is_true "${PROTONVPN_DISABLED:-}"; then
+    echo "[hc-vpn] Proton VPN disabled via PROTONVPN_DISABLED."
     return 0
   fi
 
@@ -1765,35 +1766,31 @@ start_protonvpn_vpn() {
     return 0
   fi
 
-  echo "[hc-vpn] PROTONVPN_WG_CONFIGS found — starting WireGuard tunnel..."
-  echo "[hc-vpn] This encrypts outbound API traffic through Proton VPN."
-  echo "[hc-vpn] Uses standard WireGuard + HTTP CONNECT (HTTPS tunneling)."
+  echo "[hc-vpn] Starting Proton VPN WireGuard tunnel (17 built-in configs)..."
+  echo "[hc-vpn] Encrypts outbound API traffic via standard WireGuard tunnel."
+  echo "[hc-vpn] Uses HTTP CONNECT (standard HTTPS tunnel, not SOCKS5)."
 
   mkdir -p /home/node/.protonvpn
 
-  # Quick check
   local check
   check=$(/home/node/app/protonvpn-manager.sh check 2>/dev/null) || true
   if echo "$check" | grep -q "wireproxy: missing"; then
-    echo "[hc-vpn] wireproxy not available — skipping VPN."
+    echo "[hc-vpn] wireproxy not available."
     echo "skipped" > /home/node/.protonvpn/status
     return 0
   fi
 
-  # Launch manager in background
   /home/node/app/protonvpn-manager.sh service >> /tmp/protonvpn-manager.log 2>&1 &
   PROTONVPN_PID=$!
 
-  # Wait up to 10s for connection
-  echo "[hc-vpn] Waiting for tunnel (up to 10s)..."
+  echo "[hc-vpn] Tunnel starting (up to 10s)..."
   local i=0
   while [ $i -lt 5 ]; do
     if [ -f /home/node/.protonvpn/status ]; then
       local st2
       st2=$(cat /home/node/.protonvpn/status 2>/dev/null)
       if [ "$st2" = "connected" ]; then
-        echo "[hc-vpn] Tunnel established (HTTP CONNECT on :25345)."
-        # Export proxy vars for child processes
+        echo "[hc-vpn] Tunnel active on HTTP CONNECT :25345."
         export HTTP_PROXY="http://127.0.0.1:25345"
         export HTTPS_PROXY="http://127.0.0.1:25345"
         export http_proxy="http://127.0.0.1:25345"
