@@ -206,7 +206,7 @@ async def tunnel_status():
 
 # ── REST Endpoints ─────────────────────────────────────────────────
 
-@app.get("/transcript/{video_input:path}")
+@app.get("/transcript/{video_input}")
 async def get_transcript(
     video_input: str,
     lang: str = Query("en"),
@@ -229,7 +229,7 @@ async def get_transcript(
     }
 
 
-@app.get("/transcript/{video_input:path}/text")
+@app.get("/transcript/{video_input}/text")
 async def get_transcript_text(
     video_input: str,
     lang: str = Query("en"),
@@ -245,7 +245,7 @@ async def get_transcript_text(
     return {"video_id": video_id, "language": lang, "client": data["client"], "text": data["text"]}
 
 
-@app.get("/transcripts/{video_input:path}")
+@app.get("/transcripts/{video_input}")
 async def list_transcripts(
     video_input: str,
     x_proxy_token: str = Header(default="", alias="X-Proxy-Token"),
