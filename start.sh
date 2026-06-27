@@ -1751,7 +1751,6 @@ start_protonvpn_vpn() {
   if [ -n "${PROTONVPN_PID:-}" ] && kill -0 "$PROTONVPN_PID" 2>/dev/null; then
     return 0
   fi
-  # Also check by status file
   if [ -f /home/node/.protonvpn/status ]; then
     local st
     st=$(cat /home/node/.protonvpn/status 2>/dev/null)
@@ -1760,34 +1759,48 @@ start_protonvpn_vpn() {
     fi
   fi
 
-  echo "[hc-vpn] PROTONVPN_USERNAME is set — starting VPN manager..."
-  echo "[hc-vpn] Compliance: VPN encrypts outbound API traffic only."
-  echo "[hc-vpn] Do NOT use for bypassing platform restrictions or abuse."
-
   if [ ! -f /home/node/app/protonvpn-manager.sh ]; then
     echo "[hc-vpn] protonvpn-manager.sh not found — skipping."
     return 0
   fi
 
+  echo "[hc-vpn] Checking environment for VPN support..."
+
+  # Fast capability check (runs instantly, no waiting)
+  local cap_check
+  cap_check=$(sudo /home/node/app/protonvpn-manager.sh check 2>/dev/null) || true
+  if echo "$cap_check" | grep -q "capabilities: missing"; then
+    echo "[hc-vpn] VPN cannot run here — missing NET_ADMIN / TUN device."
+    echo "[hc-vpn] Works on: local Docker with --cap-add=NET_ADMIN, Render, etc."
+    echo "[hc-vpn] Continuing without VPN."
+    mkdir -p /home/node/.protonvpn 2>/dev/null || true
+    echo "skipped (no-capabilities)" > /home/node/.protonvpn/status 2>/dev/null || true
+    return 0
+  fi
+
+  echo "[hc-vpn] PROTONVPN_USERNAME is set — starting VPN manager..."
+  echo "[hc-vpn] Compliance: VPN encrypts outbound API traffic only."
+  echo "[hc-vpn] Do NOT use for bypassing platform restrictions or abuse."
+
   # Launch in background
   sudo /home/node/app/protonvpn-manager.sh service >> /tmp/protonvpn-manager.log 2>&1 &
   PROTONVPN_PID=$!
 
-  # Wait a few seconds for initial connection
-  echo "[hc-vpn] Waiting for initial connection..."
-  for i in $(seq 1 30); do
+  # Brief wait (10s max) then continue either way
+  echo "[hc-vpn] Waiting for initial connection (up to 10s)..."
+  for i in $(seq 1 5); do
     if [ -f /home/node/.protonvpn/status ]; then
       local vpn_status
       vpn_status=$(cat /home/node/.protonvpn/status 2>/dev/null)
       if [ "$vpn_status" = "connected" ]; then
-        echo "[hc-vpn] Connected successfully."
+        echo "[hc-vpn] Connected."
         return 0
       fi
     fi
     sleep 2
   done
 
-  echo "[hc-vpn] VPN connection may not be ready yet — continuing startup."
+  echo "[hc-vpn] VPN still starting — continuing in background."
 }
 
 
