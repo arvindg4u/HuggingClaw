@@ -1771,7 +1771,6 @@ start_protonvpn_vpn() {
   fi
 
   mkdir -p /home/node/.protonvpn
-  rm -f /home/node/.protonvpn/status
 
   # Launch manager in background
   /home/node/app/protonvpn-manager.sh service >> /tmp/protonvpn-manager.log 2>&1 &
@@ -1888,6 +1887,7 @@ while true; do
 
   
 # ── Proton VPN (optional, opt-in) ──
+rm -f /home/node/.protonvpn/status
 start_protonvpn_vpn
 
 # ── Ensure pre-bundled plugins survive backup restores ──
