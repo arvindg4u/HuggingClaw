@@ -223,38 +223,51 @@ run_service() {
       write_health "ok"
 
       # ── Inner loop: health checks + rotation timer ──
-      local inner_seconds=0
+      local elapsed_seconds=0
       local max_seconds=$((ROTATE * 60))
 
-      while [ $inner_seconds -lt $max_seconds ]; do
-        sleep "$HEALTH_INTERVAL"
-        inner_seconds=$((inner_seconds + HEALTH_INTERVAL))
-        local elapsed_minutes=$((inner_seconds / 60))
+      while [ $elapsed_seconds -lt $max_seconds ]; do
+        sleep 5
+        elapsed_seconds=$((elapsed_seconds + 5))
 
-        # 1. Check wireproxy process is alive
-        if ! wireproxy_alive; then
-          warn "wireproxy process died (elapsed ${elapsed_minutes}m). Rotating..."
-          write_health "dead (process)"
+        # Check for manual rotate flag (from dashboard button)
+        if [ -f /tmp/protonvpn-force-rotate ]; then
+          rm -f /tmp/protonvpn-force-rotate
+          warn "Manual rotation requested. Rotating..."
+          write_health "rotating (manual)"
+          write_status "rotating"
           break
         fi
 
-        # 2. Check tunnel connectivity
-        if health_check; then
-          if [ "$consecutive_failures" -gt 0 ]; then
-            log "Health recovered after ${consecutive_failures} failure(s)."
-            consecutive_failures=0
-            write_health "ok"
-            write_status "connected"
-          fi
-        else
-          consecutive_failures=$((consecutive_failures + 1))
-          write_health "fail (${consecutive_failures}/${HEALTH_THRESHOLD})"
-          warn "Health check ${consecutive_failures}/${HEALTH_THRESHOLD} failed (elapsed ${elapsed_minutes}m)."
+        # Run health checks at configured interval
+        if [ $((elapsed_seconds % HEALTH_INTERVAL)) -eq 0 ]; then
+          local elapsed_minutes=$((elapsed_seconds / 60))
 
-          if [ "$consecutive_failures" -ge "$HEALTH_THRESHOLD" ]; then
-            warn "Health threshold reached! Rotating to next peer..."
-            write_health "rotating (threshold)"
+          # 1. Check wireproxy process is alive
+          if ! wireproxy_alive; then
+            warn "wireproxy process died (elapsed ${elapsed_minutes}m). Rotating..."
+            write_health "dead (process)"
             break
+          fi
+
+          # 2. Check tunnel connectivity
+          if health_check; then
+            if [ "$consecutive_failures" -gt 0 ]; then
+              log "Health recovered after ${consecutive_failures} failure(s)."
+              consecutive_failures=0
+              write_health "ok"
+              write_status "connected"
+            fi
+          else
+            consecutive_failures=$((consecutive_failures + 1))
+            write_health "fail (${consecutive_failures}/${HEALTH_THRESHOLD})"
+            warn "Health check ${consecutive_failures}/${HEALTH_THRESHOLD} failed (elapsed ${elapsed_minutes}m)."
+
+            if [ "$consecutive_failures" -ge "$HEALTH_THRESHOLD" ]; then
+              warn "Health threshold reached! Rotating to next peer..."
+              write_health "rotating (threshold)"
+              break
+            fi
           fi
         fi
       done

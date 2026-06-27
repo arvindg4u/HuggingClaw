@@ -260,6 +260,34 @@ function formatUptime(ms) {
   return `${m}m`;
 }
 
+
+// ── VPN Status ──
+const VPN_STATE_DIR = "/home/node/.protonvpn";
+
+function readVpnStatus() {
+  try {
+    const status = fs.readFileSync(VPN_STATE_DIR + "/status", "utf8").trim();
+    const health = fs.readFileSync(VPN_STATE_DIR + "/health", "utf8").trim();
+    let tunnelIp = "";
+    try { tunnelIp = fs.readFileSync(VPN_STATE_DIR + "/tunnel_ip", "utf8").trim(); } catch {}
+    return { status: status || "unknown", health: health || "unknown", tunnelIp };
+  } catch {
+    return { status: "inactive", health: "unknown", tunnelIp: "" };
+  }
+}
+
+function triggerVpnRotate() {
+  try {
+    fs.writeFileSync("/tmp/protonvpn-force-rotate", "1");
+    try {
+      const pid = fs.readFileSync(VPN_STATE_DIR + "/run/pid", "utf8").trim();
+      if (pid) process.kill(parseInt(pid), "SIGTERM");
+    } catch {}
+    return true;
+  } catch {
+    return false;
+  }
+}
 function escapeHtml(v) {
   return String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
@@ -397,6 +425,7 @@ function renderDashboard(data) {
   tiles.push(
     tile({ title: "Backup", value: badge(syncStatus.toUpperCase(), syncTone), detail: escapeHtml(data.sync?.message || "No status yet"), tone: syncTone, meta: data.sync?.timestamp ? `<span class="local-time" data-iso="${data.sync.timestamp}"></span>` : "" }),
     tile({ title: "Keep Awake", value: badge(kaStatus.toUpperCase(), kaTone), detail: kaConf ? `Pinging <code>${escapeHtml(data.keepalive?.targetUrl || "/health")}</code>` : "Not configured", tone: kaTone }),
+    tile({ title: "VPN", value: badge(data.vpn?.status === "connected" ? "Connected" : data.vpn?.status || "Inactive", data.vpn?.status === "connected" ? "ok" : "warn"), detail: (data.vpn?.tunnelIp ? `Exit IP: <code>${escapeHtml(data.vpn.tunnelIp)}</code>` : "No tunnel active") + (data.vpn?.health && data.vpn.health !== "ok" ? ` · Health: ${escapeHtml(data.vpn.health)}` : ""), tone: data.vpn?.status === "connected" ? "ok" : "warn", meta: `<button onclick="rotateVpn()" style="background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:6px 12px;font-size:.78rem;cursor:pointer;margin-top:4px">🔄 Rotate IP</button> <span id="vpn-eta" style="color:var(--muted);font-size:.72rem"></span>` }),
   );
 
   if (JUPYTER_ENABLED) {
@@ -516,7 +545,76 @@ function renderDashboard(data) {
     document.body.appendChild(notice);
     setTimeout(() => { window.location.replace(HF_SPACE_URL); }, 300);
   }
-</script>
+// ── VPN Live Status + Rotate ──
+function getVpnTile() {
+  // Find the VPN tile by its title text
+  const articles = document.querySelectorAll(".tile");
+  for (const a of articles) {
+    const title = a.querySelector(".tile-title");
+    if (title && title.textContent.trim() === "VPN") return a;
+  }
+  return null;
+}
+
+async function refreshVpnStatus() {
+  try {
+    const r = await fetch("/api/vpn/status", { cache: "no-store" });
+    if (!r.ok) return;
+    const vpn = await r.json();
+    const tile = getVpnTile();
+    if (!tile) return;
+    const badgeEl = tile.querySelector(".badge");
+    const detailEl = tile.querySelector(".tile-detail");
+    if (badgeEl) {
+      const connected = vpn.status === "connected";
+      badgeEl.textContent = connected ? "Connected" : (vpn.status || "Inactive");
+      badgeEl.className = "badge " + (connected ? "ok" : "warn");
+    }
+    if (detailEl) {
+      const ipHtml = vpn.tunnelIp ? "Exit IP: <code>" + vpn.tunnelIp + "</code>" : "No tunnel active";
+      const healthHtml = (vpn.health && vpn.health !== "ok") ? " &middot; Health: " + vpn.health : "";
+      detailEl.innerHTML = ipHtml + healthHtml;
+    }
+  } catch {}
+}
+
+async function rotateVpn() {
+  const tile = getVpnTile();
+  if (!tile) return;
+  const meta = tile.querySelector(".tile-meta");
+  const btn = meta ? meta.querySelector("button") : null;
+  const eta = document.getElementById("vpn-eta");
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = "⏳ Rotating...";
+  if (eta) eta.textContent = "Switching to next peer...";
+  try {
+    await fetch("/api/vpn/rotate", { method: "POST", cache: "no-store" });
+    setTimeout(async function() {
+      for (let i = 0; i < 12; i++) {
+        await new Promise(r => setTimeout(r, 5000));
+        await refreshVpnStatus();
+        const detailEl = tile.querySelector(".tile-detail");
+        const ipMatch = detailEl ? detailEl.textContent.match(/Exit IP: (\S+)/) : null;
+        if (ipMatch && ipMatch[1] && ipMatch[1] !== "—") {
+          if (eta) eta.textContent = "IP changed to " + ipMatch[1];
+          break;
+        }
+        if (i === 11 && eta) eta.textContent = "Still connecting...";
+      }
+      btn.disabled = false;
+      btn.textContent = "🔄 Rotate IP";
+    }, 2000);
+  } catch {
+    btn.disabled = false;
+    btn.textContent = "🔄 Rotate IP";
+    if (eta) eta.textContent = "Failed";
+  }
+}
+
+// Auto-refresh VPN status every 10s
+setInterval(refreshVpnStatus, 10000);
+setTimeout(refreshVpnStatus, 1000);
 </body></html>`;
 }
 
@@ -684,6 +782,20 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ model: LLM_MODEL, uptime: formatUptime(Date.now() - startTime), gatewayReady, jupyterReady, sync: getSyncStatus(), whatsapp: readGuardianStatus(), keepalive: getKeepaliveStatus() }));
   }
+  
+  // VPN status endpoint
+  if (pathname === "/api/vpn/status") {
+    const vpn = readVpnStatus();
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    return res.end(JSON.stringify(vpn));
+  }
+  
+  // VPN rotate endpoint — signal manager to switch to next WireGuard config
+  if (pathname === "/api/vpn/rotate" && req.method === "POST") {
+    const ok = triggerVpnRotate();
+    res.writeHead(ok ? 200 : 500, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ rotated: ok, message: ok ? "Rotating to next WireGuard peer..." : "Failed to trigger rotation" }));
+  }
 
   // Private space redirect — send users to the authenticated HF Spaces page.
   // Works for both direct .hf.space links AND programmatic shares.
@@ -809,7 +921,7 @@ const server = http.createServer(async (req, res) => {
       JUPYTER_ENABLED ? probePort(JUPYTER_HOST, JUPYTER_PORT, `${JUPYTER_BASE}/login`) : Promise.resolve(false),
     ]);
     res.writeHead(200, { "Content-Type": "text/html" });
-    return res.end(renderDashboard({ uptimeHuman: formatUptime(Date.now() - startTime), gatewayReady, jupyterReady, sync: getSyncStatus(), whatsapp: readGuardianStatus(), keepalive: getKeepaliveStatus() }));
+    return res.end(renderDashboard({ uptimeHuman: formatUptime(Date.now() - startTime), gatewayReady, jupyterReady, sync: getSyncStatus(), whatsapp: readGuardianStatus(), keepalive: getKeepaliveStatus(), vpn: readVpnStatus() }));
   }
 
   // JupyterLab terminal
