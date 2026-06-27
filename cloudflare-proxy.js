@@ -127,14 +127,7 @@ function proxyConnect(targetHost, targetPort, timeout = 30000) {
   
   // WebSocket proxy (for wss:// or ws:// URLs)
   if (pUrl.startsWith('wss') || pUrl.startsWith('ws://')) {
-    // Try multiplexed pool first, fall back to legacy retry
-    const pool = getMultiplexedPool(pUrl);
-    if (pool) {
-      return pool.connectTunnel(targetHost, targetPort, timeout).catch((e) => {
-        log(`[dbg] multiplexed pool failed: "${e?.message}", falling back to legacy`);
-        return wsRetry(3);
-      });
-    }
+    // FIXED: Skip multiplexed pool — wg-proxy relay only supports legacy format
     return wsRetry(3)
       .catch((e) => {
         log(`[dbg] wsConnectProxy all retries failed: "${e?.message}"`);
@@ -328,7 +321,7 @@ https.request = function(...args) {
       })
       .catch(cbOnce);
   };
-    nopts.agent = httpsKeepAliveAgent;
+    // nopts.agent = httpsKeepAliveAgent; // FIXED
   return origHttps.call(this, nopts, cb);
 };
 
@@ -1036,6 +1029,7 @@ class MultiplexedPool {
 
   // Create a multiplexed tunnel. Returns a Duplex stream.
   connectTunnel(targetHost, targetPort, timeout = 45000) {
+    const self = this;
     return new Promise((resolve, reject) => {
       const connId = this._getNextConnId();
       const duplex = new Duplex({
@@ -1070,7 +1064,7 @@ class MultiplexedPool {
                 pending.ws.send(JSON.stringify({ type: 'disconnect', connId: pending.connId }));
               } catch(e) {}
             }
-            pool.pending.delete(pending.connId);
+            self.pending.delete(pending.connId);
           }
           callback(err);
         }
@@ -1092,7 +1086,7 @@ class MultiplexedPool {
         timer: setTimeout(() => {
           if (!pending.ready) {
             pending.reject(new Error('multiplexed connect timeout'));
-            pool.pending.delete(connId);
+            self.pending.delete(connId);
           }
         }, timeout)
       };
