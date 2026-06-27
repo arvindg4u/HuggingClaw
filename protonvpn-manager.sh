@@ -1,20 +1,10 @@
 #!/bin/bash
 # ════════════════════════════════════════════════════════════════
 # 🛡️  Proton VPN Manager — WireGuard tunnel via wireproxy.
-#     Runs entirely in userspace — no TUN/NET_ADMIN needed.
-#     Works on HF Spaces, Render, any Docker environment.
+#     Userspace — no TUN/NET_ADMIN needed. Works on HF Spaces.
 #
-#     17 Proton VPN FREE WireGuard configs built-in.
-#     No manual setup required — just deploy and it works.
-#
-#     Uses HTTP CONNECT (standard HTTPS tunneling) to expose
-#     the encrypted WireGuard tunnel — not a SOCKS5 proxy.
-#     HTTP CONNECT is the same mechanism every HTTPS client
-#     uses natively (RFC 7231).
-#
-# Compliance: WireGuard is a VPN encryption protocol. This
-# encrypts the app's own API calls in transit. It does NOT
-# bypass platform restrictions or engage in abuse.
+#     17 built-in Proton VPN FREE WireGuard configs.
+#     Uses HTTP CONNECT (standard HTTPS tunnel, not SOCKS5).
 # ════════════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -23,16 +13,14 @@ log()  { echo "[hc-vpn] $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 err()  { echo "[hc-vpn] ERROR: $*" >&2; }
 warn() { echo "[hc-vpn] WARNING: $*" >&2; }
 
-# ── Config ──
-ROTATE_INTERVAL="${PROTONVPN_ROTATE_INTERVAL:-30}"
-WIREPROXY="${WIREPROXY_BIN:-/usr/local/bin/wireproxy}"
+ROTATE="${PROTONVPN_ROTATE_INTERVAL:-30}"
 TUNNEL_PORT=25345
 STATE_DIR="/home/node/.protonvpn"
 STATUS_FILE="${STATE_DIR}/status"
+WIREPROXY="/usr/local/bin/wireproxy"
+WIREPROXY_TMP="/tmp/wireproxy"
 
 # ── 17 built-in Proton VPN FREE WireGuard configs ──
-# Each entry: privateKey|peerPublicKey|endpoint
-# Source: wg-proxy/render-env.txt (Proton VPN free tier servers)
 declare -a WG_PEERS=(
   "SH3bUChOJ4P7h93xjW8bz/CqeKrdl/9Z4J1EXwH4RUE=|Uqp1/VJ/Lz2VoN/2D0HEG7G8WDxLJm7+JNC5KZrUREw=|149.88.30.88:51820"
   "oDs/VVhAgFelbHPBGDFo+SiJC1MeVlhftJWXNRj9rGY=|oGVahl/rkt0i22DILrVpPSmYZmqcmSup/HQ/upVf2Vg=|138.199.35.120:51820"
@@ -53,111 +41,179 @@ declare -a WG_PEERS=(
   "IInph6mqE0DmcpVvdsX5K5kCAqimzgRhqB+fDrJNmXg=|qwoWn5tpqguIWdYpsIjUIMnrMT0dtxnrKwSUB4ZvMTA=|151.243.141.160:51820"
 )
 
-TOTAL_PEERS=${#WG_PEERS[@]}
+TOTAL=${#WG_PEERS[@]}
 
-# ── Download wireproxy (if not already installed) ──
-download_wireproxy() {
+# ── Ensure wireproxy binary is available ──
+ensure_wireproxy() {
   [ -x "$WIREPROXY" ] && return 0
-  log "Downloading wireproxy (userspace WireGuard)..."
+  [ -x "$WIREPROXY_TMP" ] && { ln -sf "$WIREPROXY_TMP" "$WIREPROXY" 2>/dev/null; return 0; }
+
   local arch
   arch=$(uname -m)
   case "$arch" in x86_64|amd64) arch="amd64" ;; aarch64|arm64) arch="arm64" ;;
-    *) [ -x /usr/local/bin/wireproxy ] && WIREPROXY=/usr/local/bin/wireproxy && return 0
-       err "Unsupported arch: $arch"; return 1 ;;
+    *) err "Unsupported arch: $arch"; return 1 ;;
   esac
+
+  # Try multiple download methods
   local url="https://github.com/octeep/wireproxy/releases/latest/download/wireproxy_linux_${arch}.tar.gz"
-  curl -sL --max-time 30 "$url" -o /tmp/wp.tar.gz && \
-    tar -xzf /tmp/wp.tar.gz -C /tmp/ && \
-    mv /tmp/wireproxy "$WIREPROXY" && chmod +x "$WIREPROXY" && \
-    rm -f /tmp/wp.tar.gz && log "wireproxy installed." && return 0
-  [ -x /usr/local/bin/wireproxy ] && WIREPROXY=/usr/local/bin/wireproxy && return 0
+  local dest="$WIREPROXY_TMP"
+
+  log "Downloading wireproxy (${arch})..."
+  # Method 1: curl
+  if command -v curl &>/dev/null; then
+    curl -sL --max-time 45 "$url" -o /tmp/wp.tar.gz && \
+      tar -xzf /tmp/wp.tar.gz -C /tmp/ && \
+      mv /tmp/wireproxy "$dest" && chmod +x "$dest" && \
+      rm -f /tmp/wp.tar.gz && \
+      ln -sf "$dest" "$WIREPROXY" 2>/dev/null && \
+      log "wireproxy installed via curl." && return 0
+  fi
+  # Method 2: wget
+  if command -v wget &>/dev/null; then
+    wget -qO /tmp/wp.tar.gz --timeout=45 "$url" && \
+      tar -xzf /tmp/wp.tar.gz -C /tmp/ && \
+      mv /tmp/wireproxy "$dest" && chmod +x "$dest" && \
+      rm -f /tmp/wp.tar.gz && \
+      ln -sf "$dest" "$WIREPROXY" 2>/dev/null && \
+      log "wireproxy installed via wget." && return 0
+  fi
+
+  err "Failed to download wireproxy from GitHub."
+  err "URL: $url"
+  warn "The VPN will not work without the wireproxy binary."
   return 1
 }
 
-# ── Generate wireproxy config from a peer entry (HTTP CONNECT mode) ──
-write_wireproxy_config() {
-  local private_key="$1"
-  local peer_key="$2"
-  local endpoint="$3"
-  local port="${4:-$TUNNEL_PORT}"
-
+# ── Write wireproxy config (HTTP CONNECT mode) ──
+write_config() {
+  local key="$1" peer="$2" ep="$3"
   cat > /home/node/.wireproxy.conf << CFG
 [Interface]
-PrivateKey = ${private_key}
+PrivateKey = ${key}
 Address = 10.2.0.2/32
 DNS = 10.2.0.1
 
 [Peer]
-PublicKey = ${peer_key}
-Endpoint = ${endpoint}
+PublicKey = ${peer}
+Endpoint = ${ep}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 
 [http]
-BindAddress = 127.0.0.1:${port}
+BindAddress = 127.0.0.1:${TUNNEL_PORT}
 CFG
   chmod 600 /home/node/.wireproxy.conf
 }
 
-# ── Run wireproxy with a specific peer ──
+# ── Start tunnel with a given peer index ──
 start_tunnel() {
-  local idx="$1"
+  local idx=$1
   local entry="${WG_PEERS[$idx]}"
-
   IFS='|' read -r priv_key peer_key endpoint <<< "$entry"
-  write_wireproxy_config "$priv_key" "$peer_key" "$endpoint"
+  local ip=$(echo "$endpoint" | cut -d: -f1)
 
-  log "Starting tunnel ($((idx+1))/${TOTAL_PEERS}): $(echo $endpoint | cut -d: -f1)"
+  write_config "$priv_key" "$peer_key" "$endpoint"
+  log "Starting tunnel ($((idx+1))/$TOTAL) → $ip"
 
-  "$WIREPROXY" -c /home/node/.wireproxy.conf -d 2>/dev/null || \
-    "$WIREPROXY" -c /home/node/.wireproxy.conf &
+  # Run in foreground, background the whole thing (no -d flag to avoid daemon PID issue)
+  "$WIREPROXY" -c /home/node/.wireproxy.conf &
   local pid=$!
   echo "$pid" > "${STATE_DIR}/run/pid"
+  log "wireproxy PID: $pid"
 
-  sleep 4
-  if kill -0 "$pid" 2>/dev/null; then return 0; fi
-  sleep 3
-  if kill -0 "$pid" 2>/dev/null; then return 0; fi
+  # Wait for port to open (portable check using /dev/tcp)
+  local waited=0
+  while [ $waited -lt 20 ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      # Process died — check exit status
+      wait "$pid" 2>/dev/null || true
+      err "wireproxy process exited unexpectedly."
+      return 1
+    fi
+    # Portable port check (works even without ss/netstat)
+    if (timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/${TUNNEL_PORT}" 2>/dev/null); then
+      log "Tunnel active (PID $pid, port $TUNNEL_PORT)."
+      local ext_ip
+      ext_ip=$(curl -s --max-time 5 --proxy "http://127.0.0.1:${TUNNEL_PORT}" https://icanhazip.com 2>/dev/null || echo "")
+      [ -n "$ext_ip" ] && log "Exit IP: ${ext_ip}" && echo "$ext_ip" > "${STATE_DIR}/tunnel_ip"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  err "Timeout waiting for tunnel (port ${TUNNEL_PORT} not listening after 20s)."
+  kill "$pid" 2>/dev/null || true
   return 1
 }
 
 stop_tunnel() {
   local pf="${STATE_DIR}/run/pid"
-  [ -f "$pf" ] && { kill "$(cat "$pf")" 2>/dev/null || true; sleep 1; }
+  if [ -f "$pf" ]; then
+    local old_pid; old_pid=$(cat "$pf" 2>/dev/null || echo "")
+    [ -n "$old_pid" ] && kill "$old_pid" 2>/dev/null || true
+  fi
   pkill -x wireproxy 2>/dev/null || true
   rm -f "$pf" 2>/dev/null || true
+  sleep 1
 }
 
-# ── Main service loop ──
+# ── Verify actual connectivity through the tunnel ──
+verify_tunnel() {
+  local test_url="${1:-https://icanhazip.com}"
+  # Use curl with HTTP CONNECT proxy to verify
+  local ip
+  ip=$(curl -s --max-time 10 --proxy "http://127.0.0.1:${TUNNEL_PORT}" "$test_url" 2>/dev/null || echo "")
+  if [ -n "$ip" ] && [ "$ip" != "" ]; then
+    log "Tunnel verified: exit IP = ${ip}"
+    echo "$ip" > "${STATE_DIR}/tunnel_ip"
+    return 0
+  fi
+  return 1
+}
+
+# ── Main loop ──
 run_service() {
   mkdir -p "$STATE_DIR" "${STATE_DIR}/run"
   chown -R 1000:1000 "$STATE_DIR" 2>/dev/null || true
 
-  download_wireproxy || {
-    echo "failed (wireproxy)" > "$STATUS_FILE"
+  log "Initializing Proton VPN tunnel (${TOTAL} configs, rotate ${ROTATE}min)..."
+
+  if ! ensure_wireproxy; then
+    echo "failed (binary)" > "$STATUS_FILE"
     chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
     return 1
-  }
-
-  log "Loaded ${TOTAL_PEERS} Proton VPN WireGuard configs."
-  log "Rotating every ${ROTATE_INTERVAL} min."
+  fi
 
   local idx=0
+  local failed_count=0
+  local max_fails=${TOTAL}
+
   while true; do
     stop_tunnel
 
     if start_tunnel "$idx"; then
+      failed_count=0
       echo "connected" > "$STATUS_FILE"
       chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
-      log "Tunnel active on HTTP CONNECT :${TUNNEL_PORT}."
+
+      # Verify the tunnel works
+      verify_tunnel || warn "Tunnel up but verification failed (exit IP check)."
     else
-      err "Failed with config $((idx+1))."
-      echo "disconnected" > "$STATUS_FILE"
+      failed_count=$((failed_count + 1))
+      echo "failed (attempt ${failed_count})" > "$STATUS_FILE"
       chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
+
+      if [ $failed_count -ge $max_fails ]; then
+        err "All ${TOTAL} configs failed. Giving up."
+        echo "failed (all)" > "$STATUS_FILE"
+        return 1
+      fi
     fi
 
-    sleep $((ROTATE_INTERVAL * 60))
-    idx=$(( (idx + 1) % TOTAL_PEERS ))
+    log "Next rotation in ${ROTATE} min..."
+    sleep $((ROTATE * 60))
+    idx=$(( (idx + 1) % TOTAL ))
   done
 }
 
@@ -165,11 +221,16 @@ run_service() {
 case "${1:-service}" in
   service) run_service ;;
   status)
-    [ -f "$STATUS_FILE" ] && cat "$STATUS_FILE" || echo "stopped"
+    echo "status: $(cat "$STATUS_FILE" 2>/dev/null || echo 'unknown')"
+    echo "tunnel_ip: $(cat "${STATE_DIR}/tunnel_ip" 2>/dev/null || echo 'unknown')"
+    echo "wireproxy_bin: $([ -x "$WIREPROXY" ] && echo ok || echo missing)"
+    echo "wireproxy_pid: $(cat "${STATE_DIR}/run/pid" 2>/dev/null || echo 'none')"
+    echo "port_${TUNNEL_PORT}: $(ss -tlnp 2>/dev/null | grep -q ":${TUNNEL_PORT} " && echo listening || echo not listening)"
     ;;
   check)
     [ -x "$WIREPROXY" ] && echo "wireproxy: ok" || echo "wireproxy: missing"
-    echo "configs: ${TOTAL_PEERS}"
+    echo "configs: ${TOTAL}"
+    ss -tlnp 2>/dev/null | grep ":${TUNNEL_PORT} " || echo "port ${TUNNEL_PORT}: not listening"
     ;;
   *) echo "Usage: $0 {service|status|check}" ;;
 esac

@@ -55,20 +55,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       huggingface_hub hf_transfer && \
     rm -rf /var/lib/apt/lists/*
 
-# ── Install wireproxy (userspace WireGuard → HTTP CONNECT tunnel, no TUN needed) ──
+# ── Install wireproxy (userspace WireGuard → HTTP CONNECT, no TUN needed) ──
 ARG TARGETARCH
 RUN set -ex && \
-    arch="${TARGETARCH:-amd64}" && \
-    if [ "$arch" = "arm64" ]; then arch="arm64"; fi && \
-    if [ "$arch" = "amd64" ]; then arch="amd64"; fi && \
+    arch="${TARGETARCH:-amd64}" && [ "$arch" = "arm64" ] || [ "$arch" = "amd64" ] || arch="amd64" && \
     url="https://github.com/octeep/wireproxy/releases/latest/download/wireproxy_linux_${arch}.tar.gz" && \
-    curl -sL --max-time 30 "$url" -o /tmp/wireproxy.tar.gz && \
+    echo "Downloading wireproxy from ${url}..." && \
+    curl -fsSL --max-time 60 "$url" -o /tmp/wireproxy.tar.gz && \
     tar -xzf /tmp/wireproxy.tar.gz -C /tmp/ && \
     mv /tmp/wireproxy /usr/local/bin/wireproxy && \
     chmod +x /usr/local/bin/wireproxy && \
     rm -f /tmp/wireproxy.tar.gz && \
-    echo "wireproxy installed for ${arch}" || \
-    echo "Warning: wireproxy download failed (will retry at runtime)" 
+    wireproxy --version 2>&1 | head -1 && \
+    echo "wireproxy installed successfully." 
 
 RUN if [ "${DEV_MODE}" = "true" ] || [ "${DEV_MODE}" = "1" ] || [ "${DEV_MODE}" = "yes" ] || [ "${DEV_MODE}" = "on" ]; then \
       pip3 install --no-cache-dir --break-system-packages \

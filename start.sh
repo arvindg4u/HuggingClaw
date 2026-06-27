@@ -1745,63 +1745,67 @@ start_background_sync_once() {
 # Compliant use: protect LLM API calls in transit — not for bypassing
 # platform restrictions, spam, abuse, or any TOS-violating activity.
 start_protonvpn_vpn() {
-  # Disable with PROTONVPN_DISABLED=true (built-in configs enabled by default)
+  # Abort if disabled
   if hc_is_true "${PROTONVPN_DISABLED:-}"; then
     echo "[hc-vpn] Proton VPN disabled via PROTONVPN_DISABLED."
     return 0
   fi
 
   # Skip if already running
-  if [ -n "${PROTONVPN_PID:-}" ] && kill -0 "$PROTONVPN_PID" 2>/dev/null; then
-    return 0
-  fi
+  if [ -n "${PROTONVPN_PID:-}" ] && kill -0 "$PROTONVPN_PID" 2>/dev/null; then return 0; fi
   if [ -f /home/node/.protonvpn/status ]; then
-    local st
-    st=$(cat /home/node/.protonvpn/status 2>/dev/null)
+    local st; st=$(cat /home/node/.protonvpn/status 2>/dev/null)
     [ "$st" = "connected" ] && return 0
   fi
 
-  if [ ! -f /home/node/app/protonvpn-manager.sh ]; then
-    echo "[hc-vpn] protonvpn-manager.sh not found."
+  [ -f /home/node/app/protonvpn-manager.sh ] || { echo "[hc-vpn] manager not found."; return 0; }
+
+  echo "[hc-vpn] Starting WireGuard tunnel (17 Proton VPN configs)..."
+
+  # Quick pre-check
+  local check; check=$(/home/node/app/protonvpn-manager.sh check 2>/dev/null) || true
+  if echo "$check" | grep -q "wireproxy: missing"; then
+    echo "[hc-vpn] wireproxy binary not found — skipping."
+    mkdir -p /home/node/.protonvpn && echo "skipped (no binary)" > /home/node/.protonvpn/status
     return 0
   fi
-
-  echo "[hc-vpn] Starting Proton VPN WireGuard tunnel (17 built-in configs)..."
-  echo "[hc-vpn] Encrypts outbound API traffic via standard WireGuard tunnel."
-  echo "[hc-vpn] Uses HTTP CONNECT (standard HTTPS tunnel, not SOCKS5)."
 
   mkdir -p /home/node/.protonvpn
 
-  local check
-  check=$(/home/node/app/protonvpn-manager.sh check 2>/dev/null) || true
-  if echo "$check" | grep -q "wireproxy: missing"; then
-    echo "[hc-vpn] wireproxy not available."
-    echo "skipped" > /home/node/.protonvpn/status
-    return 0
-  fi
-
+  # Launch manager in background
   /home/node/app/protonvpn-manager.sh service >> /tmp/protonvpn-manager.log 2>&1 &
   PROTONVPN_PID=$!
 
-  echo "[hc-vpn] Tunnel starting (up to 10s)..."
+  # Wait for connection (up to 20s)
+  echo "[hc-vpn] Establishing tunnel..."
   local i=0
-  while [ $i -lt 5 ]; do
+  while [ $i -lt 10 ]; do
     if [ -f /home/node/.protonvpn/status ]; then
-      local st2
-      st2=$(cat /home/node/.protonvpn/status 2>/dev/null)
-      if [ "$st2" = "connected" ]; then
-        echo "[hc-vpn] Tunnel active on HTTP CONNECT :25345."
+      local s; s=$(cat /home/node/.protonvpn/status 2>/dev/null)
+      if [ "$s" = "connected" ]; then
+        echo "[hc-vpn] Tunnel active! HTTP CONNECT on 127.0.0.1:25345"
         export HTTP_PROXY="http://127.0.0.1:25345"
         export HTTPS_PROXY="http://127.0.0.1:25345"
         export http_proxy="http://127.0.0.1:25345"
         export https_proxy="http://127.0.0.1:25345"
+        echo "[hc-vpn] HTTP_PROXY set — outbound traffic routed through WireGuard tunnel."
         return 0
+      elif [ "$s" != "connected" ] && [ "$s" != "starting" ]; then
+        echo "[hc-vpn] Tunnel status: ${s}"
+        # If it failed quickly, don't keep waiting
+        echo "$s" | grep -q "^failed" && return 0
       fi
     fi
     sleep 2
     i=$((i+1))
   done
-  echo "[hc-vpn] Tunnel still starting — continuing in background."
+
+  # Final status check
+  if [ -f /home/node/.protonvpn/status ]; then
+    local s; s=$(cat /home/node/.protonvpn/status 2>/dev/null)
+    echo "[hc-vpn] Final status: ${s}"
+  fi
+  echo "[hc-vpn] Tunnel continuing in background — check /tmp/protonvpn-manager.log"
 }
 
 
