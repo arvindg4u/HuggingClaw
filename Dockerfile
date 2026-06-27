@@ -156,6 +156,6 @@ WORKDIR /home/node/app
 EXPOSE 7861
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s \
-  CMD curl -fsS http://localhost:7861/health || exit 1
+  CMD curl -fsS --noproxy '*' http://localhost:7861/health || exit 1
 
 CMD ["/home/node/app/start.sh"]

@@ -114,7 +114,7 @@ setInterval(() => {
       }
     } catch(e) {}
   }
-}, TUNNEL_CHECK_INTERVAL);
+}, TUNNEL_CHECK_INTERVAL).unref();
 
 // HTTP CONNECT proxy through the local WireGuard tunnel
 // Sends a standard HTTP CONNECT request (RFC 7231) — same mechanism HTTPS uses
