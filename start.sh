@@ -1738,6 +1738,58 @@ start_background_sync_once() {
   SYNC_LOOP_PID=$!
 }
 
+# ── Proton VPN Manager (optional, opt-in) ──
+# Encrypts outbound API traffic through Proton VPN.
+# Only activates when PROTONVPN_USERNAME and PROTONVPN_PASSWORD are set.
+# Rotates exit IP every PROTONVPN_ROTATE_INTERVAL minutes (default: 30).
+# Compliant use: protect LLM API calls in transit — not for bypassing
+# platform restrictions, spam, abuse, or any TOS-violating activity.
+start_protonvpn_vpn() {
+  [ -n "${PROTONVPN_USERNAME:-}" ] || return 0
+
+  # Skip if already running (idempotent - safe to call multiple times)
+  if [ -n "${PROTONVPN_PID:-}" ] && kill -0 "$PROTONVPN_PID" 2>/dev/null; then
+    return 0
+  fi
+  # Also check by status file
+  if [ -f /home/node/.protonvpn/status ]; then
+    local st
+    st=$(cat /home/node/.protonvpn/status 2>/dev/null)
+    if [ "$st" = "connected" ] || [ "$st" = "running" ]; then
+      return 0
+    fi
+  fi
+
+  echo "[hc-vpn] PROTONVPN_USERNAME is set — starting VPN manager..."
+  echo "[hc-vpn] Compliance: VPN encrypts outbound API traffic only."
+  echo "[hc-vpn] Do NOT use for bypassing platform restrictions or abuse."
+
+  if [ ! -f /home/node/app/protonvpn-manager.sh ]; then
+    echo "[hc-vpn] protonvpn-manager.sh not found — skipping."
+    return 0
+  fi
+
+  # Launch in background
+  sudo /home/node/app/protonvpn-manager.sh service >> /tmp/protonvpn-manager.log 2>&1 &
+  PROTONVPN_PID=$!
+
+  # Wait a few seconds for initial connection
+  echo "[hc-vpn] Waiting for initial connection..."
+  for i in $(seq 1 30); do
+    if [ -f /home/node/.protonvpn/status ]; then
+      local vpn_status
+      vpn_status=$(cat /home/node/.protonvpn/status 2>/dev/null)
+      if [ "$vpn_status" = "connected" ]; then
+        echo "[hc-vpn] Connected successfully."
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+
+  echo "[hc-vpn] VPN connection may not be ready yet — continuing startup."
+}
+
 
 
 
@@ -1816,6 +1868,9 @@ while true; do
   fi
 
   
+# ── Proton VPN (optional, opt-in) ──
+start_protonvpn_vpn
+
 # ── Ensure pre-bundled plugins survive backup restores ──
 if command -v openclaw &>/dev/null; then
   if [ ! -d /home/node/.openclaw/extensions/whatsapp ] && [ -n "${WHATSAPP_ENABLED:-}" ]; then

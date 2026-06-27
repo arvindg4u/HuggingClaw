@@ -41,3 +41,6 @@ temp/
 Thumbs.db
 telegram-worker-proxy/
 tor-proxy/node_modules/
+
+# Vercel YouTube proxy (unused subproject)
+vercel-youtube-proxy/

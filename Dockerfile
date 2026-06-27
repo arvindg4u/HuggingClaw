@@ -6,7 +6,7 @@
 #   /app/      → OpenClaw gateway (internal :7860)
 #   /terminal/ → JupyterLab terminal (internal :8888)
 #
-# Clean image — no Tor, VPN, or proxy tools.
+# Optional Proton VPN for outbound traffic encryption (opt-in via env vars).
 # ════════════════════════════════════════════════════════════════
 
 # ── Stage 1: Pull pre-built OpenClaw ──
@@ -51,7 +51,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-wqy-zenhei \
     xfonts-scalable \
     --no-install-recommends && \
-    pip3 install --no-cache-dir --break-system-packages huggingface_hub hf_transfer && \
+    pip3 install --no-cache-dir --break-system-packages \
+      huggingface_hub hf_transfer \
+      "git+https://github.com/jonasjancarik/protonvpn-cli-community.git@latest" && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── Install OpenVPN as WireGuard fallback for Proton VPN ──
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openvpn \
+    --no-install-recommends && \
     rm -rf /var/lib/apt/lists/*
 
 RUN if [ "${DEV_MODE}" = "true" ] || [ "${DEV_MODE}" = "1" ] || [ "${DEV_MODE}" = "yes" ] || [ "${DEV_MODE}" = "on" ]; then \
@@ -66,7 +74,8 @@ RUN mkdir -p /home/node/app /home/node/.openclaw && \
     chown -R 1000:1000 /home/node && \
     printf '%s\n' \
       'Cmnd_Alias HUGGINGCLAW_APT = /usr/bin/apt, /usr/bin/apt-get, /usr/bin/dpkg' \
-      'node ALL=(root) NOPASSWD: HUGGINGCLAW_APT' \
+      'Cmnd_Alias HUGGINGCLAW_VPN = /home/node/app/protonvpn-manager.sh, /usr/local/bin/protonvpn' \
+      'node ALL=(root) NOPASSWD: HUGGINGCLAW_APT, HUGGINGCLAW_VPN' \
       > /etc/sudoers.d/huggingclaw-apt && \
     chmod 0440 /etc/sudoers.d/huggingclaw-apt && \
     visudo -cf /etc/sudoers.d/huggingclaw-apt
@@ -116,8 +125,10 @@ COPY --chown=1000:1000 telegram-proxy.cjs /home/node/app/telegram-proxy.cjs
 COPY --chown=1000:1000 whatsapp-proxy.cjs /home/node/app/whatsapp-proxy.cjs
 COPY --chown=1000:1000 discord-proxy.cjs /home/node/app/discord-proxy.cjs
 COPY --chown=1000:1000 discord-loopback-proxy.cjs /home/node/app/discord-loopback-proxy.cjs
+COPY --chown=1000:1000 protonvpn-manager.sh /home/node/app/protonvpn-manager.sh
 RUN chmod +x /home/node/app/start.sh \
               /home/node/app/package-manifest.sh \
+              /home/node/app/protonvpn-manager.sh \
               /home/node/app/openclaw-sync.py \
               /home/node/app/jupyter-devdata-sync.py \
               /home/node/app/dns-resolve.py
