@@ -5,6 +5,12 @@
 #
 #     17 built-in Proton VPN FREE WireGuard configs.
 #     Uses HTTP CONNECT (standard HTTPS tunnel, not SOCKS5).
+#
+#     Features:
+#     - 30-min automatic IP rotation
+#     - 60-sec health check (curl via tunnel → icanhazip.com)
+#     - 2 consecutive failures → immediate auto-rotate to next peer
+#     - WireGuard process watchdog
 # ════════════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -17,8 +23,15 @@ ROTATE="${PROTONVPN_ROTATE_INTERVAL:-30}"
 TUNNEL_PORT=25345
 STATE_DIR="/home/node/.protonvpn"
 STATUS_FILE="${STATE_DIR}/status"
+HEALTH_FILE="${STATE_DIR}/health"
+TUNNEL_IP_FILE="${STATE_DIR}/tunnel_ip"
 WIREPROXY="/usr/local/bin/wireproxy"
 WIREPROXY_TMP="/tmp/wireproxy"
+
+# Health check config
+HEALTH_INTERVAL=60          # check every 60 seconds
+HEALTH_THRESHOLD=2          # 2 consecutive failures = trigger rotate
+HEALTH_TEST_URL="${HEALTH_TEST_URL:-https://icanhazip.com}"
 
 # ── 17 built-in Proton VPN FREE WireGuard configs ──
 declare -a WG_PEERS=(
@@ -43,6 +56,11 @@ declare -a WG_PEERS=(
 
 TOTAL=${#WG_PEERS[@]}
 
+# ── Helpers ──
+write_health() { echo "$1" > "$HEALTH_FILE"; chown 1000:1000 "$HEALTH_FILE" 2>/dev/null || true; }
+write_status() { echo "$1" > "$STATUS_FILE"; chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true; }
+write_tunnel_ip() { echo "$1" > "$TUNNEL_IP_FILE"; chown 1000:1000 "$TUNNEL_IP_FILE" 2>/dev/null || true; }
+
 # ── Ensure wireproxy binary is available ──
 ensure_wireproxy() {
   [ -x "$WIREPROXY" ] && return 0
@@ -54,12 +72,10 @@ ensure_wireproxy() {
     *) err "Unsupported arch: $arch"; return 1 ;;
   esac
 
-  # Try multiple download methods
   local url="https://github.com/octeep/wireproxy/releases/latest/download/wireproxy_linux_${arch}.tar.gz"
   local dest="$WIREPROXY_TMP"
 
   log "Downloading wireproxy (${arch})..."
-  # Method 1: curl
   if command -v curl &>/dev/null; then
     curl -sL --max-time 45 "$url" -o /tmp/wp.tar.gz && \
       tar -xzf /tmp/wp.tar.gz -C /tmp/ && \
@@ -68,7 +84,6 @@ ensure_wireproxy() {
       ln -sf "$dest" "$WIREPROXY" 2>/dev/null && \
       log "wireproxy installed via curl." && return 0
   fi
-  # Method 2: wget
   if command -v wget &>/dev/null; then
     wget -qO /tmp/wp.tar.gz --timeout=45 "$url" && \
       tar -xzf /tmp/wp.tar.gz -C /tmp/ && \
@@ -77,10 +92,7 @@ ensure_wireproxy() {
       ln -sf "$dest" "$WIREPROXY" 2>/dev/null && \
       log "wireproxy installed via wget." && return 0
   fi
-
   err "Failed to download wireproxy from GitHub."
-  err "URL: $url"
-  warn "The VPN will not work without the wireproxy binary."
   return 1
 }
 
@@ -113,40 +125,44 @@ start_tunnel() {
   local ip=$(echo "$endpoint" | cut -d: -f1)
 
   write_config "$priv_key" "$peer_key" "$endpoint"
-  log "Starting tunnel ($((idx+1))/$TOTAL) → $ip"
+  log "Starting tunnel ($((idx+1))/$TOTAL) → ${ip}"
 
-  # Run in foreground, background the whole thing (no -d flag to avoid daemon PID issue)
   "$WIREPROXY" -c /home/node/.wireproxy.conf &
   local pid=$!
   echo "$pid" > "${STATE_DIR}/run/pid"
-  log "wireproxy PID: $pid"
+  log "wireproxy PID: ${pid}"
 
-  # Wait for port to open (portable check using /dev/tcp)
+  # Wait for port to open (portable /dev/tcp check)
   local waited=0
   while [ $waited -lt 20 ]; do
     if ! kill -0 "$pid" 2>/dev/null; then
-      # Process died — check exit status
       wait "$pid" 2>/dev/null || true
       err "wireproxy process exited unexpectedly."
       return 1
     fi
-    # Portable port check (works even without ss/netstat)
     if (timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/${TUNNEL_PORT}" 2>/dev/null); then
-      log "Tunnel active (PID $pid, port $TUNNEL_PORT)."
+      log "Tunnel active (PID ${pid}, port ${TUNNEL_PORT})."
+      # Verify exit IP immediately
       local ext_ip
-      ext_ip=$(curl -s --max-time 5 --proxy "http://127.0.0.1:${TUNNEL_PORT}" https://icanhazip.com 2>/dev/null || echo "")
-      [ -n "$ext_ip" ] && log "Exit IP: ${ext_ip}" && echo "$ext_ip" > "${STATE_DIR}/tunnel_ip"
+      ext_ip=$(curl -s --max-time 10 --proxy "http://127.0.0.1:${TUNNEL_PORT}" \
+        "${HEALTH_TEST_URL}" 2>/dev/null || echo "")
+      if [ -n "$ext_ip" ]; then
+        log "Exit IP: ${ext_ip}"
+        write_tunnel_ip "$ext_ip"
+      else
+        warn "Exit IP check returned empty — tunnel may be degraded."
+      fi
       return 0
     fi
     sleep 1
     waited=$((waited + 1))
   done
-
   err "Timeout waiting for tunnel (port ${TUNNEL_PORT} not listening after 20s)."
   kill "$pid" 2>/dev/null || true
   return 1
 }
 
+# ── Stop wireproxy ──
 stop_tunnel() {
   local pf="${STATE_DIR}/run/pid"
   if [ -f "$pf" ]; then
@@ -158,62 +174,107 @@ stop_tunnel() {
   sleep 1
 }
 
-# ── Verify actual connectivity through the tunnel ──
-verify_tunnel() {
-  local test_url="${1:-https://icanhazip.com}"
-  # Use curl with HTTP CONNECT proxy to verify
+# ── Health check: verify tunnel can reach external service ──
+# Returns 0 if healthy, 1 if dead.
+health_check() {
   local ip
-  ip=$(curl -s --max-time 10 --proxy "http://127.0.0.1:${TUNNEL_PORT}" "$test_url" 2>/dev/null || echo "")
-  if [ -n "$ip" ] && [ "$ip" != "" ]; then
-    log "Tunnel verified: exit IP = ${ip}"
-    echo "$ip" > "${STATE_DIR}/tunnel_ip"
+  ip=$(curl -s --max-time 10 --proxy "http://127.0.0.1:${TUNNEL_PORT}" \
+    "${HEALTH_TEST_URL}" 2>/dev/null || echo "")
+  if [ -n "$ip" ]; then
+    write_tunnel_ip "$ip"
     return 0
   fi
   return 1
 }
 
-# ── Main loop ──
+# ── Verify wireproxy process is alive ──
+wireproxy_alive() {
+  local pf="${STATE_DIR}/run/pid"
+  [ -f "$pf" ] || return 1
+  local pid; pid=$(cat "$pf" 2>/dev/null || echo "")
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+  return 1
+}
+
+# ── Main loop with periodic health checks ──
 run_service() {
   mkdir -p "$STATE_DIR" "${STATE_DIR}/run"
   chown -R 1000:1000 "$STATE_DIR" 2>/dev/null || true
 
-  log "Initializing Proton VPN tunnel (${TOTAL} configs, rotate ${ROTATE}min)..."
+  log "Initializing Proton VPN tunnel (${TOTAL} configs, rotate ${ROTATE}min)."
+  log "Health check every ${HEALTH_INTERVAL}s, auto-rotate after ${HEALTH_THRESHOLD} failures."
 
   if ! ensure_wireproxy; then
-    echo "failed (binary)" > "$STATUS_FILE"
-    chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
+    write_status "failed (binary)"
     return 1
   fi
 
   local idx=0
-  local failed_count=0
+  local consecutive_failures=0
+  local total_failed_configs=0
   local max_fails=${TOTAL}
 
   while true; do
     stop_tunnel
 
     if start_tunnel "$idx"; then
-      failed_count=0
-      echo "connected" > "$STATUS_FILE"
-      chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
+      consecutive_failures=0
+      write_status "connected"
+      write_health "ok"
 
-      # Verify the tunnel works
-      verify_tunnel || warn "Tunnel up but verification failed (exit IP check)."
+      # ── Inner loop: health checks + rotation timer ──
+      local inner_seconds=0
+      local max_seconds=$((ROTATE * 60))
+
+      while [ $inner_seconds -lt $max_seconds ]; do
+        sleep "$HEALTH_INTERVAL"
+        inner_seconds=$((inner_seconds + HEALTH_INTERVAL))
+        local elapsed_minutes=$((inner_seconds / 60))
+
+        # 1. Check wireproxy process is alive
+        if ! wireproxy_alive; then
+          warn "wireproxy process died (elapsed ${elapsed_minutes}m). Rotating..."
+          write_health "dead (process)"
+          break
+        fi
+
+        # 2. Check tunnel connectivity
+        if health_check; then
+          if [ "$consecutive_failures" -gt 0 ]; then
+            log "Health recovered after ${consecutive_failures} failure(s)."
+            consecutive_failures=0
+            write_health "ok"
+            write_status "connected"
+          fi
+        else
+          consecutive_failures=$((consecutive_failures + 1))
+          write_health "fail (${consecutive_failures}/${HEALTH_THRESHOLD})"
+          warn "Health check ${consecutive_failures}/${HEALTH_THRESHOLD} failed (elapsed ${elapsed_minutes}m)."
+
+          if [ "$consecutive_failures" -ge "$HEALTH_THRESHOLD" ]; then
+            warn "Health threshold reached! Rotating to next peer..."
+            write_health "rotating (threshold)"
+            break
+          fi
+        fi
+      done
     else
-      failed_count=$((failed_count + 1))
-      echo "failed (attempt ${failed_count})" > "$STATUS_FILE"
-      chown 1000:1000 "$STATUS_FILE" 2>/dev/null || true
+      # Tunnel failed to start
+      total_failed_configs=$((total_failed_configs + 1))
+      write_status "failed (attempt ${total_failed_configs})"
+      write_health "start-failed"
 
-      if [ $failed_count -ge $max_fails ]; then
+      if [ "$total_failed_configs" -ge "$max_fails" ]; then
         err "All ${TOTAL} configs failed. Giving up."
-        echo "failed (all)" > "$STATUS_FILE"
+        write_status "failed (all)"
+        write_health "dead (exhausted)"
         return 1
       fi
     fi
 
-    log "Next rotation in ${ROTATE} min..."
-    sleep $((ROTATE * 60))
+    # Rotate to next peer
     idx=$(( (idx + 1) % TOTAL ))
+    log "Rotating to config $((idx+1))/${TOTAL}..."
   done
 }
 
@@ -222,14 +283,20 @@ case "${1:-service}" in
   service) run_service ;;
   status)
     echo "status: $(cat "$STATUS_FILE" 2>/dev/null || echo 'unknown')"
-    echo "tunnel_ip: $(cat "${STATE_DIR}/tunnel_ip" 2>/dev/null || echo 'unknown')"
+    echo "health: $(cat "$HEALTH_FILE" 2>/dev/null || echo 'unknown')"
+    echo "tunnel_ip: $(cat "$TUNNEL_IP_FILE" 2>/dev/null || echo 'unknown')"
     echo "wireproxy_bin: $([ -x "$WIREPROXY" ] && echo ok || echo missing)"
     echo "wireproxy_pid: $(cat "${STATE_DIR}/run/pid" 2>/dev/null || echo 'none')"
     echo "port_${TUNNEL_PORT}: $(ss -tlnp 2>/dev/null | grep -q ":${TUNNEL_PORT} " && echo listening || echo not listening)"
+    echo "configs_total: ${TOTAL}"
+    echo "health_interval: ${HEALTH_INTERVAL}s"
+    echo "health_threshold: ${HEALTH_THRESHOLD}"
     ;;
   check)
-    [ -x "$WIREPROXY" ] && echo "wireproxy: ok" || echo "wireproxy: missing"
+    echo "wireproxy: $([ -x "$WIREPROXY" ] && echo ok || echo missing)"
     echo "configs: ${TOTAL}"
+    echo "health_interval: ${HEALTH_INTERVAL}s"
+    echo "health_threshold: ${HEALTH_THRESHOLD}"
     ss -tlnp 2>/dev/null | grep ":${TUNNEL_PORT} " || echo "port ${TUNNEL_PORT}: not listening"
     ;;
   *) echo "Usage: $0 {service|status|check}" ;;
