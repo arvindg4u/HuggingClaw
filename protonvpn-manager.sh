@@ -3,7 +3,7 @@
 # 🛡️  Proton VPN Manager — WireGuard tunnel via wireproxy.
 #     Userspace — no TUN/NET_ADMIN needed. Works on HF Spaces.
 #
-#     17 built-in Proton VPN FREE WireGuard configs.
+#     4 Singapore Proton VPN FREE WireGuard configs.
 #     Uses HTTP CONNECT (standard HTTPS tunnel, not SOCKS5).
 #
 #     Features:
@@ -33,25 +33,12 @@ HEALTH_INTERVAL=60          # check every 60 seconds
 HEALTH_THRESHOLD=2          # 2 consecutive failures = trigger rotate
 HEALTH_TEST_URL="${HEALTH_TEST_URL:-https://icanhazip.com}"
 
-# ── 17 built-in Proton VPN FREE WireGuard configs ──
+# ── 4 Singapore Proton VPN FREE WireGuard configs ──
 declare -a WG_PEERS=(
-  "SH3bUChOJ4P7h93xjW8bz/CqeKrdl/9Z4J1EXwH4RUE=|Uqp1/VJ/Lz2VoN/2D0HEG7G8WDxLJm7+JNC5KZrUREw=|149.88.30.88:51820"
-  "oDs/VVhAgFelbHPBGDFo+SiJC1MeVlhftJWXNRj9rGY=|oGVahl/rkt0i22DILrVpPSmYZmqcmSup/HQ/upVf2Vg=|138.199.35.120:51820"
-  "gKWzO+GHInsyQTPghaxXp9xLM4knQqyuCLOzvKlXoGM=|Y4jxn/IIoorfo/X99RZFU6HbL9WWn7ffGI5isYFU9lo=|146.70.202.34:51820"
-  "iCemcNphbxPmP+7WK3/oqUruKYlI0BksqwdbYX7VsFQ=|8il/lBt/NRXyh309nNf6Ebcu8mtOIuI9QCZe1MAozSc=|146.70.147.98:51820"
-  "AKjCQtjE7DY6L14TPy4FkuznmXajWHHKsXgoYpGiJ0o=|+tBxOtFy6U050wKXUHW16Ya8gzRVoAGdSZGQ2PokrGA=|149.22.84.149:51820"
-  "KCRBFg3o8AZ2d8hQy3Ptsc/KVby2d4EimjHVzNH8VFM=|wP/7Xi9sTiO1XMpLXf/OUJiJc1E0PA3KyskMtGajEFA=|146.70.202.2:51820"
-  "4DwU54de/J71xWRReiOI27V+fJutYlPqIUiWL5/DIlU=|W0ke+9ooJLu/AnDM3pcbkn8e+PfjScXywBCsXdlEmwE=|149.22.88.58:51820"
-  "8GV+0tDa6cRn8fdi2T0h0kOJ09j/wqwZmNkRem0q0UI=|g0gQj1lhsEuyJcJlzVyjq7aQmtC+/ca05vqOqvCQ/zI=|146.70.230.130:51820"
-  "mNxXbJR4T9cKM3IYOHbp+7N+aa1WFuYaqI0YpKa+pEg=|ZEQHDxg/HbjznRvApyBWfUGs6T20Rvy0/DctZk6FvB4=|89.187.185.161:51820"
-  "6J4kyAvFKtVFIZu4KaTpVIPIb9eqdW29G6lHRJBXllU=|jShHBnjRpU3cgm2apLl0OElwSK0fs/gJTm9nnjdO8Ec=|149.40.62.119:51820"
-  "+HMkwLLgbynGfifsMk2dSWkk9fyl41EutI9Vsjj2ZXk=|KZ9UhGk5qLny663HP6xWCfyIDH2xgvu9DNH5tGYmYnw=|138.199.50.144:51820"
-  "UARft8SuSAsx9i3EXQuOYpr55C0VWa7ixFgnH6l/Fk4=|eAXAQ+pjJuejhTOjyCnC39GS/8lv8Zw7Cj5u7gMzIgE=|151.243.141.166:51820"
-  "8EsXHKNXdR7pNM4lN/Dl18wXZfarPnyEb5Tn+hOK00I=|LnAW4J80mzbBRPWuJyPcT1H04MElAYZus93sOG4WCFE=|146.70.230.82:51820"
-  "+B0nD8F86Qz1EgnuPglmKEtdVPQeFxfbgO3E+kkwhl4=|OKHT7YYBH4VD4vmuxrpbWQtY4SIRHuibasAZthkWEzg=|146.70.230.98:51820"
-  "QDNLJjX8stIOVJza9HzlHUWgF6MA9QYL+7rzAiDHbUE=|8jEgre7McUnWFLvjlQSenvYJgUGISWeNyLonrEupuDA=|146.70.230.114:51820"
-  "EJaBl0BHpFVM4LF/850a5ZKDkmO+eSs5eXmAuIIzAmI=|v5X/QsIRV2BRh6XKeDk1+NOiqAZDYYTD6xL3Qiu/b2g=|151.243.141.164:51820"
-  "IInph6mqE0DmcpVvdsX5K5kCAqimzgRhqB+fDrJNmXg=|qwoWn5tpqguIWdYpsIjUIMnrMT0dtxnrKwSUB4ZvMTA=|151.243.141.160:51820"
+  "IFVH9u+4DH8vary70GyVbt5gqAYpiahEtF+UrDrqr0I=|DU0jJf1tLDu9Nr84tFt1Eph27zsvI3Gu5dkwTGyE9Wk=|103.216.221.73:51820"
+  "qNk4thdxYB858+2fgO56r0jJ8jgRo+p25tmPRiXubXQ=|LzDybSqRbDLpmigYBYbCHyh9fMfphvcEYpV39GvTgE4=|103.216.221.69:51820"
+  "KDKAhqj/k9Galx6MYdt1GfUam7dxzoorUuQ6ENERInI=|wooCicf2PLNZjvDxVMVc/nrvFsFnNAU4n+AnKWVz8mg=|149.50.211.149:51820"
+  "2N2s6TElhFywIgBJujvlFPMpeHassktBpwlBBBQSLU0=|o+vYNpIDzf302SLUBLAG9zBf+M3nBBoCq/uei1M/wws=|149.50.211.159:51820"
 )
 
 TOTAL=${#WG_PEERS[@]}
