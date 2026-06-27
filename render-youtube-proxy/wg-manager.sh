@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-log()  { echo "[wg] $(date '+%Y-%m-%d %H:%M:%S') $*"; }
+log()  { echo "[wg] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2; }
 err()  { echo "[wg] ERROR: $*" >&2; }
 warn() { echo "[wg] WARNING: $*" >&2; }
 
