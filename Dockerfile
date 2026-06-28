@@ -96,7 +96,7 @@ RUN mkdir -p /home/node/browser-deps && \
 RUN ln -s /home/node/.openclaw/openclaw-app/openclaw.mjs /usr/local/bin/openclaw 2>/dev/null || \
     npm install -g openclaw@${OPENCLAW_VERSION}
 
-# ── Pre-bundle WhatsApp + Discord plugins (build time, real directory) ──
+# ── Pre-bundle WhatsApp plugin (build time, real directory) ──
 RUN mkdir -p /home/node/.openclaw/extensions && \
     if HOME=/home/node openclaw plugins install clawhub:@openclaw/whatsapp 2>/dev/null; then \
       echo "[build] WhatsApp plugin pre-bundled from ClawHub."; \
@@ -104,13 +104,6 @@ RUN mkdir -p /home/node/.openclaw/extensions && \
       echo "[build] WhatsApp plugin pre-bundled from npm."; \
     else \
       echo "[build] Warning: could not pre-bundle WhatsApp plugin (will install at runtime)"; \
-    fi && \
-    if HOME=/home/node openclaw plugins install clawhub:@openclaw/discord 2>/dev/null; then \
-      echo "[build] Discord plugin pre-bundled from ClawHub."; \
-    elif HOME=/home/node openclaw plugins install @openclaw/discord 2>/dev/null; then \
-      echo "[build] Discord plugin pre-bundled from npm."; \
-    else \
-      echo "[build] Warning: could not pre-bundle Discord plugin (will install at runtime)"; \
     fi && \
     chown -R 1000:1000 /home/node/.openclaw
 
@@ -129,8 +122,6 @@ COPY --chown=1000:1000 jupyter-devdata-sync.py /home/node/app/jupyter-devdata-sy
 COPY --chown=1000:1000 dns-fix.cjs /home/node/app/dns-fix.cjs
 COPY --chown=1000:1000 telegram-proxy.cjs /home/node/app/telegram-proxy.cjs
 COPY --chown=1000:1000 whatsapp-proxy.cjs /home/node/app/whatsapp-proxy.cjs
-COPY --chown=1000:1000 discord-proxy.cjs /home/node/app/discord-proxy.cjs
-COPY --chown=1000:1000 discord-loopback-proxy.cjs /home/node/app/discord-loopback-proxy.cjs
 COPY --chown=1000:1000 protonvpn-manager.sh /home/node/app/protonvpn-manager.sh
 RUN chmod +x /home/node/app/start.sh \
               /home/node/app/package-manifest.sh \
@@ -149,7 +140,7 @@ ENV HOME=/home/node \
     PATH=/home/node/.local/bin:/usr/local/bin:$PATH \
     OPENCLAW_TEMP_DIR=/home/node/.openclaw/tmp \
     NODE_PATH=/home/node/browser-deps/node_modules \
-    NODE_OPTIONS="--require /home/node/app/dns-fix.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs --require /home/node/app/whatsapp-proxy.cjs --require /home/node/app/discord-proxy.cjs"
+    NODE_OPTIONS="--require /home/node/app/dns-fix.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs --require /home/node/app/whatsapp-proxy.cjs"
 
 WORKDIR /home/node/app
 

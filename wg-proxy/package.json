@@ -1,8 +1,0 @@
-{
-  "name": "huggingclaw-wg-proxy",
-  "version": "1.0.0",
-  "private": true,
-  "dependencies": {
-    "ws": "^8.18.3"
-  }
-}

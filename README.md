@@ -135,7 +135,7 @@ To chat via Telegram:
 
 ## 🌐 Cloudflare Proxy Setup
 
-Hugging Face Free Tier often restricts outbound connections to services like Telegram, Discord, and WhatsApp. HuggingClaw solves this with a **Transparent Outbound Proxy** via Cloudflare Workers.
+Hugging Face Free Tier often restricts outbound connections to services like Telegram and WhatsApp. HuggingClaw solves this with a **Transparent Outbound Proxy** via Cloudflare Workers.
 
 ### ⚡ Automatic Setup (Recommended)
 

@@ -1,14 +1,13 @@
 /**
- * HuggingClaw Render Proxy — Telegram + WhatsApp + Discord relay
+ * HuggingClaw Render Proxy — Telegram + WhatsApp relay
  *
- * Deploy on Render free tier.  HF Spaces routes Telegram API, WhatsApp, and Discord
+ * Deploy on Render free tier.  HF Spaces routes Telegram API and WhatsApp
  * traffic through this proxy to bypass outbound connection blocks.
  *
  * Endpoints:
  *   /telegram/*         →  proxies to https://api.telegram.org/*
  *   /whatsapp/*         →  proxies WhatsApp Web HTTP endpoints
  *   /whatsapp-ws/       →  WebSocket proxy for WhatsApp Web
- *   /discord/*          →  proxies to https://discord.com/*
  *   /health             →  health check (for cron ping)
  *   /                   →  status page
  */
@@ -133,33 +132,6 @@ function handleWhatsAppHttp(req, res, path) {
   req.pipe(proxyReq);
 }
 
-// ── HTTP proxy for Discord API ───────────────────────────────────────────
-function handleDiscord(req, res, path) {
-  const discordPath = path.replace(/^\/discord/, "") || "/";
-  const options = {
-    hostname: "discord.com",
-    port: 443,
-    path: discordPath,
-    method: req.method,
-    headers: { ...req.headers },
-    timeout: 30000,
-  };
-  delete options.headers["host"];
-  delete options.headers["x-target-host"];
-
-  log("discord", `${req.method} ${discordPath}`);
-  const proxyReq = https.request(options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-    proxyRes.pipe(res);
-  });
-  proxyReq.on("error", (e) => {
-    log("discord", `ERROR: ${e.message}`);
-    if (!res.headersSent) res.writeHead(502).end(JSON.stringify({ error: e.message }));
-  });
-  proxyReq.on("timeout", () => { proxyReq.destroy(); if (!res.headersSent) res.writeHead(504).end("timeout"); });
-  req.pipe(proxyReq);
-}
-
 // ── Health endpoint ─────────────────────────────────────────────────────
 function handleHealth(res) {
   res.writeHead(200, {
@@ -173,14 +145,13 @@ function handleHealth(res) {
     timestamp: new Date().toISOString(),
     telegram: "https://api.telegram.org",
     whatsapp: "web.whatsapp.com",
-    discord: "https://discord.com",
   }));
 }
 
 // ── Status / landing page ───────────────────────────────────────────────
 function handleStatus(res) {
   res.writeHead(200, { "Content-Type": "text/plain", "Cache-Control": "no-cache" });
-  res.end(`HuggingClaw Render Proxy\nUptime: ${Math.floor(process.uptime())}s\n\nEndpoints:\n  /telegram/*     → Telegram Bot API proxy\n  /whatsapp/*     → WhatsApp Multi-domain HTTP proxy (x-target-host)\n  /whatsapp-ws    → WhatsApp WebSocket relay (query: ?host=&path=)\n  /discord/*      → Discord API proxy\n  /health         → Health check\n`);
+  res.end(`HuggingClaw Render Proxy\nUptime: ${Math.floor(process.uptime())}s\n\nEndpoints:\n  /telegram/*     → Telegram Bot API proxy\n  /whatsapp/*     → WhatsApp Multi-domain HTTP proxy (x-target-host)\n  /whatsapp-ws    → WhatsApp WebSocket relay (query: ?host=&path=)\n  /health         → Health check\n`);
 }
 
 // ── HTTP Server ──────────────────────────────────────────────────────────
@@ -196,8 +167,6 @@ const server = http.createServer((req, res) => {
     return res.end("Upgrade Required — use WebSocket");
   }
   if (path.startsWith("/whatsapp")) return handleWhatsAppHttp(req, res, path);
-  if (path.startsWith("/discord")) return handleDiscord(req, res, path);
-
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("Not Found");
 });
@@ -271,90 +240,8 @@ wss.on("connection", (clientWs, req) => {
 });
 
 
-// ── WebSocket TCP tunnel for Discord Gateway ──────────────────────────
-// cloudflare-proxy.js connects here and sends {host, port} JSON to tunnel
-// TCP traffic through Render\'s unrestricted outbound (bypasses WireGuard).
-// Protocol matches the "legacy format" used by wg-proxy/relay.js:
-//   1. Client sends:  {"host":"gateway.discord.gg","port":443}
-//   2. Server replies: {"status":"connected"}
-//   3. Binary frames flow bidirectionally
-const discordWss = new WebSocketServer({ server, path: "/discord-ws" });
-
-discordWss.on("connection", (ws, req) => {
-  log("discord-ws", "New tunnel connection");
-  let targetSocket = null;
-
-  const cleanup = () => {
-    if (targetSocket) { try { targetSocket.end(); } catch(_) {} targetSocket = null; }
-  };
-
-  ws.on("message", (data, isBinary) => {
-    if (!isBinary) {
-      // Text frame \u2014 JSON control message
-      const str = typeof data === "string" ? data : data.toString();
-      try {
-        const msg = JSON.parse(str);
-        if (msg.host && msg.port && !targetSocket) {
-          const host = msg.host;
-          const port = parseInt(msg.port) || 443;
-          log("discord-ws", `Connecting to ${host}:${port}`);
-
-          targetSocket = net.connect(port, host, () => {
-            log("discord-ws", `Connected to ${host}:${port}`);
-            if (ws.readyState === ws.OPEN) {
-              ws.send(JSON.stringify({ status: "connected" }), { binary: false });
-            }
-          });
-
-          targetSocket.on("data", (td) => {
-            if (ws.readyState === ws.OPEN) {
-              ws.send(td, { binary: true });
-            }
-          });
-
-          targetSocket.on("error", (err) => {
-            log("discord-ws", `Socket error: ${err.message}`);
-            try { ws.send(JSON.stringify({ error: err.message })); } catch(_) {}
-            cleanup();
-          });
-
-          targetSocket.on("close", () => {
-            log("discord-ws", `Socket closed for ${host}:${port}`);
-            cleanup();
-            try { ws.close(); } catch(_) {}
-          });
-
-          return;
-        }
-        if (msg.error && ws.readyState === ws.OPEN) {
-          ws.send(JSON.stringify({ error: msg.error }));
-        }
-      } catch(e) {
-        log("discord-ws", `Invalid JSON: ${e.message}`);
-      }
-      return;
-    }
-
-    // Binary frame \u2014 forward to target socket
-    if (targetSocket) {
-      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-      try { targetSocket.write(buf); } catch(_) {}
-    }
-  });
-
-  ws.on("close", () => {
-    log("discord-ws", "WebSocket closed");
-    cleanup();
-  });
-
-  ws.on("error", (e) => {
-    log("discord-ws", `WebSocket error: ${e.message}`);
-    cleanup();
-  });
-});
-
 // ── WebSocket TCP tunnel for WhatsApp ────────────────────────────
-// Same protocol as discord-ws: client sends JSON {host, port},
+// Client sends JSON {host, port},
 // server connects via net.connect(), binary frames flow bidirectionally.
 const whatsappWss = new WebSocketServer({ server, path: "/whatsapp-tcp" });
 
@@ -439,7 +326,6 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`[hc-render-proxy] Listening on port ${PORT}`);
   console.log(`[hc-render-proxy] Telegram → https://api.telegram.org`);
   console.log(`[hc-render-proxy] WhatsApp → web.whatsapp.com / g.whatsapp.net / mmg.whatsapp.net / pps.whatsapp.net / static.whatsapp.net`);
-  console.log(`[hc-render-proxy] Discord WS tunnel → /discord-ws (TCP relay for gateway.discord.gg)`);
   console.log(`[hc-render-proxy] WhatsApp TCP tunnel → /whatsapp-tcp (TCP relay for WhatsApp domains)`);
   console.log(`[hc-render-proxy] Cron ping → /health every 10min to keep awake`);
 });

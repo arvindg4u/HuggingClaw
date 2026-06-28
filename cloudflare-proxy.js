@@ -152,13 +152,6 @@ function isWhatsAppDomain(hn) {
   return hn && WHATSAPP_DOMAINS.includes(hn.toLowerCase());
 }
 
-// Discord Gateway domains that need TCP tunnel through Render proxy
-// (NOT through WireGuard \u2014 that is only for opencode.ai)
-const DISCORD_GATEWAY_DOMAINS = ['gateway.discord.gg', 'gateway-us-east1-b.discord.gg', 'gateway-us-east1-c.discord.gg', 'gateway-us-east1-d.discord.gg', 'gateway-us-west1-a.discord.gg', 'gateway-us-west1-b.discord.gg', 'gateway-us-west1-c.discord.gg', 'gateway-eu-west1-a.discord.gg', 'gateway-eu-west1-b.discord.gg', 'gateway-eu-west1-c.discord.gg', 'gateway-sgp1-a.discord.gg', 'gateway-sgp1-b.discord.gg'];
-function isDiscordGateway(hn) {
-  return hn && DISCORD_GATEWAY_DOMAINS.includes(hn.toLowerCase());
-}
-
 const isInternal = (h) => {
   const hc = typeof h === "string" ? h.toLowerCase() : "";
   return /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|::1|localhost)/.test(hc);
@@ -487,7 +480,6 @@ http.request = function(...args) {
 
 // Cloudflare Worker proxy URL for Telegram (set via env CLOUDFLARE_PROXY_URL)
 const CF_PROXY_URL = (typeof process !== 'undefined' && process.env && process.env.CLOUDFLARE_PROXY_URL) || null;
-const DISCORD_WS_PROXY_URL = (typeof process !== 'undefined' && process.env && process.env.DISCORD_WS_PROXY_URL) || null;
 
 // Direct Cloudflare Worker proxy for Telegram (fast path — bypasses SOCKS5)
 async function telegramViaWorker(url, options) {
@@ -660,44 +652,6 @@ net.connect = function(...args) {
     return origNetConnect.call(this, nopts);
   }
 
-  // ── Discord Gateway: route through Render proxy WebSocket tunnel (NOT WireGuard) ──
-  if (isDiscordGateway(hn) && DISCORD_WS_PROXY_URL) {
-    log(`Discord gateway net.connect via WS tunnel: ${hn}:${opts.port || 443}`);
-    const socks = new net.Socket();
-    socks.setMaxListeners(0);
-    socks._hc_proxied = true;
-    socks._hc_writeBuf = [];
-
-    discordWsConnect(hn, opts.port || 443, DISCORD_WS_PROXY_URL)
-      .then(s => {
-        socks.emit("connect");
-        socks._hc_socket = s;
-        if (socks._hc_writeBuf && socks._hc_writeBuf.length) {
-          const buf = Buffer.concat(socks._hc_writeBuf);
-          socks._hc_writeBuf = [];
-          try { s.write(buf); } catch(e) {}
-        }
-      })
-      .catch(err => {
-        socks.emit('error', err);
-      });
-
-    const origWrite = socks.write.bind(socks);
-    socks.write = function(data, ...args) {
-      if (socks._hc_socket) return socks._hc_socket.write(data, ...args);
-      if (!socks._hc_writeBuf) socks._hc_writeBuf = [];
-      socks._hc_writeBuf.push(Buffer.from(data));
-      if (args.length > 0 && typeof args[args.length-1] === 'function') args[args.length-1]();
-      return true;
-    };
-    socks.origDestroy = socks.destroy.bind(socks);
-    socks.destroy = function(e) {
-      if (socks._hc_socket) try { socks._hc_socket.destroy(e); } catch(_) {}
-      socks.origDestroy(e);
-    };
-    return socks;
-  }
-
   if (opts._hc || !needsProxy(hn)) return origNetConnect.call(this, ...args);
 
   // Use proxyConnect which handles wss:// (WebSocket), socks5://, and direct fallback
@@ -854,13 +808,13 @@ tls.connect = function(...args) {
 
 // ── WebSocket proxy connection (one-shot, legacy format) ──
 // Uses a fresh WebSocket per tunnel with legacy {host, port} format.
-// TunnelPool (multiplexed protocol) was removed because wg-proxy relay
+// TunnelPool (multiplexed protocol) was removed because the Render relay
 // works reliably only with legacy format. Multiplexed format caused
 // persistent timeouts due to protocol race conditions on reconnect.
 // This adds ~2s per request (WebSocket connect time) but is reliable.
 function wsConnectProxy(targetHost, targetPort, timeout = 30000) {
   // One-shot WebSocket with legacy {host, port} format (proven working).
-  // TunnelPool (multiplexed protocol) is NOT used because wg-proxy relay
+  // TunnelPool (multiplexed protocol) is NOT used because the Render relay
   // works reliably only with legacy format. Multiplexed format causes timeouts
   // due to protocol race conditions on reconnect.
 
@@ -1222,126 +1176,6 @@ function getMultiplexedPool(wsUrl) {
     multiplexedPool = new MultiplexedPool(wsUrl);
   }
   return multiplexedPool;
-}
-
-
-// ── Discord WebSocket tunnel (parameterized, uses DISCORD_WS_PROXY_URL) ──
-// Same protocol as wsConnectProxy but accepts a custom WebSocket proxy URL.
-// Routes Discord Gateway traffic through Render proxy (not WireGuard).
-function discordWsConnect(targetHost, targetPort, wsProxyUrl, timeout = 45000) {
-  if (!wsProxyUrl) return Promise.reject(new Error('no WebSocket proxy URL for Discord'));
-  if (!WebSocket) return Promise.reject(new Error('ws library not available'));
-
-  return new Promise((resolveWake) => {
-    const httpWakeUrl = wsProxyUrl.replace(/^wss:/i, 'https:').replace(/^ws:/i, 'http:');
-    try {
-      const u = new URL(httpWakeUrl);
-      const mod = u.protocol === 'https:' ? require('https') : require('http');
-      const wakeReq = mod.get(u, (res) => { res.resume(); resolveWake(); });
-      wakeReq.setTimeout(5000, () => { try { wakeReq.destroy(); } catch(e) {} resolveWake(); });
-      wakeReq.on('error', () => resolveWake());
-    } catch(e) { resolveWake(); }
-  }).then(() => {
-    return new Promise((resolve, reject) => {
-        let settled = false;
-        const effectiveTimeout = Math.max(timeout, 45000);
-        const timer = setTimeout(() => {
-          if (!settled) { settled = true; reject(new Error('discord ws tunnel timeout')); }
-        }, effectiveTimeout);
-
-        const wsUrl = wsProxyUrl.replace(/^https:/i, 'wss:');
-        let ws;
-        try {
-          ws = new WebSocket(wsUrl, { handshakeTimeout: 20000 });
-        } catch(e) {
-          clearTimeout(timer); reject(e); return;
-        }
-
-        let pendingWriteBuffer = [];
-        let tunnelReady = false;
-
-        const { Duplex } = require('stream');
-        const duplex = new Duplex({
-          write(data, encoding, callback) {
-            if (!tunnelReady) {
-              pendingWriteBuffer.push(Buffer.from(data));
-              callback(); return;
-            }
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(data, { binary: true }, callback);
-            } else {
-              callback(new Error('WebSocket closed'));
-            }
-          },
-          read(size) {
-            // Consumer buffer drained — resume WebSocket data flow if paused
-            if (ws && ws._socket && typeof ws._socket.isPaused === 'function' && ws._socket.isPaused()) {
-              try { ws._socket.resume(); } catch(e) {}
-            }
-          },
-          destroy(err, callback) {
-            try { ws.close(); } catch(e) {}
-            callback(err);
-          }
-        });
-        duplex.setMaxListeners(0);
-        duplex.on('error', () => {});
-
-        ws.on('message', (data, isBinary) => {
-          const str = !isBinary ? (typeof data === 'string' ? data : data.toString()) : '';
-          if (str.length > 0 && str[0] === '{') {
-            if (settled) return;
-            try {
-              const parsed = JSON.parse(str);
-              if (parsed.status === 'connected' || parsed.type === 'connected') {
-                tunnelReady = true;
-                clearTimeout(timer);
-                if (pendingWriteBuffer.length > 0) {
-                  const buf = Buffer.concat(pendingWriteBuffer);
-                  pendingWriteBuffer = [];
-                  if (ws.readyState === WebSocket.OPEN) ws.send(buf, { binary: true }, () => {});
-                }
-                if (!settled) { settled = true; duplex.emit('connect'); resolve(duplex); }
-                return;
-              }
-              if (parsed.error) {
-                clearTimeout(timer);
-                if (!settled) { settled = true; reject(new Error(parsed.error)); }
-                return;
-              }
-            } catch(e) {}
-            return;
-          }
-          const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-          if (buf.length > 0) {
-            if (!duplex.push(buf)) {
-              // Backpressure: consumer buffer full, pause WebSocket data flow
-              if (ws && ws._socket && typeof ws._socket.pause === 'function') {
-                try { ws._socket.pause(); } catch(e) {}
-              }
-            }
-          }
-        });
-
-        ws.on('open', () => {
-          // Enable TCP_NODELAY for low-latency streaming
-          if (ws._socket) {
-            try { ws._socket.setNoDelay(true); } catch(e) {}
-          }
-          ws.send(JSON.stringify({ host: targetHost, port: targetPort }), { binary: false });
-        });
-        ws.on('error', (e) => {
-          log(`[wsTrace] Discord WS ERROR: "${e?.message}" for ${targetHost}:${targetPort}`);
-          clearTimeout(timer); if (!settled) { settled = true; reject(e); }
-        });
-        ws.on('close', (code, reason) => {
-          log(`[wsTrace] Discord WS CLOSE: code=${code} for ${targetHost}:${targetPort}`);
-          clearTimeout(timer);
-          if (!tunnelReady && !settled) { settled = true; reject(new Error('Discord WS closed before tunnel ready')); }
-          duplex.push(null);
-        });
-    });
-  });
 }
 
 // HTTP CONNECT proxy fallback

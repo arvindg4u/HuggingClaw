@@ -5,7 +5,7 @@
  * This script intercepts:
  *   1. globalThis.fetch() for WhatsApp HTTP API calls → routes through Render proxy
  *   2. tls.connect() for WhatsApp WebSocket → routes through WebSocket TCP tunnel
- *      (/whatsapp-tcp on Render proxy, same pattern as Discord's /discord-ws)
+ *      (/whatsapp-tcp on Render proxy, WebSocket TCP tunnel)
  *
  * WHATSAPP_PROXY_BASE env var controls the HTTP proxy target (set by start.sh).
  * WHATSAPP_WS_PROXY_URL env var controls the WebSocket tunnel endpoint.
@@ -99,7 +99,7 @@ globalThis.fetch = function patchedWaFetch(input, init) {
 // Baileys creates TLS sockets via tls.connect() for WhatsApp WebSocket.
 // Instead of HTTP rewrite (which breaks WebSocket upgrades at the proxy),
 // use a raw TCP tunnel through Render proxy's /whatsapp-tcp endpoint.
-// Pattern: same as discordWsConnect() in cloudflare-proxy.js.
+// Pattern: WebSocket TCP tunnel through Render proxy (same protocol as WhatsApp's /whatsapp-tcp).
 //
 // Flow:
 //   Baileys → tls.connect("web.whatsapp.com", 443)

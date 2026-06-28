@@ -721,34 +721,6 @@ if [ -n "${WHATSAPP_PROXY_BASE:-}" ]; then
   echo "[whatsapp] WS tunnel: ${WHATSAPP_WS_PROXY_URL}"
 fi
 
-# Discord API root — discord-proxy.cjs rewrites discord.com to this proxy.
-DISCORD_PROXY_BASE="${DISCORD_PROXY_BASE:-https://render-proxy-ukjd.onrender.com/discord}"
-export DISCORD_PROXY_BASE
-
-# Discord Gateway WebSocket — routed through Render proxy (DISCORD_WS_PROXY_URL)
-# NOT through ROUTE_TARGETS/wg-proxy (WireGuard is only for opencode.ai).
-# REST API still goes through DISCORD_PROXY_BASE (handled by discord-proxy.cjs).
-# Discord loopback proxy — OpenClaw plugin requires loopback URL for proxy validation
-# Starts a local HTTP CONNECT proxy on 127.0.0.1.
-# All CONNECT requests forward via net.connect, intercepted by cloudflare-proxy.js.
-DISCORD_LOOPBACK_PORT="${DISCORD_LOOPBACK_PORT:-31285}"
-export DISCORD_LOOPBACK_PORT
-
-# Discord Gateway WebSocket tunnel URL \u2014 for cloudflare-proxy.js
-# Derived from DISCORD_PROXY_BASE (e.g., https://render-proxy-ukjd.onrender.com/discord)
-# → wss://render-proxy-ukjd.onrender.com/discord-ws
-if [ -n "${DISCORD_PROXY_BASE:-}" ]; then
-  DISCORD_WS_PROXY_URL="$(echo "$DISCORD_PROXY_BASE" | sed 's|^https://|wss://|;s|/discord$|/discord-ws|')"
-  export DISCORD_WS_PROXY_URL
-  echo "[discord] Gateway WS tunnel: ${DISCORD_WS_PROXY_URL}"
-fi
-if [ -n "${DISCORD_BOT_TOKEN:-}" ] && command -v node &>/dev/null; then
-  if [ ! -f /tmp/.discord_loopback_started ]; then
-    nohup node /home/node/app/discord-loopback-proxy.cjs > /tmp/discord-loopback.log 2>&1 &
-    echo "[discord] Loopback proxy started on 127.0.0.1:${DISCORD_LOOPBACK_PORT}"
-    touch /tmp/.discord_loopback_started
-  fi
-fi
 # Telegram (supports multiple user IDs, comma-separated)
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.plugins.entries.telegram = {"enabled": true}')
@@ -803,14 +775,6 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   fi
 fi
 
-# Discord config — enabled + loopback proxy for plugin validation
-if [ -n "${DISCORD_BOT_TOKEN:-}" ]; then
-  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.plugins.entries.discord = {"enabled": true}')
-  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq '.channels.discord.enabled = true')
-  # Set loopback proxy so Discord plugin proxy validation passes
-  CONFIG_JSON=$(echo "$CONFIG_JSON" | jq --arg proxy_port "${DISCORD_LOOPBACK_PORT:-31285}" 'del(.channels.discord.proxy // empty) | .channels.discord.accounts.default.proxy = "http://127.0.0.1:\($proxy_port)"')
-  echo "[discord] Config: loopback proxy http://127.0.0.1:${DISCORD_LOOPBACK_PORT:-31285}"
-fi
 
 # Write config
 EXISTING_CONFIG="/home/node/.openclaw/openclaw.json"
@@ -907,7 +871,7 @@ echo "$CURRENT_CONFIG" > "$EXISTING_CONFIG"
 # These preload scripts patch iframe embedding, API key rotation, and
 # proxy routing (ROUTE_ENDPOINT/ROUTE_TARGETS for SOCKS5/WS proxy).
 export NODE_PATH="${NODE_PATH:-/home/node/browser-deps/node_modules}"
-export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/dns-fix.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs --require /home/node/app/whatsapp-proxy.cjs --require /home/node/app/discord-proxy.cjs"
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /home/node/app/iframe-fix.cjs --require /home/node/app/dns-fix.cjs --require /opt/cloudflare-proxy.js --require /home/node/app/telegram-proxy.cjs --require /home/node/app/whatsapp-proxy.cjs"
 
 # ── Startup Summary ──
 echo ""
