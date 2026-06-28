@@ -25,9 +25,13 @@ try { WebSocket = require("ws"); } catch(e) { /* ws not available — continue w
 
 const log = (...args) => console.error("[hc-proxy]", ...args);
 
-// Keepalive agent for HTTPS proxy connections — reduces TCP setup overhead
-// for multiple requests to the same host through the proxy tunnel.
-const httpsKeepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 10, maxFreeSockets: 5, timeout: 60000 });
+// Keepalive agent for HTTPS proxy connections.
+// Once a TLS socket is established over a CONNECT tunnel, the agent keeps it
+// alive and reuses it for subsequent requests to the same host:port.
+// This eliminates TCP handshake + CONNECT + TLS setup on every request.
+// KeepAliveMsecs=30s between probes, freeSocketTimeout=5min (less than 30min VPN rotation)
+const httpsKeepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 10, maxFreeSockets: 5, timeout: 300000, keepAliveMsecs: 30000 });
+const httpKeepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: 10, maxFreeSockets: 5, timeout: 60000 });
 
 
 // ── Proxy Routing Config ──
@@ -388,9 +392,11 @@ https.request = function(...args) {
 
   if (opts._hc || !needsProxy(hn)) return origHttps.call(this, ...args);
 
-  // For proxied hosts: provide createConnection that establishes
-  // proxy tunnel + TLS. Node's ClientRequest calls createConnection
-  // and waits for the callback with the fully connected TLS socket.
+  // For proxied hosts: provide createConnection that establishes a raw
+  // CONNECT tunnel through the VPN. Node's https.Agent then wraps TLS
+  // on top and pools the resulting TLS socket for keepalive reuse.
+  // On subsequent requests to the same host:port the agent skips
+  // createConnection entirely — no new tunnel, no new TLS.
   const nopts = { ...opts, _hc: true };
   nopts.createConnection = (options, callback) => {
     let settled = false;
@@ -400,18 +406,13 @@ https.request = function(...args) {
       if (typeof callback === 'function') callback(err, socket);
     };
     proxyConnect(hn, port)
-      .then((tunnel) => {
-        const tlsSocket = tls.connect({
-          socket: tunnel,
-          host: hn,
-          servername: options.servername || hn,
-          rejectUnauthorized: options.rejectUnauthorized !== false,
-        }, () => cbOnce(null, tlsSocket));
-        tlsSocket.on('error', cbOnce);
-      })
+      .then((tunnel) => cbOnce(null, tunnel))
       .catch(cbOnce);
   };
-    // nopts.agent = httpsKeepAliveAgent; // FIXED
+  // Assign keepalive agent so Node pools TLS sockets per target host.
+  // Each pooled TLS socket sits on a persistent CONNECT tunnel through
+  // the VPN — zero tunnel setup overhead on reused sockets.
+  nopts.agent = httpsKeepAliveAgent;
   return origHttps.call(this, nopts, cb);
 };
 
@@ -471,7 +472,7 @@ http.request = function(...args) {
 
   if (opts._hc || !needsProxy(hn)) return origHttp.call(this, ...args);
 
-  const nopts = { ...opts, _hc: true, createConnection: (o, c) => {
+  const nopts = { ...opts, _hc: true, agent: httpKeepAliveAgent, createConnection: (o, c) => {
     proxyConnect(o.host || o.hostname || "localhost", o.port || 80).then(s => c(null, s)).catch(e => c(e));
     // Don't return new net.Socket() — Node uses callback when undefined.
   }};
@@ -587,10 +588,10 @@ function applyFetchPatch() {
       const nodeReq = https.request(url, {
         method: req.method,
         headers: { ...headers, "x-hc": "true" },
+        agent: httpsKeepAliveAgent,
         createConnection: (o, c) => {
           proxyConnect(o.host || o.hostname || "localhost", o.port || 443, 30000)
             .then(s => c(null, s)).catch(e => c(e));
-          // Don't return new net.Socket() — Node uses callback when undefined.
         },
         timeout: 30000,
       }, (res) => {
