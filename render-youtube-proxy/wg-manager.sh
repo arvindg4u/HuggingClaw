@@ -21,7 +21,7 @@ WIREPROXY="/usr/local/bin/wireproxy"
 
 HEALTH_INTERVAL=30
 HEALTH_THRESHOLD=2
-HEALTH_TEST_URL="${HEALTH_TEST_URL:-https://icanhazip.com}"
+HEALTH_TEST_URL="${HEALTH_TEST_URL:-https://api.opencode.ai/api}"
 
 # ── 4 built-in Proton VPN FREE WireGuard configs (Singapore) ──
 # Format: privateKey|peerPublicKey|endpoint
@@ -97,7 +97,7 @@ DNS = 10.2.0.1
 PublicKey = ${peer}
 Endpoint = ${ep}
 AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
+PersistentKeepalive = 15
 
 [http]
 BindAddress = 127.0.0.1:${TUNNEL_PORT}

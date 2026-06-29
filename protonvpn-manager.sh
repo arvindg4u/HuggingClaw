@@ -3,12 +3,12 @@
 # 🛡️  Proton VPN Manager — WireGuard tunnel via wireproxy.
 #     Userspace — no TUN/NET_ADMIN needed. Works on HF Spaces.
 #
-#     17 Proton VPN FREE WireGuard configs (US/EU).
+#     17 Proton VPN FREE WireGuard configs (US).
 #     Uses HTTP CONNECT (standard HTTPS tunnel, not SOCKS5).
 #
 #     Features:
-#     - 30-min automatic IP rotation
-#     - 60-sec health check (curl via tunnel → icanhazip.com)
+#     - 10-min automatic IP rotation
+#     - 20-sec health check (curl via tunnel → https://api.opencode.ai/api (full TLS))
 #     - 2 consecutive failures → immediate auto-rotate to next peer
 #     - WireGuard process watchdog
 # ════════════════════════════════════════════════════════════════
@@ -19,7 +19,7 @@ log()  { echo "[hc-vpn] $(date '+%Y-%m-%d %H:%M:%S') $*"; }
 err()  { echo "[hc-vpn] ERROR: $*" >&2; }
 warn() { echo "[hc-vpn] WARNING: $*" >&2; }
 
-ROTATE="${PROTONVPN_ROTATE_INTERVAL:-30}"
+ROTATE="${PROTONVPN_ROTATE_INTERVAL:-10}"
 TUNNEL_PORT=25345
 STATE_DIR="/home/node/.protonvpn"
 STATUS_FILE="${STATE_DIR}/status"
@@ -29,11 +29,10 @@ WIREPROXY="/usr/local/bin/wireproxy"
 WIREPROXY_TMP="/tmp/wireproxy"
 
 # Health check config
-HEALTH_INTERVAL=60          # check every 60 seconds
+HEALTH_INTERVAL=20          # check every 20 seconds (faster dead peer detection)
 HEALTH_THRESHOLD=2          # 2 consecutive failures = trigger rotate
-HEALTH_TEST_URL="${HEALTH_TEST_URL:-https://icanhazip.com}"
 
-# ── 17 Proton VPN FREE WireGuard configs (US/EU) ──
+# ── 17 Proton VPN FREE WireGuard configs (US) ──
 declare -a WG_PEERS=(
   "SH3bUChOJ4P7h93xjW8bz/CqeKrdl/9Z4J1EXwH4RUE=|Uqp1/VJ/Lz2VoN/2D0HEG7G8WDxLJm7+JNC5KZrUREw=|149.88.30.88:51820"
   "oDs/VVhAgFelbHPBGDFo+SiJC1MeVlhftJWXNRj9rGY=|oGVahl/rkt0i22DILrVpPSmYZmqcmSup/HQ/upVf2Vg=|138.199.35.120:51820"
@@ -109,7 +108,7 @@ DNS = 10.2.0.1
 PublicKey = ${peer}
 Endpoint = ${ep}
 AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
+PersistentKeepalive = 15
 
 [http]
 BindAddress = 127.0.0.1:${TUNNEL_PORT}
@@ -142,10 +141,10 @@ start_tunnel() {
     fi
     if (timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/${TUNNEL_PORT}" 2>/dev/null); then
       log "Tunnel active (PID ${pid}, port ${TUNNEL_PORT})."
-      # Verify exit IP immediately
+      # Verify exit IP immediately (separate from connectivity check)
       local ext_ip
-      ext_ip=$(curl -s --max-time 10 --proxy "http://127.0.0.1:${TUNNEL_PORT}" \
-        "${HEALTH_TEST_URL}" 2>/dev/null || echo "")
+      ext_ip=$(curl -s --max-time 5 --proxy "http://127.0.0.1:${TUNNEL_PORT}" \
+        "https://icanhazip.com" 2>/dev/null || echo "")
       if [ -n "$ext_ip" ]; then
         log "Exit IP: ${ext_ip}"
         write_tunnel_ip "$ext_ip"
@@ -178,15 +177,26 @@ stop_tunnel() {
 # Returns 0 if healthy, 1 if dead.
 health_check() {
   local ip
+  # Primary: opencode.ai exercises real API tunnel path
+  local op_response
+  op_response=$(curl -s --max-time 10 --proxy "http://127.0.0.1:${TUNNEL_PORT}" \
+    "https://api.opencode.ai/api" 2>/dev/null || echo "")
+  if [ -n "$op_response" ]; then
+    # Tunnel works — get actual exit IP from icanhazip.com
+    ip=$(curl -s --max-time 5 --proxy "http://127.0.0.1:${TUNNEL_PORT}" \
+      "https://icanhazip.com" 2>/dev/null || echo "$op_response")
+    write_tunnel_ip "$ip"
+    return 0
+  fi
+  # Fallback: icanhazip.com alone
   ip=$(curl -s --max-time 10 --proxy "http://127.0.0.1:${TUNNEL_PORT}" \
-    "${HEALTH_TEST_URL}" 2>/dev/null || echo "")
+    "https://icanhazip.com" 2>/dev/null || echo "")
   if [ -n "$ip" ]; then
     write_tunnel_ip "$ip"
     return 0
   fi
   return 1
 }
-
 # ── Verify wireproxy process is alive ──
 wireproxy_alive() {
   local pf="${STATE_DIR}/run/pid"
@@ -237,6 +247,28 @@ run_service() {
           write_health "rotating (manual)"
           write_status "rotating"
           break
+        fi
+
+        # Check for fast health probe sentinel (from cloudflare-proxy.js tunnel failure)
+        if [ -f /tmp/tunnel-fast-probe ]; then
+          rm -f /tmp/tunnel-fast-probe
+          log "Fast health probe requested (from proxy layer). Running out-of-cycle health check..."
+          if health_check; then
+            log "Fast health probe passed."
+            if [ "$consecutive_failures" -gt 0 ]; then
+              consecutive_failures=0
+              write_health "ok"
+            fi
+          else
+            consecutive_failures=$((consecutive_failures + 1))
+            write_health "fail (fast:${consecutive_failures}/${HEALTH_THRESHOLD})"
+            warn "Fast health probe failed (${consecutive_failures}/${HEALTH_THRESHOLD})."
+            if [ "$consecutive_failures" -ge "$HEALTH_THRESHOLD" ]; then
+              warn "Health threshold reached (fast probe)! Rotating to next peer..."
+              write_health "rotating (fast-threshold)"
+              break
+            fi
+          fi
         fi
 
         # Run health checks at configured interval

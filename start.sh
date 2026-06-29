@@ -1724,7 +1724,7 @@ start_protonvpn_vpn() {
 
   [ -f /home/node/app/protonvpn-manager.sh ] || { echo "[hc-vpn] manager not found."; return 0; }
 
-  echo "[hc-vpn] Starting WireGuard tunnel (4 Singapore Proton VPN configs)..."
+  echo "[hc-vpn] Starting WireGuard tunnel (17 Proton VPN FREE WireGuard configs (US))..."
 
   # Quick pre-check
   local check; check=$(/home/node/app/protonvpn-manager.sh check 2>/dev/null) || true

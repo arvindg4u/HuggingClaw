@@ -116,11 +116,143 @@ function drainKeepaliveAgents() {
   return count;
 }
 
+// ── Shared ECONNRESET recovery for keepalive agent sockets ──
+// When a reused pooled socket gets ECONNRESET/EPIPE (VPN rotated between
+// keepalive checks), drains all stale sockets from the agent and reissues
+// the request with a fresh CONNECT tunnel. Fires exactly once (retried guard).
+// Works for both https.request and http.request since they share the same
+// ClientRequest API with reusedSocket property.
+function attachReusedSocketRecovery(req, origMethod, ctx, nopts, hn, port, cb) {
+  let retried = false;
+  const errorHandler = (err) => {
+    if (retried) return;
+    if (!req.reusedSocket) return;
+    if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') return;
+    retried = true;
+    drainKeepaliveAgents();
+    log('[tunnel] ECONNRESET on reused socket — reissuing request with fresh tunnel for ' + hn + ':' + port);
+    const retryOpts = { ...nopts };
+    retryOpts.createConnection = (options, callback) => {
+      let settled = false;
+      const cbOnce = (err, socket) => {
+        if (settled) return;
+        settled = true;
+        if (typeof callback === 'function') callback(err, socket);
+      };
+      proxyConnect(hn, port)
+        .then((tunnel) => cbOnce(null, tunnel))
+        .catch(cbOnce);
+    };
+    retryOpts.agent = nopts.agent;
+    origMethod.call(ctx, retryOpts, cb);
+  };
+  req.on('error', errorHandler);
+  return req;
+}
+
+// ── Fast active tunnel probe ──
+// Fast tunnel probe: cache results for 5 seconds.
+// On confirmed failure: marks tunnel dead, drains agents, signals rotate.
+let tunnelProbeCache = 0;
+let tunnelProbeHealthy = false;
+const TUNNEL_PROBE_TTL = 5000;
+
+// Raw CONNECT tunnel — like tunnelHttpConnect but does NOT check
+// tunnelAvailable, so it can be used for out-of-cycle health probing.
+function rawTunnelConnect(targetHost, targetPort, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    const s = net.createConnection({ host: TUNNEL_HOST, port: TUNNEL_PORT }, () => {
+      s.setKeepAlive(true, 15000);
+      s.setNoDelay(true);
+      s.write('CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\nHost: ' + targetHost + ':' + targetPort + '\r\n\r\n');
+    });
+    let responded = false;
+    const cleanup = () => { s.removeAllListeners(); s.destroy(); };
+    s.setTimeout(timeout, () => { cleanup(); reject(new Error('probe CONNECT timeout')); });
+    s.once('data', (data) => {
+      responded = true;
+      if (data.toString().startsWith('HTTP/1.1 2') || data.toString().startsWith('HTTP/1.0 2')) {
+        resolve(s);
+      } else {
+        cleanup();
+        reject(new Error('probe CONNECT rejected: ' + data.toString().split('\r\n')[0]));
+      }
+    });
+    s.on('error', (err) => { if (!responded) { cleanup(); reject(err); } });
+    s.on('close', () => { if (!responded) { cleanup(); reject(new Error('probe CONNECT closed')); } });
+  });
+}
+
+// Active probe: opens a raw CONNECT tunnel to httpbin.org:80, sends GET /ip,
+// and confirms the exit IP is a valid address. Caches result for 5s.
+async function probeTunnelNow() {
+  const now = Date.now();
+  if (now - tunnelProbeCache < TUNNEL_PROBE_TTL) return tunnelProbeHealthy;
+  try {
+    const socket = await rawTunnelConnect('httpbin.org', 80, 10000);
+    const result = await new Promise((resolve) => {
+      let responded = false;
+      const timer = setTimeout(() => {
+        if (!responded) { responded = true; try { socket.destroy(); } catch(_) {} resolve(false); }
+      }, 8000);
+      let respData = '';
+      socket.on('data', (chunk) => {
+        respData += chunk.toString();
+        if (respData.includes('\r\n\r\n') && !responded) {
+          responded = true;
+          clearTimeout(timer);
+          try { socket.destroy(); } catch(_) {}
+          const headerEnd = respData.indexOf('\r\n\r\n');
+          const body = respData.substring(headerEnd + 4).trim();
+          resolve(body.length > 0 && /^[\d.]+$/.test(body));
+        }
+      });
+      socket.on('error', () => { if (!responded) { responded = true; clearTimeout(timer); resolve(false); } });
+      socket.on('close', () => { if (!responded) { responded = true; clearTimeout(timer); resolve(false); } });
+      socket.write('GET /ip HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n');
+    });
+    tunnelProbeHealthy = result;
+    tunnelProbeCache = Date.now();
+    log('[tunnel] Fast probe: ' + (result ? 'HEALTHY (exit IP verified)' : 'FAILED (no valid exit IP)'));
+    return result;
+  } catch (e) {
+    tunnelProbeHealthy = false;
+    tunnelProbeCache = Date.now();
+    log('[tunnel] Fast probe: FAILED (' + e.message + ')');
+    return false;
+  }
+}
+
+// Bypass all probe/status caches and fire an immediate background probe.
+// On confirmed dead: marks tunnel unavailable, drains agents, signals rotate.
+function forceCheckTunnel() {
+  tunnelProbeCache = 0;
+  tunnelLastCheck = 0;
+  probeTunnelNow().then((healthy) => {
+    if (!healthy) {
+      tunnelAvailable = false;
+      drainKeepaliveAgents();
+      try { fs.writeFileSync('/tmp/tunnel-fast-probe', Date.now().toString()); } catch(_) {}
+      log('[tunnel] Force probe confirmed dead — tunnel marked unavailable, agents drained, rotate signaled');
+    }
+  });
+}
+
 // Track previous tunnel state for transition detection
 let tunnelPrevConnected = false;
 
-function checkTunnel() {
+function checkTunnel(useFastProbe) {
   const now = Date.now();
+  
+  // Fast path: use active probe cache with 5s TTL (called on every proxyConnect)
+  if (useFastProbe) {
+    if (now - tunnelProbeCache < TUNNEL_PROBE_TTL) return tunnelProbeHealthy;
+    // No fresh probe result — return best guess (tunnel is either up or we'll
+    // discover it's dead on the actual CONNECT attempt and retry)
+    return tunnelAvailable;
+  }
+  
+  // Normal path: check status file every TUNNEL_CHECK_INTERVAL (15s)
   if (now - tunnelLastCheck < TUNNEL_CHECK_INTERVAL) return tunnelAvailable;
   tunnelLastCheck = now;
   let currentlyConnected = false;
@@ -135,15 +267,11 @@ function checkTunnel() {
   
   // Detect state transitions
   if (currentlyConnected && !tunnelPrevConnected) {
-    // Reconnected — drain stale keepalive sockets
     log('[tunnel] Proton VPN active — routing outbound traffic through WireGuard tunnel');
     drainKeepaliveAgents();
   } else if (!currentlyConnected && tunnelPrevConnected) {
-    // Disconnected — drain keepalive sockets immediately
     log('[tunnel] Proton VPN disconnected — draining keepalive sockets');
     drainKeepaliveAgents();
-  } else if (currentlyConnected && tunnelPrevConnected) {
-    // Still connected — no action needed
   }
   
   tunnelAvailable = currentlyConnected;
@@ -154,6 +282,26 @@ function checkTunnel() {
 setInterval(() => {
   checkTunnel();
 }, TUNNEL_CHECK_INTERVAL).unref();
+
+// ── Proactive rotation counter ──
+// After N successful tunnel requests, preemptively rotate the
+// tunnel even if the timer hasn't expired yet.
+let tunnelRequestCount = 0;
+const PROACTIVE_ROTATE_REQUESTS = parseInt(process.env.PROACTIVE_ROTATE_REQUESTS || '50', 10);
+
+let lastProactiveRotate = 0;
+
+function incrementProactiveCounter() {
+  tunnelRequestCount++;
+  if (tunnelRequestCount >= PROACTIVE_ROTATE_REQUESTS) {
+    tunnelRequestCount = 0;
+    const now = Date.now();
+    if (now - lastProactiveRotate < 120000) return; // 2-min cooldown between proactive rotations
+    lastProactiveRotate = now;
+    try { fs.writeFileSync('/tmp/protonvpn-force-rotate', Date.now().toString()); } catch(_) {}
+    log('[tunnel] Proactive rotation triggered after ' + PROACTIVE_ROTATE_REQUESTS + ' requests — signaled manager');
+  }
+}
 
 // HTTP CONNECT proxy through the local WireGuard tunnel
 // Sends a standard HTTP CONNECT request (RFC 7231) — same mechanism HTTPS uses
@@ -179,6 +327,10 @@ function tunnelHttpConnect(targetHost, targetPort, timeout = 30000) {
     });
     s.on('error', (err) => { if (!responded) { cleanup(); reject(err); } });
     s.on('close', () => { if (!responded) { cleanup(); reject(new Error('HTTP CONNECT closed')); } });
+  }).then((socket) => {
+    // Count this as a successful tunnel request (triggers proactive rotation at threshold)
+    incrementProactiveCounter();
+    return socket;
   });
 }
 
@@ -209,14 +361,21 @@ const needsProxy = (h) => !isInternal(h) && domainMatch(h, SOCKS5_DOMAINS);
 
 // SOCKS5 connect helper
 // Connect through proxy: tries local WireGuard tunnel first, then SOCKS5, HTTP CONNECT, direct
-function proxyConnect(targetHost, targetPort, timeout = 30000) {
-  // Step 1: Try local WireGuard tunnel for ALL external traffic
-  // This routes through Proton VPN via HTTP CONNECT (standard HTTPS tunneling)
-  if (!isInternal(targetHost) && checkTunnel()) {
+function proxyConnect(targetHost, targetPort, timeout = 10000) {
+  // Fast path: check tunnel with 5s TTL probe cache
+  if (!isInternal(targetHost) && checkTunnel(true)) {
     return tunnelHttpConnect(targetHost, targetPort, timeout)
       .catch(() => {
-        // Tunnel failed — fall through to SOCKS5/direct routing
-        return proxyConnectFallback(targetHost, targetPort, timeout);
+        // Quick port check — if tunnel port is gone, skip retry and fall through immediately
+        if (!isTunnelPortListening()) {
+          tunnelAvailable = false;
+          drainKeepaliveAgents();
+          try { fs.writeFileSync('/tmp/tunnel-fast-probe', Date.now().toString()); } catch(_) {}
+          log('[tunnel] Port not listening — skipping retry, falling through to SOCKS5/direct');
+          return proxyConnectFallback(targetHost, targetPort, timeout);
+        }
+        // Port is still up — transient failure, retry with fresh CONNECT
+        return tunnelHttpConnect(targetHost, targetPort, 10000);
       });
   }
   return proxyConnectFallback(targetHost, targetPort, timeout);
@@ -450,36 +609,8 @@ https.request = function(...args) {
   // Each pooled TLS socket sits on a persistent CONNECT tunnel through
   // the VPN — zero tunnel setup overhead on reused sockets.
   nopts.agent = httpsKeepAliveAgent;
-  // Create the request, then attach an ECONNRESET recovery handler.
-  // When the VPN rotates between keepalive checks, a reused TLS socket
-  // silently dies. The next write = ECONNRESET. We intercept this,
-  // drain the stale agent pool, and reissue with a fresh tunnel.
   const req = origHttps.call(this, nopts, cb);
-  let retried = false;
-  req.on('error', (err) => {
-    if (retried) return;
-    if (!req.reusedSocket) return;
-    if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') return;
-    retried = true;
-    drainKeepaliveAgents();
-    log('[tunnel] ECONNRESET on reused socket — reissuing request with fresh tunnel for ' + hn + ':' + port);
-    // Build a fresh opts with forced createConnection (bypass agent pool)
-    const retryOpts = { ...nopts };
-    retryOpts.createConnection = (options, callback) => {
-      let settled = false;
-      const cbOnce = (err, socket) => {
-        if (settled) return;
-        settled = true;
-        if (typeof callback === 'function') callback(err, socket);
-      };
-      proxyConnect(hn, port)
-        .then((tunnel) => cbOnce(null, tunnel))
-        .catch(cbOnce);
-    };
-    // Use origHttps with a fresh agent pool for this retry
-    retryOpts.agent = httpsKeepAliveAgent;
-    origHttps.call(this, retryOpts, cb);
-  });
+  attachReusedSocketRecovery(req, origHttps, this, nopts, hn, port, cb);
   return req;
 };
 
@@ -543,7 +674,9 @@ http.request = function(...args) {
     proxyConnect(o.host || o.hostname || "localhost", o.port || 80).then(s => c(null, s)).catch(e => c(e));
     // Don't return new net.Socket() — Node uses callback when undefined.
   }};
-  return origHttp.call(this, nopts, cb);
+  const req = origHttp.call(this, nopts, cb);
+  attachReusedSocketRecovery(req, origHttp, this, nopts, hn, port, cb);
+  return req;
 };
 
 // Cloudflare Worker proxy URL for Telegram (set via env CLOUDFLARE_PROXY_URL)
@@ -671,7 +804,12 @@ function applyFetchPatch() {
           }));
         });
       });
-      nodeReq.on("error", (e) => { reject(e); });
+      nodeReq.on("error", (e) => {
+        // Don't reject on reused socket ECONNRESET — the https.request retry handler
+        // will reissue the request with a fresh tunnel. Let that retry complete.
+        if (nodeReq.reusedSocket && (e.code === 'ECONNRESET' || e.code === 'EPIPE')) return;
+        reject(e);
+      });
       nodeReq.on("timeout", () => { nodeReq.destroy(); reject(new Error('fetch timeout')); });
 
       if (req.body && typeof req.body.getReader === "function") {
@@ -740,7 +878,14 @@ net.connect = function(...args) {
       s.on("data", (d) => { socks.push(d); });
       s.on("end", () => { socks.emit("end"); });
       s.on("close", () => { socks.emit("close"); });
-      s.on("error", (e) => { socks.emit("error", e); });
+      s.on("error", (e) => {
+        // Tunnel socket ECONNRESET — drain stale agent sockets
+        if (e.code === 'ECONNRESET' || e.code === 'EPIPE') {
+          drainKeepaliveAgents();
+          log('[tunnel] net.connect tunnel socket ' + e.code + ' — drained keepalive agents');
+        }
+        socks.emit("error", e);
+      });
     })
     .catch(e => { socks.emit("error", e); });
 
@@ -807,6 +952,13 @@ tls.connect = function(...args) {
     // Callback mode: establish tunnel, then TLS, then call cb
     proxyConnect(hn, opts.port || 443)
       .then((tunnel) => {
+        // Drain agents on tunnel socket ECONNRESET (VPN rotation between checks)
+        tunnel.on('error', (e) => {
+          if (e.code === 'ECONNRESET' || e.code === 'EPIPE') {
+            drainKeepaliveAgents();
+            log('[tunnel] tls.connect tunnel socket ' + e.code + ' — drained keepalive agents');
+          }
+        });
         const tlsSocket = origTlsConnect({
           socket: tunnel,
           host: opts.host || hn,
