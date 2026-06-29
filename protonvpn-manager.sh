@@ -272,7 +272,10 @@ run_service() {
         fi
 
         # Run health checks at configured interval
-        if [ $((elapsed_seconds % HEALTH_INTERVAL)) -eq 0 ]; then
+        # Adaptive interval: after a failure, poll every 10s for faster recovery
+        local check_interval=$HEALTH_INTERVAL
+        [ "$consecutive_failures" -gt 0 ] && check_interval=10
+        if [ $((elapsed_seconds % check_interval)) -eq 0 ]; then
           local elapsed_minutes=$((elapsed_seconds / 60))
 
           # 1. Check wireproxy process is alive
@@ -310,16 +313,29 @@ run_service() {
       write_health "start-failed"
 
       if [ "$total_failed_configs" -ge "$max_fails" ]; then
-        err "All ${TOTAL} configs failed. Giving up."
-        write_status "failed (all)"
+        warn "All ${TOTAL} configs failed. Waiting 30s before retry cycle..."
+        write_status "retrying"
         write_health "dead (exhausted)"
-        return 1
+        sleep 30
+        total_failed_configs=0
+        idx=0
+        continue
       fi
     fi
 
+    # Log current peer before rotating
+    local old_entry="${WG_PEERS[$idx]}"
+    local old_ip
+    IFS='|' read -r _ _ old_endpoint <<< "$old_entry"
+    old_ip=$(echo "$old_endpoint" | cut -d: -f1)
+
     # Rotate to next peer
     idx=$(( (idx + 1) % TOTAL ))
-    log "Rotating to config $((idx+1))/${TOTAL}..."
+    local new_entry="${WG_PEERS[$idx]}"
+    local new_ip
+    IFS='|' read -r _ _ new_endpoint <<< "$new_entry"
+    new_ip=$(echo "$new_endpoint" | cut -d: -f1)
+    log "Rotated: ${old_ip} -> ${new_ip} (peer $((idx+1))/${TOTAL})"
   done
 }
 

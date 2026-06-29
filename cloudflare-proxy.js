@@ -105,11 +105,12 @@ function drainKeepaliveAgents() {
     agent.freeSockets = {};
     // Also destroy any sockets still in the request queue
     if (agent.requests) {
-      const reqs = agent.requests;
-      agent.requests = {};
-      for (const key of Object.keys(reqs || {})) {
-        // Let queued requests naturally create new connections
+      for (const reqQueue of Object.values(agent.requests)) {
+        for (const req of reqQueue) {
+          try { req.destroy(new Error('tunnel disconnected')); } catch(_) {}
+        }
       }
+      agent.requests = {};
     }
   }
   if (count > 0) log('[tunnel] drained ' + count + ' idle keepalive socket(s) after tunnel state change');

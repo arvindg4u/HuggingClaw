@@ -3,6 +3,8 @@ set -euo pipefail
 
 umask 0077
 
+export TZ=Asia/Kolkata
+
 # ════════════════════════════════════════════════════════════════
 # HuggingClaw — OpenClaw Gateway for HF Spaces
 # ════════════════════════════════════════════════════════════════
