@@ -31,14 +31,16 @@ def get_video_id(video_input):
 
 def parse_vtt(text):
     lines = []
+    prev = None
     for line in text.split("\n"):
         line = line.strip()
         if not line or line.startswith("WEBVTT") or line.startswith("Kind:") or line.startswith("Language:") or "-->" in line or line.isdigit():
             continue
         line = re.sub(r'<[^>]+>', '', line)
         line = line.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        if line:
+        if line and line != prev:
             lines.append(line)
+            prev = line
     return " ".join(lines)
 
 

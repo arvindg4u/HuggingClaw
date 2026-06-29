@@ -160,7 +160,7 @@ const TUNNEL_PROBE_TTL = 5000;
 
 // Raw CONNECT tunnel — like tunnelHttpConnect but does NOT check
 // tunnelAvailable, so it can be used for out-of-cycle health probing.
-function rawTunnelConnect(targetHost, targetPort, timeout = 10000) {
+function rawTunnelConnect(targetHost, targetPort, timeout = 5000) {
   return new Promise((resolve, reject) => {
     const s = net.createConnection({ host: TUNNEL_HOST, port: TUNNEL_PORT }, () => {
       s.setKeepAlive(true, 15000);
@@ -244,12 +244,25 @@ let tunnelPrevConnected = false;
 
 function checkTunnel(useFastProbe) {
   const now = Date.now();
-  
+
   // Fast path: use active probe cache with 5s TTL (called on every proxyConnect)
   if (useFastProbe) {
     if (now - tunnelProbeCache < TUNNEL_PROBE_TTL) return tunnelProbeHealthy;
-    // No fresh probe result — return best guess (tunnel is either up or we'll
-    // discover it's dead on the actual CONNECT attempt and retry)
+    // Cache is stale. If tunnel was previously dead, check whether it has
+    // just come back (manager reconnected while we were in stale-cache limbo).
+    // This prevents up to 15s of unnecessary bypass after VPN recovers.
+    if (!tunnelAvailable) {
+      try {
+        const st = fs.readFileSync(TUNNEL_STATUS_FILE, 'utf8').trim();
+        if (st === 'connected' && isTunnelPortListening()) {
+          tunnelAvailable = true;
+          tunnelPrevConnected = true;
+          drainKeepaliveAgents();
+          log('[tunnel] Tunnel appears to have reconnected — marked available');
+          return true;
+        }
+      } catch(e) {}
+    }
     return tunnelAvailable;
   }
   
@@ -306,7 +319,7 @@ function incrementProactiveCounter() {
 
 // HTTP CONNECT proxy through the local WireGuard tunnel
 // Sends a standard HTTP CONNECT request (RFC 7231) — same mechanism HTTPS uses
-function tunnelHttpConnect(targetHost, targetPort, timeout = 30000) {
+function tunnelHttpConnect(targetHost, targetPort, timeout = 5000) {
   return new Promise((resolve, reject) => {
     if (!tunnelAvailable) return reject(new Error('Tunnel not available'));
     const s = net.createConnection({ host: TUNNEL_HOST, port: TUNNEL_PORT }, () => {
@@ -362,21 +375,20 @@ const needsProxy = (h) => !isInternal(h) && domainMatch(h, SOCKS5_DOMAINS);
 
 // SOCKS5 connect helper
 // Connect through proxy: tries local WireGuard tunnel first, then SOCKS5, HTTP CONNECT, direct
-function proxyConnect(targetHost, targetPort, timeout = 10000) {
+function proxyConnect(targetHost, targetPort, timeout = 5000) {
   // Fast path: check tunnel with 5s TTL probe cache
   if (!isInternal(targetHost) && checkTunnel(true)) {
     return tunnelHttpConnect(targetHost, targetPort, timeout)
       .catch(() => {
-        // Quick port check — if tunnel port is gone, skip retry and fall through immediately
-        if (!isTunnelPortListening()) {
-          tunnelAvailable = false;
-          drainKeepaliveAgents();
-          try { fs.writeFileSync('/tmp/tunnel-fast-probe', Date.now().toString()); } catch(_) {}
-          log('[tunnel] Port not listening — skipping retry, falling through to SOCKS5/direct');
-          return proxyConnectFallback(targetHost, targetPort, timeout);
-        }
-        // Port is still up — transient failure, retry with fresh CONNECT
-        return tunnelHttpConnect(targetHost, targetPort, 10000);
+        // CONNECT failed — tunnel is dead regardless of whether the port
+        // is listening (WireGuard UDP can be down while wireproxy process
+        // is still alive). Mark dead immediately and signal rotate rather
+        // than retrying (which would waste another timeout).
+        tunnelAvailable = false;
+        drainKeepaliveAgents();
+        try { fs.writeFileSync('/tmp/tunnel-fast-probe', Date.now().toString()); } catch(_) {}
+        log('[tunnel] CONNECT failed — marking dead, falling through to SOCKS5/direct');
+        return proxyConnectFallback(targetHost, targetPort, timeout);
       });
   }
   return proxyConnectFallback(targetHost, targetPort, timeout);
@@ -791,7 +803,7 @@ function applyFetchPatch() {
         headers: { ...headers, "x-hc": "true" },
         agent: httpsKeepAliveAgent,
         createConnection: (o, c) => {
-          proxyConnect(o.host || o.hostname || "localhost", o.port || 443, 30000)
+          proxyConnect(o.host || o.hostname || "localhost", o.port || 443)
             .then(s => c(null, s)).catch(e => c(e));
         },
         timeout: 30000,

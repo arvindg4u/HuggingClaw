@@ -70,16 +70,20 @@ def get_video_id(video_input: str) -> str:
 
 
 def parse_vtt(text: str) -> str:
-    """Extract plain text from VTT subtitle content."""
+    """Extract plain text from VTT subtitle content.
+    Deduplicates consecutive identical lines (auto-generated captions
+    often repeat each cue 3 times due to overlapping language variants)."""
     lines = []
+    prev = None
     for line in text.split("\n"):
         line = line.strip()
         if not line or line.startswith("WEBVTT") or line.startswith("Kind:") or line.startswith("Language:") or "-->" in line or line.isdigit():
             continue
         line = re.sub(r'<[^>]+>', '', line)
         line = line.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        if line:
+        if line and line != prev:
             lines.append(line)
+            prev = line
     return " ".join(lines)
 
 
