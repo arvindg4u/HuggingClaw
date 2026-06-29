@@ -30,8 +30,8 @@ const log = (...args) => console.error("[hc-proxy]", ...args);
 // alive and reuses it for subsequent requests to the same host:port.
 // This eliminates TCP handshake + CONNECT + TLS setup on every request.
 // KeepAliveMsecs=30s between probes, freeSocketTimeout=5min (less than 30min VPN rotation)
-const httpsKeepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 10, maxFreeSockets: 5, timeout: 300000, keepAliveMsecs: 30000 });
-const httpKeepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: 10, maxFreeSockets: 5, timeout: 60000 });
+const httpsKeepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 8, maxFreeSockets: 3, timeout: 300000, keepAliveMsecs: 30000, scheduling: "lifo", agentKeepAliveTimeoutBuffer: 3000 });
+const httpKeepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: 8, maxFreeSockets: 3, timeout: 60000, scheduling: "lifo", agentKeepAliveTimeoutBuffer: 3000 });
 
 
 // ── Proxy Routing Config ──
@@ -90,34 +90,69 @@ function isTunnelPortListening() {
   } catch(e) { return false; }
 }
 
+// Drain all idle keepalive sockets so the next request creates a fresh CONNECT tunnel.
+// Called on tunnel disconnect (to evict stale sockets that point at the dead peer) and
+// on reconnect (to avoid hitting stale TLS state that may silently fail).
+function drainKeepaliveAgents() {
+  let count = 0;
+  for (const agent of [httpsKeepAliveAgent, httpKeepAliveAgent]) {
+    for (const [key, freeSockets] of Object.entries(agent.freeSockets || {})) {
+      for (const sock of freeSockets) {
+        try { sock.destroy(); } catch(_) {}
+        count++;
+      }
+    }
+    agent.freeSockets = {};
+    // Also destroy any sockets still in the request queue
+    if (agent.requests) {
+      const reqs = agent.requests;
+      agent.requests = {};
+      for (const key of Object.keys(reqs || {})) {
+        // Let queued requests naturally create new connections
+      }
+    }
+  }
+  if (count > 0) log('[tunnel] drained ' + count + ' idle keepalive socket(s) after tunnel state change');
+  return count;
+}
+
+// Track previous tunnel state for transition detection
+let tunnelPrevConnected = false;
+
 function checkTunnel() {
-  if (tunnelAvailable) return true;
   const now = Date.now();
-  if (now - tunnelLastCheck < TUNNEL_CHECK_INTERVAL) return false;
+  if (now - tunnelLastCheck < TUNNEL_CHECK_INTERVAL) return tunnelAvailable;
   tunnelLastCheck = now;
+  let currentlyConnected = false;
   try {
     const st = fs.readFileSync(TUNNEL_STATUS_FILE, 'utf8').trim();
     if (st === 'connected' && isTunnelPortListening()) {
-      tunnelAvailable = true;
-      log('[tunnel] Proton VPN active — routing outbound traffic through WireGuard tunnel');
-      return true;
+      currentlyConnected = true;
     } else if (st === 'connected' && !isTunnelPortListening()) {
       log('[tunnel] WARNING: stale status file — port ' + TUNNEL_PORT + ' not listening (VPN not ready yet)');
     }
   } catch(e) { }
-  return false;
-}
-// Periodic re-check for late tunnel availability
-setInterval(() => {
-  if (!tunnelAvailable) {
-    try {
-      const st = fs.readFileSync(TUNNEL_STATUS_FILE, 'utf8').trim();
-      if (st === 'connected' && isTunnelPortListening()) {
-        tunnelAvailable = true;
-        log('[tunnel] Proton VPN active (periodic check) — routing outbound traffic through WireGuard tunnel');
-      }
-    } catch(e) {}
+  
+  // Detect state transitions
+  if (currentlyConnected && !tunnelPrevConnected) {
+    // Reconnected — drain stale keepalive sockets
+    log('[tunnel] Proton VPN active — routing outbound traffic through WireGuard tunnel');
+    drainKeepaliveAgents();
+  } else if (!currentlyConnected && tunnelPrevConnected) {
+    // Disconnected — drain keepalive sockets immediately
+    log('[tunnel] Proton VPN disconnected — draining keepalive sockets');
+    drainKeepaliveAgents();
+  } else if (currentlyConnected && tunnelPrevConnected) {
+    // Still connected — no action needed
   }
+  
+  tunnelAvailable = currentlyConnected;
+  tunnelPrevConnected = currentlyConnected;
+  return tunnelAvailable;
+}
+// Periodic re-check for tunnel state changes (always runs, no stale caching)
+setInterval(() => {
+  checkTunnel();
 }, TUNNEL_CHECK_INTERVAL).unref();
 
 // HTTP CONNECT proxy through the local WireGuard tunnel
@@ -126,6 +161,8 @@ function tunnelHttpConnect(targetHost, targetPort, timeout = 30000) {
   return new Promise((resolve, reject) => {
     if (!tunnelAvailable) return reject(new Error('Tunnel not available'));
     const s = net.createConnection({ host: TUNNEL_HOST, port: TUNNEL_PORT }, () => {
+      s.setKeepAlive(true, 15000);
+      s.setNoDelay(true);
       s.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`);
     });
     let responded = false;
@@ -413,7 +450,37 @@ https.request = function(...args) {
   // Each pooled TLS socket sits on a persistent CONNECT tunnel through
   // the VPN — zero tunnel setup overhead on reused sockets.
   nopts.agent = httpsKeepAliveAgent;
-  return origHttps.call(this, nopts, cb);
+  // Create the request, then attach an ECONNRESET recovery handler.
+  // When the VPN rotates between keepalive checks, a reused TLS socket
+  // silently dies. The next write = ECONNRESET. We intercept this,
+  // drain the stale agent pool, and reissue with a fresh tunnel.
+  const req = origHttps.call(this, nopts, cb);
+  let retried = false;
+  req.on('error', (err) => {
+    if (retried) return;
+    if (!req.reusedSocket) return;
+    if (err.code !== 'ECONNRESET' && err.code !== 'EPIPE') return;
+    retried = true;
+    drainKeepaliveAgents();
+    log('[tunnel] ECONNRESET on reused socket — reissuing request with fresh tunnel for ' + hn + ':' + port);
+    // Build a fresh opts with forced createConnection (bypass agent pool)
+    const retryOpts = { ...nopts };
+    retryOpts.createConnection = (options, callback) => {
+      let settled = false;
+      const cbOnce = (err, socket) => {
+        if (settled) return;
+        settled = true;
+        if (typeof callback === 'function') callback(err, socket);
+      };
+      proxyConnect(hn, port)
+        .then((tunnel) => cbOnce(null, tunnel))
+        .catch(cbOnce);
+    };
+    // Use origHttps with a fresh agent pool for this retry
+    retryOpts.agent = httpsKeepAliveAgent;
+    origHttps.call(this, retryOpts, cb);
+  });
+  return req;
 };
 
 // ── 2. Patch http.request ──
@@ -1186,6 +1253,8 @@ function socksHttpConnectProxy(targetHost, targetPort, timeout = 30000) {
     const s = net.createConnection({ host: SOCKS5_HOST, port: SOCKS5_PORT });
     s.setTimeout(timeout, () => { s.destroy(); reject(new Error('HTTP CONNECT timeout')); });
     s.on("connect", () => {
+      s.setKeepAlive(true, 15000);
+      s.setNoDelay(true);
       s.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`);
     });
     let resp = '';
